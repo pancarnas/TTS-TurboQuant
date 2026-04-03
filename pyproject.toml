@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tts-turboquant"
+version = "0.1.0"
+description = "TurboQuant KV cache compression for TTS models"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+license = { text = "Apache-2.0" }
+
+dependencies = [
+  "torch",
+  "scipy>=1.10.0",
+]
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["turboquant*"] } }
+
+[tool.pytest.ini_options]
+testpaths = ["models/Qwen3-TTS/tests"]
+pythonpath = [".", "models/Qwen3-TTS"]

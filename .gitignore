@@ -1,0 +1,75 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.idea/
+.vscode/
+venv/
+env/
+.venv/
+.pytest_cache/
+
+# Audio outputs
+*.wav
+*.m4a
+*.mp3
+*.ogg
+*.flac
+
+# Benchmark outputs
+**/benchmarks/outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.onnx
+*.safetensors
+**/checkpoints/
+
+# Personal/temp files
+*.excalidraw
+excalidraw.file.txt
+*.txt
+!requirements.txt
+!LICENSE
+
+# Attention maps
+attentionMap/
+
+# NLTK data
+nltk_data/
+
+# Pickle files
+*.pickle
+
+# macOS
+.DS_Store
+
+# HuggingFace cache
+.cache/
+
+# Benchmark results and logs
+results/
+
+# VALL-E-X (kept locally, not tracked)
+models/VALL-E-X/
