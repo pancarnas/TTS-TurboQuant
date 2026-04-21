@@ -368,16 +368,22 @@ def _open_results_file(prefix: str) -> tuple:
     fh = open(path, "a", buffering=1, encoding="utf-8")
     fh.write(f"# {prefix} run started {ts}\n")
     fh.write(f"# columns: group,idx,config,rtf,cer,spk_sim,peak_vram_mb,tokens_per_sec,"
-             f"compressed_mb,decompressed_prefix_mb,theoretical_ratio,effective_ratio\n")
+             f"sim_compressed_mb,realized_mb,theoretical_ratio,effective_ratio\n")
     return fh, path
 
 
 def _write_result_line(fh, **kw):
-    """Append one CSV-ish row. Missing values render as empty."""
+    """Append one CSV-ish row. Missing values render as empty.
+
+    sim_compressed_mb: analytical — what compression WOULD store at configured bits.
+    realized_mb: actual VRAM used by the cache's fp16 buffer (track_only=True default).
+    theoretical_ratio: fp16_equiv / sim_compressed (how effective compression would be).
+    effective_ratio: fp16_equiv / realized (what we actually save; 1.0 in track_only mode).
+    """
     cols = [
         "group", "idx", "config", "rtf", "cer", "spk_sim",
-        "peak_vram_mb", "tokens_per_sec", "compressed_mb",
-        "decompressed_prefix_mb", "theoretical_ratio", "effective_ratio",
+        "peak_vram_mb", "tokens_per_sec", "sim_compressed_mb",
+        "realized_mb", "theoretical_ratio", "effective_ratio",
     ]
     row = []
     for c in cols:
@@ -581,7 +587,7 @@ def benchmark_vallex(args):
                 "rtf": [], "cer": [], "spk_sim": [],
                 "theoretical_ratio": [], "effective_ratio": [],
                 "peak_vram_mb": [], "tokens_per_sec": [],
-                "compressed_mb": [], "decompressed_prefix_mb": [],
+                "sim_compressed_mb": [], "realized_mb": [],
             }
             for name, _ in TURBOQUANT_CONFIGS
         }
@@ -607,18 +613,25 @@ def benchmark_vallex(args):
 
                     theoretical_ratio = 1.0
                     effective_ratio = 1.0
-                    compressed_mb = 0.0
-                    decompressed_prefix_mb = 0.0
+                    sim_compressed_mb = 0.0
+                    realized_mb = 0.0
                     if mem_report:
                         theoretical_ratio = mem_report.get("theoretical_compression_ratio",
                                                            mem_report.get("compression_ratio", 1.0))
                         effective_ratio = mem_report.get("effective_compression_ratio", theoretical_ratio)
-                        compressed_mb = mem_report.get("compressed_bytes", 0) / (1024 ** 2)
-                        decompressed_prefix_mb = mem_report.get("decompressed_prefix_bytes", 0) / (1024 ** 2)
+                        # Simulated: what compression WOULD use (analytical); Realized: what the fp16 buffer actually uses.
+                        sim_compressed_mb = mem_report.get(
+                            "simulated_compressed_bytes",
+                            mem_report.get("compressed_bytes", 0),
+                        ) / (1024 ** 2)
+                        realized_mb = mem_report.get(
+                            "realized_fp16_bytes",
+                            mem_report.get("total_bytes", 0),
+                        ) / (1024 ** 2)
                         group_results[config_name]["theoretical_ratio"].append(theoretical_ratio)
                         group_results[config_name]["effective_ratio"].append(effective_ratio)
-                        group_results[config_name]["compressed_mb"].append(compressed_mb)
-                        group_results[config_name]["decompressed_prefix_mb"].append(decompressed_prefix_mb)
+                        group_results[config_name]["sim_compressed_mb"].append(sim_compressed_mb)
+                        group_results[config_name]["realized_mb"].append(realized_mb)
 
                     status = f"RTF={rtf:.2f} VRAM={peak_vram_mb:.0f}MB tok/s={tokens_per_sec:.1f}"
                     error_rate = None
@@ -651,8 +664,8 @@ def benchmark_vallex(args):
                         group=group_name, idx=i, config=config_name,
                         rtf=rtf, cer=error_rate, spk_sim=spk_sim,
                         peak_vram_mb=peak_vram_mb, tokens_per_sec=tokens_per_sec,
-                        compressed_mb=compressed_mb,
-                        decompressed_prefix_mb=decompressed_prefix_mb,
+                        sim_compressed_mb=sim_compressed_mb,
+                        realized_mb=realized_mb,
                         theoretical_ratio=theoretical_ratio,
                         effective_ratio=effective_ratio,
                     )
@@ -724,37 +737,43 @@ def benchmark_vallex(args):
             _tee(results_fh, row)
 
     # Memory & throughput summary — across ALL sentences per config.
+    # Columns explained:
+    #   VRAM(MB)      — peak torch allocator VRAM during the step (includes model + activations + cache)
+    #   Realized(MB)  — what the KV cache itself actually uses (fp16 buffer in track_only mode)
+    #   SimComp(MB)   — analytical: what compression WOULD use if realized (not actual storage)
+    #   R_theory      — fp16_equivalent / SimComp, i.e. the compression ratio if it were realized
+    #   R_eff         — fp16_equivalent / Realized, i.e. actual memory savings (≈1.0 in track_only)
     _tee(results_fh, f"\n{'=' * 110}")
     _tee(results_fh, "FINAL SUMMARY — Memory & Throughput (averages across all sentences)")
     _tee(results_fh, f"{'=' * 110}")
-    _tee(results_fh, f"{'Config':<22} {'VRAM(MB)':<10} {'tok/s':<8} {'Compressed(MB)':<16} "
-                     f"{'Decomp prefix(MB)':<20} {'R_theory':<10} {'R_eff':<8}")
+    _tee(results_fh, f"{'Config':<22} {'VRAM(MB)':<10} {'tok/s':<8} {'Realized(MB)':<14} "
+                     f"{'SimComp(MB)':<14} {'R_theory':<10} {'R_eff':<8}")
     _tee(results_fh, "-" * 100)
 
     for config_name, tq_config in TURBOQUANT_CONFIGS:
         vram = []
         tps = []
-        comp = []
-        decomp = []
+        realized = []
+        sim_comp = []
         th = []
         eff = []
         for group_name in active_groups:
             r = summary[group_name][config_name]
             vram += r["peak_vram_mb"]
             tps += r["tokens_per_sec"]
-            comp += r["compressed_mb"]
-            decomp += r["decompressed_prefix_mb"]
+            realized += r["realized_mb"]
+            sim_comp += r["sim_compressed_mb"]
             th += r["theoretical_ratio"]
             eff += r["effective_ratio"]
         avg_vram = sum(vram) / len(vram) if vram else 0
         avg_tps = sum(tps) / len(tps) if tps else 0
-        avg_comp = sum(comp) / len(comp) if comp else 0
-        avg_decomp = sum(decomp) / len(decomp) if decomp else 0
+        avg_realized = sum(realized) / len(realized) if realized else 0
+        avg_sim_comp = sum(sim_comp) / len(sim_comp) if sim_comp else 0
         avg_th = sum(th) / len(th) if th else (1.0 if tq_config is None else 0)
         avg_eff = sum(eff) / len(eff) if eff else (1.0 if tq_config is None else 0)
         _tee(results_fh,
              f"{config_name:<22} {avg_vram:<10.0f} {avg_tps:<8.1f} "
-             f"{avg_comp:<16.2f} {avg_decomp:<20.2f} {avg_th:<10.2f} {avg_eff:<8.2f}")
+             f"{avg_realized:<14.2f} {avg_sim_comp:<14.2f} {avg_th:<10.2f} {avg_eff:<8.2f}")
 
     _tee(results_fh, f"\nOutput audio saved to: {output_dir}/")
     _tee(results_fh, f"Structured results: {results_path}")
@@ -1030,7 +1049,17 @@ def main():
                              "For a smoke test: --groups short.")
     parser.add_argument("--max-per-group", type=int, default=None,
                         help="Cap sentences per group (useful for smoke tests; default: run all).")
+    parser.add_argument("--track-only-off", action="store_true",
+                        help="Disable the Phase-1 fast path and run the legacy compression "
+                             "path on-CUDA. Useful only for reconstruction-quality A/B "
+                             "tests against track_only=True. Makes decode ~7x slower.")
     args = parser.parse_args()
+
+    # Propagate track_only=False into every TurboQuantConfig if requested.
+    if args.track_only_off:
+        for _, cfg in TURBOQUANT_CONFIGS:
+            if cfg is not None:
+                cfg.track_only = False
 
     # Validate and apply --groups / --max-per-group filters.
     requested = [g.strip() for g in args.groups.split(",") if g.strip()]
