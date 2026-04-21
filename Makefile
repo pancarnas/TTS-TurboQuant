@@ -1,4 +1,4 @@
-.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex evaluate evaluate-vallex test clean
+.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex smoke-vallex profile-vallex evaluate evaluate-vallex test clean
 
 DEVICE ?= $(shell python -c "import torch; print('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))" 2>/dev/null || echo cpu)
 
@@ -43,6 +43,21 @@ run:
 run-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) 2>&1 | tee results/benchmark_vallex_$(shell date +%Y%m%d_%H%M%S).log
+
+# Fast pipeline check: short sentences only, 2 per group, no quality metrics.
+# Completes in a few minutes. Use to validate the stack before the full run.
+smoke-vallex:
+	@mkdir -p results
+	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
+		--groups short --max-per-group 2 --no-quality 2>&1 \
+		| tee results/smoke_vallex_$(shell date +%Y%m%d_%H%M%S).log
+
+# torch.profiler run, one medium sentence per TurboQuant config. Skips the sweep.
+profile-vallex:
+	@mkdir -p results
+	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
+		--profile --profile-sentence medium --no-quality 2>&1 \
+		| tee results/profile_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
 evaluate:
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --evaluate-only

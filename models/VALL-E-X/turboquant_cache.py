@@ -144,15 +144,29 @@ class TurboQuantValleCache:
         return self._total_seq.get(layer_idx, 0)
 
     def memory_report(self) -> dict:
-        """Report compression statistics."""
+        """Report compression statistics.
+
+        Includes the decompressed-prefix cache (self._decompressed_k/_v) which holds
+        reconstructed fp16 K/V on GPU so attention can read full sequences. That's the
+        true VRAM cost of compression-with-reconstruction; without it the reported
+        ratio is only theoretical (compressed storage vs fp16 equivalent).
+        """
         total_compressed_bytes = 0
-        total_fp16_bytes = 0
+        total_fp16_recent_bytes = 0
+        total_decompressed_bytes = 0
 
         for layer_idx in self._total_seq:
             for t in self._fp16_recent_k.get(layer_idx, []):
-                total_fp16_bytes += t.nelement() * t.element_size()
+                total_fp16_recent_bytes += t.nelement() * t.element_size()
             for t in self._fp16_recent_v.get(layer_idx, []):
-                total_fp16_bytes += t.nelement() * t.element_size()
+                total_fp16_recent_bytes += t.nelement() * t.element_size()
+
+            dk = self._decompressed_k.get(layer_idx)
+            dv = self._decompressed_v.get(layer_idx)
+            if dk is not None:
+                total_decompressed_bytes += dk.nelement() * dk.element_size()
+            if dv is not None:
+                total_decompressed_bytes += dv.nelement() * dv.element_size()
 
             for chunk in self._chunks_k.get(layer_idx, []):
                 inner = chunk.get("compressed")
@@ -162,7 +176,7 @@ class TurboQuantValleCache:
                             total_compressed_bytes += v.nelement() * v.element_size()
                 fp16_t = chunk.get("fp16")
                 if isinstance(fp16_t, torch.Tensor):
-                    total_fp16_bytes += fp16_t.nelement() * fp16_t.element_size()
+                    total_fp16_recent_bytes += fp16_t.nelement() * fp16_t.element_size()
             for chunk in self._chunks_v.get(layer_idx, []):
                 inner = chunk.get("compressed")
                 if isinstance(inner, dict):
@@ -171,18 +185,44 @@ class TurboQuantValleCache:
                             total_compressed_bytes += v.nelement() * v.element_size()
                 fp16_t = chunk.get("fp16")
                 if isinstance(fp16_t, torch.Tensor):
-                    total_fp16_bytes += fp16_t.nelement() * fp16_t.element_size()
+                    total_fp16_recent_bytes += fp16_t.nelement() * fp16_t.element_size()
 
-        total_bytes = total_compressed_bytes + total_fp16_bytes
+        # Theoretical denominator: what fp16 K/V for every token across every layer would cost.
         fp16_equivalent = sum(
             seq * 16 * 64 * 2  # seq_len * num_heads * head_dim * 2 bytes (fp16)
             for seq in self._total_seq.values()
         ) * 2  # keys + values
 
+        # Theoretical: compares compressed storage + residual fp16 window only.
+        theoretical_total = total_compressed_bytes + total_fp16_recent_bytes
+        theoretical_ratio = (
+            fp16_equivalent / theoretical_total if theoretical_total > 0 else 1.0
+        )
+
+        # Effective: includes the reconstructed-prefix cache the attention layer actually reads.
+        effective_total = theoretical_total + total_decompressed_bytes
+        effective_ratio = (
+            fp16_equivalent / effective_total if effective_total > 0 else 1.0
+        )
+
         return {
             "compressed_bytes": total_compressed_bytes,
-            "fp16_recent_bytes": total_fp16_bytes,
-            "total_bytes": total_bytes,
+            "fp16_recent_bytes": total_fp16_recent_bytes,
+            "decompressed_prefix_bytes": total_decompressed_bytes,
+            "total_bytes": effective_total,
             "fp16_equivalent_bytes": fp16_equivalent,
-            "compression_ratio": fp16_equivalent / total_bytes if total_bytes > 0 else 1.0,
+            "theoretical_compression_ratio": theoretical_ratio,
+            "effective_compression_ratio": effective_ratio,
+            # Backward-compat alias so existing print paths keep working.
+            "compression_ratio": theoretical_ratio,
+        }
+
+    def peak_vram_report(self, device) -> dict:
+        """Thin wrapper over torch.cuda allocator stats — returns MB."""
+        if not (isinstance(device, torch.device) and device.type == "cuda") and \
+           not (isinstance(device, str) and device.startswith("cuda")):
+            return {"peak_allocated_mb": 0.0, "current_allocated_mb": 0.0}
+        return {
+            "peak_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024 ** 2),
+            "current_allocated_mb": torch.cuda.memory_allocated(device) / (1024 ** 2),
         }
