@@ -45,7 +45,10 @@ import sys
 import os
 import time
 import argparse
+import atexit
 import datetime
+import shutil
+import subprocess
 
 # VALL-E-X uses bare module imports (e.g. `from models.vallex import VALLE`);
 # add its directory to sys.path so those resolve.
@@ -270,6 +273,84 @@ def read_peak_memory_mb(device) -> float:
 
 
 # ---------------------------------------------------------------------------
+# External nvidia-smi poller — survives Python OOM crashes so the last
+# memory reading before a crash is preserved on disk.
+# ---------------------------------------------------------------------------
+
+_MONITOR_PROC = None
+_MONITOR_FH = None
+
+
+def _stop_nvidia_smi_monitor():
+    """atexit hook: stop the poller and close its file."""
+    global _MONITOR_PROC, _MONITOR_FH
+    if _MONITOR_PROC is not None:
+        try:
+            _MONITOR_PROC.terminate()
+            try:
+                _MONITOR_PROC.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _MONITOR_PROC.kill()
+        except Exception:
+            pass
+        _MONITOR_PROC = None
+    if _MONITOR_FH is not None:
+        try:
+            _MONITOR_FH.flush()
+            _MONITOR_FH.close()
+        except Exception:
+            pass
+        _MONITOR_FH = None
+
+
+def start_nvidia_smi_monitor(prefix: str, interval_s: float = 1.0) -> str:
+    """Start a background nvidia-smi polling subprocess.
+
+    Writes a CSV with (timestamp, memory.used, memory.total, utilization.gpu,
+    temperature.gpu) at `interval_s` to results/<prefix>_gpu_<ts>.csv.
+
+    Returns the CSV path, or empty string if nvidia-smi isn't available /
+    no CUDA is present.
+    """
+    global _MONITOR_PROC, _MONITOR_FH
+
+    if shutil.which("nvidia-smi") is None:
+        return ""
+    if not torch.cuda.is_available():
+        return ""
+
+    repo_root = os.path.dirname(os.path.dirname(_VALLEX_DIR))
+    results_dir = os.path.join(repo_root, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(results_dir, f"{prefix}_gpu_{ts}.csv")
+
+    # nvidia-smi's -lms flag accepts a millisecond interval; -l accepts seconds.
+    # Using -lms to support sub-second polling if needed.
+    interval_ms = max(int(interval_s * 1000), 100)
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=timestamp,memory.used,memory.total,utilization.gpu,temperature.gpu",
+        "--format=csv,nounits",
+        f"-lms={interval_ms}",
+    ]
+
+    try:
+        fh = open(csv_path, "w", buffering=1, encoding="utf-8")
+        # Flush header synchronously, then let nvidia-smi stream rows.
+        fh.write(f"# gpu monitor started {ts}, interval={interval_ms}ms\n")
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"WARNING: could not start nvidia-smi monitor: {e}")
+        return ""
+
+    _MONITOR_PROC = proc
+    _MONITOR_FH = fh
+    atexit.register(_stop_nvidia_smi_monitor)
+    return csv_path
+
+
+# ---------------------------------------------------------------------------
 # Incremental results file (so a crash doesn't lose partial data)
 # ---------------------------------------------------------------------------
 
@@ -437,12 +518,14 @@ def benchmark_vallex(args):
     device = torch.device(args.device)
 
     results_fh, results_path = _open_results_file("benchmark_vallex")
+    gpu_csv = start_nvidia_smi_monitor("benchmark_vallex")
 
     header = [
         "=" * 110,
         "VALL-E-X Real-Weights Benchmark",
         f"Device: {device} | Quality metrics: {not args.no_quality}",
         f"Structured results: {results_path}",
+        f"GPU monitor CSV: {gpu_csv or '(nvidia-smi unavailable — skipped)'}",
         "=" * 110,
     ]
     for line in header:
@@ -762,12 +845,14 @@ def profile_all_configs(args):
     """Profile one representative sentence per TurboQuant config."""
     device = torch.device(args.device)
     results_fh, results_path = _open_results_file("profile_vallex")
+    gpu_csv = start_nvidia_smi_monitor("profile_vallex")
 
     header = [
         "=" * 110,
         "VALL-E-X Profile Run",
         f"Device: {device} | profile_sentence={args.profile_sentence}",
         f"Structured results: {results_path}",
+        f"GPU monitor CSV: {gpu_csv or '(nvidia-smi unavailable — skipped)'}",
         "=" * 110,
     ]
     for line in header:
