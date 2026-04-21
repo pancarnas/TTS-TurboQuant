@@ -26,6 +26,19 @@ Outputs:
       results/benchmark_vallex_<timestamp>_results.txt (survives crashes)
     - Chrome profiler traces (when --profile) at
       models/VALL-E-X/benchmarks/outputs/profile_<group>_<config>.json.gz
+
+Known finding (L4, 2026-04-21):
+    TurboQuant on VALL-E-X as currently integrated is a NET LOSS on both latency
+    and memory. Smoke test (short sentences, baseline vs K*/V* at rw=128):
+      - baseline: RTF 0.58, 130 tok/s, ~2 GB VRAM
+      - TQ configs: RTF 3.5-4.5, 17-20 tok/s, ~2.7 GB VRAM
+      - effective compression ratio: ~0.8x (LESS compression than fp16)
+    Root cause: VALL-E-X's autoregressive decode is launch-bound (7% GPU
+    utilization, ~138k kernel launches per inference in baseline). TurboQuant
+    adds ~60k more per-step torch.cat() calls in turboquant_cache.update() to
+    rebuild full K/V from compressed chunks + residual window + decompressed
+    prefix. Fix requires restructuring TurboQuantValleCache to preallocate
+    buffers and/or adopting CUDA Graphs for the decode step — out of scope here.
 """
 
 import sys
@@ -697,9 +710,12 @@ def profile_generation(model, codec, vocos, text, preset_path, device,
         torch.cuda.reset_peak_memory_stats(device)
 
     start = time.time()
+    # Lightweight profile: record_shapes + profile_memory generate huge traces on
+    # autoregressive decode (500k+ events under TurboQuant), and export_chrome_trace
+    # then takes hours. Kernel timing alone is enough to identify the bottleneck.
     with profile(activities=activities,
-                 record_shapes=True,
-                 profile_memory=True,
+                 record_shapes=False,
+                 profile_memory=False,
                  with_stack=False) as prof:
         model.inference(
             text_tokens.to(device),
@@ -775,16 +791,32 @@ def profile_all_configs(args):
     output_dir = os.path.join(_THIS_DIR, "outputs")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Filter which configs to profile (default: baseline + K4/V2 — enough signal,
+    # keeps total runtime under ~10 min even with profiler overhead).
+    requested_configs = getattr(args, "profile_configs", None)
+    if requested_configs:
+        requested_names = [c.strip() for c in requested_configs.split(",") if c.strip()]
+        configs_to_run = [(name, cfg) for (name, cfg) in TURBOQUANT_CONFIGS
+                          if name in requested_names]
+        if not configs_to_run:
+            _tee(results_fh, f"ERROR: --profile-configs matched nothing. "
+                             f"Requested: {requested_names}. "
+                             f"Available: {[n for n, _ in TURBOQUANT_CONFIGS]}")
+            results_fh.close()
+            return
+    else:
+        configs_to_run = TURBOQUANT_CONFIGS
+
     # Per-config warmup so init costs don't dominate the profile
     _tee(results_fh, "\nWarmup (one per config)...")
-    for config_name, tq_config in TURBOQUANT_CONFIGS:
+    for config_name, tq_config in configs_to_run:
         try:
             run_generation(model, codec, vocos, "Hello.", "en", preset_path, device, tq_config)
         except Exception as e:
             _tee(results_fh, f"  warmup {config_name}: ERROR {e}")
     _tee(results_fh, "Warmup done.\n")
 
-    for config_name, tq_config in TURBOQUANT_CONFIGS:
+    for config_name, tq_config in configs_to_run:
         _tee(results_fh, f"\n{'=' * 110}")
         _tee(results_fh, f"Profiling config: {config_name}")
         _tee(results_fh, f"{'=' * 110}")
@@ -903,6 +935,10 @@ def main():
     parser.add_argument("--profile-sentence", default="medium",
                         choices=list(SENTENCE_GROUPS.keys()),
                         help="Which sentence group's first entry to profile under --profile")
+    parser.add_argument("--profile-configs",
+                        default="baseline (no TQ),K4/V2 rw=128",
+                        help="Comma-separated config names to profile (default: baseline + K4/V2). "
+                             "Use an empty string to profile ALL configs, which can take 60+ minutes.")
     parser.add_argument("--groups", default=",".join(SENTENCE_GROUPS.keys()),
                         help="Comma-separated sentence groups to run (default: all). "
                              "Useful on tight-VRAM GPUs: --groups short,medium to skip long sentences. "

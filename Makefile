@@ -1,4 +1,4 @@
-.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex smoke-vallex profile-vallex evaluate evaluate-vallex test clean
+.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex smoke-vallex profile-vallex profile-vallex-full evaluate evaluate-vallex test clean
 
 DEVICE ?= $(shell python -c "import torch; print('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))" 2>/dev/null || echo cpu)
 
@@ -52,12 +52,21 @@ smoke-vallex:
 		--groups short --max-per-group 2 --no-quality 2>&1 \
 		| tee results/smoke_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
-# torch.profiler run, one medium sentence per TurboQuant config. Skips the sweep.
+# torch.profiler run. Default: short sentence, baseline + K4/V2 only (~5-8 min).
+# profile_memory/record_shapes are off to keep trace export fast (was previously
+# hanging multi-hour on TQ configs under autoregressive decode).
 profile-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--profile --profile-sentence medium --no-quality 2>&1 \
+		--profile --profile-sentence short --no-quality 2>&1 \
 		| tee results/profile_vallex_$(shell date +%Y%m%d_%H%M%S).log
+
+# Full-coverage profile: medium sentence, all 5 configs. ~30-60 min.
+profile-vallex-full:
+	@mkdir -p results
+	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
+		--profile --profile-sentence medium --profile-configs "" --no-quality 2>&1 \
+		| tee results/profile_vallex_full_$(shell date +%Y%m%d_%H%M%S).log
 
 evaluate:
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --evaluate-only
