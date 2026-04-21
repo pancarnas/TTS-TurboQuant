@@ -1,4 +1,4 @@
-.PHONY: install install-qwen install-all install-metrics install-sox install-cuda run evaluate test clean
+.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex evaluate evaluate-vallex test clean
 
 DEVICE ?= $(shell python -c "import torch; print('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))" 2>/dev/null || echo cpu)
 
@@ -9,6 +9,11 @@ install:
 
 install-qwen: install
 	pip install -e models/Qwen3-TTS/
+
+install-vallex: install
+	pip install -e models/VALL-E-X/
+
+install-vallex-all: install-vallex install-metrics
 
 install-metrics:
 	pip install openai-whisper jiwer
@@ -35,8 +40,15 @@ run:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) 2>&1 | tee results/benchmark_$(shell date +%Y%m%d_%H%M%S).log
 
+run-vallex:
+	@mkdir -p results
+	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) 2>&1 | tee results/benchmark_vallex_$(shell date +%Y%m%d_%H%M%S).log
+
 evaluate:
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --evaluate-only
+
+evaluate-vallex:
+	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --evaluate-only
 
 # --- Test ---
 
