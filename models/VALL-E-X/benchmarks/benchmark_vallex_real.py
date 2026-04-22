@@ -246,18 +246,43 @@ class QualityMetrics:
             return 0.0, transcript
         return float(cer(ref, transcript)), transcript
 
-    def _load_wavlm(self):
-        if self._wavlm_model is None:
-            from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
-            self._wavlm_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-                "microsoft/wavlm-base-plus-sv"
-            )
-            self._wavlm_model = WavLMForXVector.from_pretrained(
-                "microsoft/wavlm-base-plus-sv"
-            ).to(self._device).eval()
+    # Sentinel values for self._wavlm_model:
+    #   None  — not loaded yet
+    #   False — load failed (e.g., tensorflow/CUDA ABI conflict); skip speaker-sim
+    #   <obj> — loaded successfully
 
-    def speaker_embedding(self, wav: np.ndarray, sr: int) -> np.ndarray:
-        self._load_wavlm()
+    def _load_wavlm(self) -> bool:
+        """Load WavLM lazily. Return True on success, False on failure.
+
+        Load failures typically come from transformers transitively importing
+        tensorflow on systems where TF's bundled cuDNN conflicts with the
+        system one. If that happens we degrade gracefully: CER still works,
+        speaker-sim is skipped with a one-shot warning.
+        """
+        if self._wavlm_model is False:
+            return False
+        if self._wavlm_model is None:
+            try:
+                from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+                self._wavlm_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+                    "microsoft/wavlm-base-plus-sv"
+                )
+                self._wavlm_model = WavLMForXVector.from_pretrained(
+                    "microsoft/wavlm-base-plus-sv"
+                ).to(self._device).eval()
+            except Exception as e:
+                print(
+                    f"WARNING: WavLM failed to load ({type(e).__name__}: {e}). "
+                    f"Speaker similarity will be skipped. If this is a "
+                    f"tensorflow/cuDNN conflict, try: pip uninstall -y tensorflow tensorflow-cpu"
+                )
+                self._wavlm_model = False
+                return False
+        return True
+
+    def speaker_embedding(self, wav: np.ndarray, sr: int):
+        if not self._load_wavlm():
+            return None
         wav = wav.astype(np.float32)
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
@@ -273,9 +298,14 @@ class QualityMetrics:
         return emb.squeeze().cpu().numpy()
 
     def speaker_cosine_similarity(self, wav_a: np.ndarray, sr_a: int,
-                                   wav_b: np.ndarray, sr_b: int) -> float:
+                                   wav_b: np.ndarray, sr_b: int):
+        """Return cosine similarity, or None if WavLM is unavailable."""
         emb_a = self.speaker_embedding(wav_a, sr_a)
+        if emb_a is None:
+            return None
         emb_b = self.speaker_embedding(wav_b, sr_b)
+        if emb_b is None:
+            return None
         return float(np.dot(emb_a, emb_b))
 
 
@@ -710,7 +740,8 @@ def benchmark_vallex(args):
                             spk_sim = metrics.speaker_cosine_similarity(
                                 baseline_wav, SAMPLE_RATE, wav, SAMPLE_RATE
                             )
-                            group_results[config_name]["spk_sim"].append(spk_sim)
+                            if spk_sim is not None:
+                                group_results[config_name]["spk_sim"].append(spk_sim)
 
                         status += f" CER={error_rate:.1%}"
                         if spk_sim is not None:
@@ -1074,7 +1105,8 @@ def evaluate_saved_wavs(args):
                     baseline_sr = sr
                 elif baseline_wav is not None:
                     spk_sim = metrics.speaker_cosine_similarity(baseline_wav, baseline_sr, wav, sr)
-                    group_results[config_name]["spk_sim"].append(spk_sim)
+                    if spk_sim is not None:
+                        group_results[config_name]["spk_sim"].append(spk_sim)
 
         for config_name, tq_config in TURBOQUANT_CONFIGS:
             r = group_results[config_name]
