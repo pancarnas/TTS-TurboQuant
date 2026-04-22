@@ -148,7 +148,13 @@ def multi_head_attention_forward(
     q = q.view(B, T, n_head, C // n_head).transpose(1, 2)  # (B, nh, T, hs)
     v = v.view(B, T, n_head, C // n_head).transpose(1, 2)  # (B, nh, T, hs)
     if tq_cache is not None and layer_idx is not None:
-        # TurboQuant path: cache manager handles storage and compression
+        # TurboQuant path: cache manager handles storage and compression.
+        # NOTE: Phase 1 (2026-04-21) replaced the per-step cat-based cache with
+        # preallocated fp16 buffers. `update()` is now a slice-write returning a
+        # contiguous view; the attention math below is unchanged. Real memory
+        # savings (eff_ratio > 1) would require reworking the `q @ k.T` / `att @ v`
+        # path to consume compressed K/V directly — see the Phase 4 design
+        # sketch in benchmarks/benchmark_vallex_real.py docstring.
         k, v = tq_cache.update(layer_idx, k, v)
         FULL_T = k.shape[-2]
         present = "tq_managed"  # sentinel — cache is managed externally

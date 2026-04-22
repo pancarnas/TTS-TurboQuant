@@ -27,18 +27,81 @@ Outputs:
     - Chrome profiler traces (when --profile) at
       models/VALL-E-X/benchmarks/outputs/profile_<group>_<config>.json.gz
 
-Known finding (L4, 2026-04-21):
-    TurboQuant on VALL-E-X as currently integrated is a NET LOSS on both latency
-    and memory. Smoke test (short sentences, baseline vs K*/V* at rw=128):
-      - baseline: RTF 0.58, 130 tok/s, ~2 GB VRAM
-      - TQ configs: RTF 3.5-4.5, 17-20 tok/s, ~2.7 GB VRAM
-      - effective compression ratio: ~0.8x (LESS compression than fp16)
-    Root cause: VALL-E-X's autoregressive decode is launch-bound (7% GPU
-    utilization, ~138k kernel launches per inference in baseline). TurboQuant
-    adds ~60k more per-step torch.cat() calls in turboquant_cache.update() to
-    rebuild full K/V from compressed chunks + residual window + decompressed
-    prefix. Fix requires restructuring TurboQuantValleCache to preallocate
-    buffers and/or adopting CUDA Graphs for the decode step — out of scope here.
+L4 findings and phased rework (2026-04-21):
+
+Phase-0 smoke (pre-fix):
+    baseline: RTF 0.58, 130 tok/s, ~2 GB VRAM
+    K4/V2:    RTF 4.03, 18.6 tok/s, ~2.7 GB VRAM, eff_ratio 0.78x
+    Root cause (profile): decode is launch-bound (7% GPU util, 138k kernels in
+    baseline). TurboQuant added 60k+ torch.cat(), 65k aten::to, 13k
+    cudaStreamSynchronize events in turboquant_cache.update() by rebuilding
+    full K/V from compressed + residual + decompressed-prefix each step.
+
+Phase 1 (commit 2c4c6d7): preallocated per-layer fp16 buffers in
+    TurboQuantValleCache. Slice-write replaces cat-per-step; compression moves
+    off-path (config.track_only=True, default). Expected: ~0.27 ms/step
+    amortized, TQ RTF within 1.2x of baseline, aten::cat count at baseline
+    level. effective_compression_ratio intentionally reports 1.0 (honest —
+    we store fp16 now, not compressed).
+
+Phase 2 (commit 72c25bb): dtype churn in MSECompressor.compress/decompress
+    cleaned up — int32 throughout bit-packing path, removes the
+    int64<->uint8 ping-pong. Only matters for --track-only-off A/B mode and
+    future compression-aware attention work.
+
+Phase 3: decision gate on L4 profile data.
+    If Phase 1/2 latency lands within ~1.2x of baseline → move to Phase 4
+    decision. If not → diagnose residual overhead before anything else.
+
+Phase 4 design sketch — realizing REAL memory savings (eff_ratio > 1):
+    The fundamental constraint: VALL-E-X's attention at modules/activation.py
+    lines 172-175 is standard PyTorch manual softmax:
+        att = (q @ k.transpose(-2, -1)) * scale
+        att = att.masked_fill(mask, -inf); att = F.softmax(att, dim=-1)
+        y = att @ v
+    It requires the full (B, nh, FULL_T, D) K/V tensors materialized on the
+    GPU. As long as attention is this shape, no amount of cache-side
+    compression can reduce real VRAM — decompressing just to feed attention
+    defeats the point.
+
+    Four realistic paths, in increasing cost:
+
+    4a) DECLARE AND STOP. Phase 1/2 delivers a correct instrumented baseline
+        that proves MSE-optimal quantization's theoretical compression ratio
+        (2.5-3x at K4/V2). Real savings are documented as gated on an
+        attention-kernel rewrite. Cost: 0. Outcome: honest paper/report
+        without the memory-savings claim.
+
+    4b) LAYER-ADAPTIVE DROP. Keep first K and last K layers in fp16
+        (semantically important), drop old tokens entirely from middle layers
+        beyond a sliding window. Real memory savings ~= window/full_len for
+        dropped layers. Cost: ~1 week. Risk: quality regression on long
+        sentences; speaker-prompt tokens must never be dropped.
+
+    4c) JIT DECOMPRESSION IN PYTHON. Replace the standard attention call
+        with a Python loop: for each chunk of compressed K/V, decompress into
+        a temporary fp16 tile, compute q @ k_tile, accumulate via online
+        softmax (LogSumExp), then q @ v_tile weighted-summed. Cost: ~2
+        weeks. Expected perf: adds many kernel launches — may regress
+        latency on launch-bound decode despite Phase 1's fixes. Memory:
+        real savings bounded by tile size.
+
+    4d) CUSTOM TRITON KERNEL. Fused dequantize + flash-style tiled attention
+        in a single kernel. Loads compressed K/V chunks into shared memory,
+        dequantizes in registers, runs online softmax. Cost: 4-8 weeks.
+        Expected: real memory savings AND latency parity with baseline.
+        Highest upside, highest risk.
+
+    Recommendation depends on L4 numbers:
+      - If Phase 1/2 RTF ≈ 0.7 (close to baseline): go 4a (declare). The
+        instrumented baseline is the contribution.
+      - If the research investment is available: 4d is the only path that
+        realizes compression in production. 4c is a dead end given the
+        launch-bound baseline.
+      - 4b is a hybrid that partially realizes compression at modest cost,
+        but only if dropping middle-layer context is acceptable for TTS
+        quality (needs validation — VALL-E-X may depend heavily on
+        cross-layer context for speaker consistency).
 """
 
 import sys
