@@ -46,32 +46,37 @@ class MSECompressor:
     def compress(self, states: torch.Tensor) -> dict:
         """
         Compress (B, H, S, D) -> dict with bit-packed indices + norms.
+
+        Phase-2 cleanup: removed a redundant int64↔uint8 round-trip in the
+        bit-pack path. Indices stay in int32 through the pack step; only the
+        final stored buffer is uint8.
         """
         B, H, S, D = states.shape
         N = B * H * S
-        flat = states.reshape(N, D).float()
+        flat = states.reshape(N, D).float()  # fp32 for norm + rotation precision
 
         # Normalize to unit sphere, store norms
         vec_norms = torch.norm(flat, dim=-1)  # (N,)
         flat_norm = flat / (vec_norms.unsqueeze(-1) + 1e-8)
 
-        # Rotate + quantize
+        # Rotate + quantize. argmin returns int64 by default; cast once to int32
+        # (2^bits <= 256 fits comfortably) and stay int32 through bit-packing.
         rotated = flat_norm @ self.Pi.T
         diffs = rotated.unsqueeze(-1) - self.centroids  # (N, D, levels)
-        indices = diffs.abs().argmin(dim=-1).to(torch.uint8)  # (N, D)
+        indices = diffs.abs().argmin(dim=-1).to(torch.int32)  # (N, D) int32
 
         # Bit-pack indices: pack multiple indices per byte
         indices_per_byte = 8 // self.bits
         idx_pad = (indices_per_byte - D % indices_per_byte) % indices_per_byte
-        idx_flat = indices.long()
         if idx_pad:
-            idx_flat = F.pad(idx_flat, (0, idx_pad))
-        n_groups = idx_flat.shape[-1] // indices_per_byte
+            indices = F.pad(indices, (0, idx_pad))
+        n_groups = indices.shape[-1] // indices_per_byte
         idx_powers = torch.tensor(
             [2 ** (self.bits * i) for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.long, device=idx_flat.device
+            dtype=torch.int32, device=indices.device,
         )
-        idx_bytes = (idx_flat.reshape(N, n_groups, indices_per_byte) * idx_powers).sum(-1).to(torch.uint8)
+        # int32 * int32 → int32; final cast to uint8 for storage only.
+        idx_bytes = (indices.reshape(N, n_groups, indices_per_byte) * idx_powers).sum(-1).to(torch.uint8)
 
         return {
             "idx_bytes": idx_bytes.reshape(B, H, S, n_groups),
@@ -82,25 +87,29 @@ class MSECompressor:
 
     @torch.no_grad()
     def decompress(self, compressed: dict) -> torch.Tensor:
-        """Decompress back to (B, H, S, D) tensor."""
+        """Decompress back to (B, H, S, D) tensor.
+
+        Phase-2 cleanup: int32 shifts + unpack (was int64). Same correctness,
+        fewer dtype casts on the decompression hot path.
+        """
         B, H, S, D = compressed["shape"]
         N = B * H * S
         idx_bytes = compressed["idx_bytes"].reshape(N, -1)
         vec_norms = compressed["vec_norms"].reshape(N, 1).float()
         idx_pad = compressed["idx_pad"]
 
-        # Unpack indices
+        # Unpack indices in int32 (values are 0..15 — fits in 4 bits).
         indices_per_byte = 8 // self.bits
         mask = (1 << self.bits) - 1
         idx_shifts = torch.tensor(
             [self.bits * i for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.long, device=idx_bytes.device
+            dtype=torch.int32, device=idx_bytes.device,
         )
-        indices = ((idx_bytes.long().unsqueeze(-1) >> idx_shifts) & mask).reshape(N, -1)
+        indices = ((idx_bytes.to(torch.int32).unsqueeze(-1) >> idx_shifts) & mask).reshape(N, -1)
         if idx_pad:
             indices = indices[:, :D]
 
-        # Reconstruct
+        # Reconstruct (fp32 for rotation-undo precision; caller re-casts to fp16).
         reconstructed = (self.centroids[indices] @ self.Pi) * vec_norms
         return reconstructed.reshape(B, H, S, D)
 
