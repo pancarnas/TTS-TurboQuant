@@ -1,4 +1,4 @@
-.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex smoke-vallex profile-vallex profile-vallex-full evaluate evaluate-vallex test clean
+.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex smoke-vallex profile-vallex profile-vallex-full smoke-qwen profile-qwen profile-qwen-full evaluate evaluate-vallex test clean
 
 DEVICE ?= $(shell python -c "import torch; print('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))" 2>/dev/null || echo cpu)
 
@@ -39,6 +39,27 @@ install-cuda:
 run:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) 2>&1 | tee results/benchmark_$(shell date +%Y%m%d_%H%M%S).log
+
+# Fast pipeline check for Qwen: short sentences only, 2 per group, no quality metrics.
+smoke-qwen:
+	@mkdir -p results
+	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
+		--groups short --max-per-group 2 --no-quality 2>&1 \
+		| tee results/smoke_qwen_$(shell date +%Y%m%d_%H%M%S).log
+
+# torch.profiler run for Qwen. Default: short sentence, baseline + K4/V2 (~5-10 min).
+profile-qwen:
+	@mkdir -p results
+	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
+		--profile --profile-sentence short --no-quality 2>&1 \
+		| tee results/profile_qwen_$(shell date +%Y%m%d_%H%M%S).log
+
+# Full Qwen profile: medium sentence, all 5 configs.
+profile-qwen-full:
+	@mkdir -p results
+	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
+		--profile --profile-sentence medium --profile-configs "" --no-quality 2>&1 \
+		| tee results/profile_qwen_full_$(shell date +%Y%m%d_%H%M%S).log
 
 run-vallex:
 	@mkdir -p results
