@@ -47,9 +47,11 @@ class ConfigProfile:
     realized_mb: float = 0.0
     r_theory: float = 1.0
     r_eff: float = 1.0
-    # GPU-bound vs launch-bound
+    # GPU-bound vs launch-bound (computed from Self CUDA total / wall, fallback to verdict line)
     verdict: str = ""
     cuda_time_frac: float = 0.0
+    cuda_time_total_s: float = 0.0
+    cpu_time_total_s: float = 0.0
     # Environment
     gpu_name: str = ""
     total_vram_gb: float = 0.0
@@ -57,6 +59,11 @@ class ConfigProfile:
     # Top kernels — list of (name, cuda_pct, calls, cuda_total_ms)
     top_cuda: list[tuple] = field(default_factory=list)
     top_cpu: list[tuple] = field(default_factory=list)
+
+    @property
+    def has_data(self) -> bool:
+        """Whether this record has enough data to be comparable (excludes stubs from killed runs)."""
+        return self.elapsed_s > 0 or self.peak_vram_mb > 0 or self.top_cuda
 
 
 _ELAPSED_RE = re.compile(r"Elapsed:\s+([\d.]+)s\s+Peak VRAM:\s+(\d+)\s*MB")
@@ -72,6 +79,8 @@ _VERDICT_RE = re.compile(r"(GPU-BOUND|LAUNCH-BOUND)\s+\(cuda_time/wall\s*=\s*([\
 _GPU_NAME_RE = re.compile(r"name=(.+)")
 _TOTAL_MEM_RE = re.compile(r"total_memory=([\d.]+)\s*GB")
 _WEIGHT_RE = re.compile(r"Model weights \+ load-time VRAM:\s+(\d+)\s*MB")
+_CUDA_TOTAL_RE = re.compile(r"Self CUDA time total:\s+([\d.]+)\s*(ms|us|s)")
+_CPU_TOTAL_RE = re.compile(r"Self CPU time total:\s+([\d.]+)\s*(ms|us|s)")
 
 
 def _detect_model(path: str) -> str:
@@ -86,60 +95,76 @@ def _detect_model(path: str) -> str:
 def _parse_top_kernels(block_lines: list[str], tag: str) -> list[tuple]:
     """Parse `prof.key_averages().table(...)` output into rows.
 
-    Returns list of (name, cuda_pct, calls, cuda_total_ms). Very defensive —
-    different torch versions format the table slightly differently.
+    Returns list of (name, cuda_pct, calls, cuda_total_ms). Torch's printout:
+      Name | Self CPU % | Self CPU | CPU total % | CPU total | CPU time avg |
+      Self CUDA | Self CUDA % | CUDA total | CUDA time avg | # of Calls
+
+    Parsing strategy: iterate every line after the "Top-N by ..." tag; accept a
+    row if (a) it splits into >= 6 space-separated tokens, (b) the last token
+    is a plain integer (# of Calls), (c) at least one token matches a percent
+    and one matches a time suffix. This skips framing rows, the column header,
+    and trailing "Self CPU time total:" footer lines automatically.
     """
     out: list[tuple] = []
-    in_table = False
-    # Find the "Top-20 by cuda_time_total:" or "Top-10 by self_cpu_time_total:" section
     start_idx = None
     for i, line in enumerate(block_lines):
         if tag in line:
-            start_idx = i
+            start_idx = i + 1
             break
     if start_idx is None:
         return out
 
+    _time_re = re.compile(r"^([\d.]+)\s*(ms|us|s)$")
+    _pct_re = re.compile(r"^([\d.]+)\s*%$")
+    _int_re = re.compile(r"^[\d,]+$")
+
+    def _to_ms(val: float, unit: str) -> float:
+        if unit == "us":
+            return val / 1000.0
+        if unit == "s":
+            return val * 1000.0
+        return val  # already ms
+
     for line in block_lines[start_idx:]:
-        if re.match(r"^-+\s+-+", line.strip()):
-            in_table = not in_table
+        stripped = line.strip()
+        if not stripped:
             continue
-        if not in_table:
-            continue
-        if line.startswith(("Self CPU time total", "Self CUDA time total")):
+        if stripped.startswith(("Self CPU time total", "Self CUDA time total")):
             break
-        # Row format (spaces-separated, columns = Name | Self CPU % | Self CPU | CPU total % |
-        # CPU total | CPU time avg | Self CUDA | Self CUDA % | CUDA total | CUDA time avg | # of Calls)
-        # Robust parse: split on 2+ spaces; the last numeric token is # of Calls.
-        tokens = re.split(r"\s{2,}", line.strip())
+        # Next Top-N section — stop this one.
+        if stripped.startswith(("Top-20 by", "Top-10 by")):
+            break
+        tokens = re.split(r"\s{2,}", stripped)
         if len(tokens) < 6:
             continue
-        name = tokens[0]
-        # try to find CUDA % and CUDA total ms
-        cuda_pct = 0.0
-        cuda_ms = 0.0
-        calls = 0
+
+        # Last token must be a plain integer (# of Calls); this filters
+        # framing rows ("--- --- ---"), header rows (with "Name" text),
+        # and stray text.
+        last = tokens[-1].replace(",", "")
+        if not _int_re.match(tokens[-1]):
+            continue
         try:
-            calls = int(tokens[-1].replace(",", ""))
+            calls = int(last)
         except ValueError:
             continue
-        # Last few cells: ... # of Calls  CUDA time avg  CUDA total  Self CUDA %  Self CUDA
-        # In the torch printout order, Self CUDA % ends with "%" character.
-        for tok in tokens:
-            m = re.match(r"([\d.]+)\s*%$", tok.strip())
-            if m:
-                cuda_pct = max(cuda_pct, float(m.group(1)))
-        # Try CUDA total column (cell containing "ms" or "us" closest to end)
-        for tok in reversed(tokens):
-            m = re.match(r"([\d.]+)\s*(ms|us|s)\b", tok.strip())
-            if m:
-                val = float(m.group(1))
-                if m.group(2) == "us":
-                    val /= 1000.0
-                elif m.group(2) == "s":
-                    val *= 1000.0
-                cuda_ms = val
-                break
+
+        name = tokens[0]
+
+        # Percent tokens in the data row: Self CPU %, CPU total %, Self CUDA %.
+        # The LAST one is Self CUDA %.
+        pct_tokens = [t for t in tokens[1:] if _pct_re.match(t.strip())]
+        if not pct_tokens:
+            continue  # not a data row
+        cuda_pct = float(_pct_re.match(pct_tokens[-1].strip()).group(1))
+
+        # Time tokens; CUDA total is second-from-last (last is CUDA avg).
+        time_tokens = [t for t in tokens[1:] if _time_re.match(t.strip())]
+        cuda_ms = 0.0
+        if len(time_tokens) >= 2:
+            m = _time_re.match(time_tokens[-2].strip())
+            cuda_ms = _to_ms(float(m.group(1)), m.group(2))
+
         out.append((name, cuda_pct, calls, cuda_ms))
         if len(out) >= 20:
             break
@@ -205,9 +230,36 @@ def parse_profile_file(path: str) -> list[ConfigProfile]:
             if m:
                 prof.verdict = m.group(1)
                 prof.cuda_time_frac = float(m.group(2)) / 100.0
+            m = _CUDA_TOTAL_RE.search(line)
+            if m:
+                val = float(m.group(1))
+                unit = m.group(2)
+                if unit == "ms":
+                    val /= 1000.0
+                elif unit == "us":
+                    val /= 1e6
+                prof.cuda_time_total_s = val
+            m = _CPU_TOTAL_RE.search(line)
+            if m:
+                val = float(m.group(1))
+                unit = m.group(2)
+                if unit == "ms":
+                    val /= 1000.0
+                elif unit == "us":
+                    val /= 1e6
+                prof.cpu_time_total_s = val
         prof.top_cuda = _parse_top_kernels(block, "Top-20 by cuda_time_total")
         prof.top_cpu = _parse_top_kernels(block, "Top-10 by self_cpu_time_total")
-        results.append(prof)
+
+        # Recompute cuda_time_frac from totals if the printed verdict was bogus (0.0%).
+        if prof.elapsed_s > 0 and prof.cuda_time_total_s > 0:
+            real_frac = prof.cuda_time_total_s / prof.elapsed_s
+            if prof.cuda_time_frac == 0.0 or abs(real_frac - prof.cuda_time_frac) > 0.02:
+                prof.cuda_time_frac = real_frac
+                prof.verdict = "GPU-BOUND" if real_frac >= 0.5 else "LAUNCH-BOUND"
+
+        if prof.has_data:
+            results.append(prof)
 
     return results
 
