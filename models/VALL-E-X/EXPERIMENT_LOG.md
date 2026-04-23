@@ -123,6 +123,24 @@ Speaker similarity is strong (0.90–0.99) and consistent across configs — voi
 
 ---
 
+### Realtime viability — yes, on L4
+
+RTF < 1.0 means 1 s of audio is generated in less than 1 s of wall-clock. VALL-E-X on L4 clears this comfortably across all length groups, with or without TurboQuant:
+
+| Group | baseline RTF | vs realtime | K4/V2 RTF | vs realtime |
+|---|---|---|---|---|
+| short (~7 words) | 0.55 | **1.82× faster** | 0.57 | 1.75× faster |
+| medium (~24 words) | 0.58 | **1.72× faster** | 0.60 | 1.67× faster |
+| long (~76 words) | 0.74 | **1.35× faster** | 0.72 | 1.39× faster |
+
+Note: the RTF measurement covers `model.inference(...)` (AR decoder + 7× NAR decoders). It does **not** include the vocos waveform synthesis (~0.2 s on top, also excluded from baseline). First-token latency isn't separately measured — if you need streaming output, instrumentation at the AR-loop level would be needed.
+
+**Default cache note.** VALL-E-X does NOT use HuggingFace's `DynamicCache` — its baseline cache is a bare `past_kv = (key_tensor, value_tensor)` tuple per layer concatenated with `torch.cat` each step (see `modules/activation.py:155-170`). Our Phase-1 cache replaces the TurboQuant overflow pattern, not this baseline bare-tuple path. Both the baseline bare-tuple and the Phase-1 TurboQuant cache hit realtime RTF on L4 as shown above.
+
+**Practical implication.** VALL-E-X on a single L4 can serve one realtime voice-synthesis stream with headroom. Concurrent streams would need batching, which is currently blocked by `assert y.shape[0] == 1` at `models/vallex.py:492` — see Phase 4 sketch for the design.
+
+---
+
 ## Methodology caveat — CER at temperature=1.0
 
 The VALL-E-X inference call uses `temperature=1.0` with no fixed seed. Each generation is stochastic: the same (sentence, config) pair can produce wildly different audio on re-run, and Whisper transcription adds its own error floor. Evidence:
