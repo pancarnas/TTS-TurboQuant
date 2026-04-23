@@ -1087,6 +1087,20 @@ def profile_all_configs(args):
             _tee(results_fh, f"Profile {config_name}: ERROR {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Release the profiler (retains ~1KB per event) and the TurboQuant
+            # cache before moving to the next config. Prevents host-RAM OOM on
+            # long profiles (Qwen at 1.7B has ~700k kernel events per run).
+            import gc
+            try:
+                del prof
+            except NameError:
+                pass
+            if hasattr(model, "_tq_cache_manager"):
+                model._tq_cache_manager = None
+            gc.collect()
+            if _is_cuda(device):
+                torch.cuda.empty_cache()
 
     _tee(results_fh, f"\nStructured results: {results_path}")
     results_fh.close()

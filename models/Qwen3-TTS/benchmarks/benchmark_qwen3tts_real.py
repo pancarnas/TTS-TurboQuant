@@ -1002,6 +1002,21 @@ def profile_all_configs(args):
             _tee(results_fh, f"Profile {config_name}: ERROR {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Release the profiler (retains ~1KB of metadata per kernel event —
+            # for Qwen that's ~700MB per config of host RAM) and the model's
+            # cached KV cache before moving to the next config. Without this,
+            # the second config's profile can OOM the host.
+            import gc
+            try:
+                del prof
+            except NameError:
+                pass
+            if hasattr(model.model, "last_kv_cache"):
+                model.model.last_kv_cache = None
+            gc.collect()
+            if _is_cuda(device):
+                torch.cuda.empty_cache()
 
     _tee(results_fh, f"\nStructured results: {results_path}")
     results_fh.close()
