@@ -539,12 +539,19 @@ def benchmark_qwen3tts(args):
 
     _tee(results_fh, "\nLoading Qwen3-TTS model...")
     t0 = time.time()
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     model = Qwen3TTSModel.from_pretrained(
         args.model,
         device_map=args.device,
         dtype=dtype,
     )
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
     _tee(results_fh, f"Model loaded in {time.time() - t0:.1f}s")
+    model_weight_mb = read_peak_memory_mb(device)
+    _tee(results_fh, f"Model weights + load-time VRAM: {model_weight_mb:.0f} MB")
 
     speakers = model.get_supported_speakers()
     speaker = speakers[0] if speakers else "Ryan"
@@ -903,8 +910,15 @@ def profile_all_configs(args):
 
     _tee(results_fh, "\nLoading Qwen3-TTS model...")
     t0 = time.time()
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     model = Qwen3TTSModel.from_pretrained(args.model, device_map=device, dtype=dtype)
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
     _tee(results_fh, f"Model loaded in {time.time() - t0:.1f}s")
+    model_weight_mb = read_peak_memory_mb(device)
+    _tee(results_fh, f"Model weights + load-time VRAM: {model_weight_mb:.0f} MB")
 
     speakers = model.get_supported_speakers()
     speaker = speakers[0] if speakers else "Ryan"

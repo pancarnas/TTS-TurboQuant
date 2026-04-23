@@ -534,6 +534,17 @@ class VALLE(VALLF):
         sum_logprobs = torch.zeros(best_of, device=y.device)  # implement batch decoding here
         x = x.repeat(best_of, 1, 1)
         y = y.repeat(best_of, 1)
+
+        # AR/NAR phase timing (used by benchmark_vallex_real.py for RTF breakdown).
+        # Events are always recorded on CUDA; a CPU-only run leaves them None.
+        _use_cuda_timing = torch.cuda.is_available() and y.is_cuda
+        _ar_start_ev = torch.cuda.Event(enable_timing=True) if _use_cuda_timing else None
+        _ar_end_ev = torch.cuda.Event(enable_timing=True) if _use_cuda_timing else None
+        _nar_start_ev = torch.cuda.Event(enable_timing=True) if _use_cuda_timing else None
+        _nar_end_ev = torch.cuda.Event(enable_timing=True) if _use_cuda_timing else None
+        if _ar_start_ev is not None:
+            _ar_start_ev.record()
+
         while True:
             y_emb = self.ar_audio_embedding(y)
             y_emb = self.ar_audio_prenet(y_emb)
@@ -607,11 +618,21 @@ class VALLE(VALLF):
 
             y = torch.concat([y, samples], dim=1)
 
+        # AR loop done.
+        if _ar_end_ev is not None:
+            _ar_end_ev.record()
+
         codes = [y[:, prefix_len + int(self.ar_audio_prepend_bos) :]]
         if self.num_quantizers == 1:
+            if _ar_end_ev is not None:
+                torch.cuda.synchronize()
+                self._ar_elapsed_ms = _ar_start_ev.elapsed_time(_ar_end_ev)
+                self._nar_elapsed_ms = 0.0
             return torch.stack(codes, dim=-1)
 
         # Non-AR Decoders
+        if _nar_start_ev is not None:
+            _nar_start_ev.record()
         y_emb = self.nar_audio_embeddings[0](
             y[:, int(self.ar_audio_prepend_bos) :]
         )
@@ -693,6 +714,11 @@ class VALLE(VALLF):
                     y_emb[:, prefix_len:] += embedding_layer(samples)
 
         assert len(codes) == self.num_quantizers
+        if _nar_end_ev is not None:
+            _nar_end_ev.record()
+            torch.cuda.synchronize()
+            self._ar_elapsed_ms = _ar_start_ev.elapsed_time(_ar_end_ev)
+            self._nar_elapsed_ms = _nar_start_ev.elapsed_time(_nar_end_ev)
         return torch.stack(codes, dim=-1)
 
     def continual(

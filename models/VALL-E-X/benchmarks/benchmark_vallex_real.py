@@ -588,13 +588,17 @@ def run_generation(model, codec, vocos, text, language, preset_path, device, tq_
     # encoded_frames shape (B=1, T, num_quantizers) — T is the AR-decoded token count.
     n_ar_tokens = int(encoded_frames.shape[1]) if encoded_frames.ndim >= 2 else 0
 
+    # AR/NAR phase split (ms) — populated by vallex.py when CUDA timing is available.
+    ar_elapsed_s = getattr(model, "_ar_elapsed_ms", 0.0) / 1000.0
+    nar_elapsed_s = getattr(model, "_nar_elapsed_ms", 0.0) / 1000.0
+
     wav = decode_audio(codec, vocos, encoded_frames, device)
 
     memory_report = None
     if tq_config is not None and hasattr(model, "_tq_cache_manager"):
         memory_report = model._tq_cache_manager.memory_report()
 
-    return wav, elapsed, memory_report, peak_vram_mb, n_ar_tokens
+    return wav, elapsed, memory_report, peak_vram_mb, n_ar_tokens, ar_elapsed_s, nar_elapsed_s
 
 
 # ---------------------------------------------------------------------------
@@ -634,8 +638,15 @@ def benchmark_vallex(args):
 
     _tee(results_fh, "\nLoading VALL-E-X model...")
     t0 = time.time()
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     model, codec, vocos = load_vallex_model(device)
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
     _tee(results_fh, f"Model loaded in {time.time() - t0:.1f}s")
+    model_weight_mb = read_peak_memory_mb(device)
+    _tee(results_fh, f"Model weights + load-time VRAM: {model_weight_mb:.0f} MB")
 
     preset_path = os.path.join(_VALLEX_DIR, "presets", args.preset)
     if not os.path.exists(preset_path):
@@ -693,14 +704,18 @@ def benchmark_vallex(args):
 
             for config_name, tq_config in TURBOQUANT_CONFIGS:
                 try:
-                    wav, elapsed, mem_report, peak_vram_mb, n_ar_tokens = run_generation(
+                    wav, elapsed, mem_report, peak_vram_mb, n_ar_tokens, ar_elapsed_s, nar_elapsed_s = run_generation(
                         model, codec, vocos, text, "en", preset_path, device, tq_config,
                     )
                     audio_duration = len(wav) / SAMPLE_RATE
                     rtf = elapsed / audio_duration if audio_duration > 0 else float("inf")
+                    ar_rtf = ar_elapsed_s / audio_duration if (audio_duration > 0 and ar_elapsed_s > 0) else 0.0
+                    nar_rtf = nar_elapsed_s / audio_duration if (audio_duration > 0 and nar_elapsed_s > 0) else 0.0
                     tokens_per_sec = n_ar_tokens / elapsed if elapsed > 0 else 0.0
 
                     group_results[config_name]["rtf"].append(rtf)
+                    group_results[config_name].setdefault("ar_rtf", []).append(ar_rtf)
+                    group_results[config_name].setdefault("nar_rtf", []).append(nar_rtf)
                     group_results[config_name]["peak_vram_mb"].append(peak_vram_mb)
                     group_results[config_name]["tokens_per_sec"].append(tokens_per_sec)
 
@@ -726,7 +741,10 @@ def benchmark_vallex(args):
                         group_results[config_name]["sim_compressed_mb"].append(sim_compressed_mb)
                         group_results[config_name]["realized_mb"].append(realized_mb)
 
-                    status = f"RTF={rtf:.2f} VRAM={peak_vram_mb:.0f}MB tok/s={tokens_per_sec:.1f}"
+                    status = f"RTF={rtf:.2f}"
+                    if ar_rtf > 0 or nar_rtf > 0:
+                        status += f" (AR={ar_rtf:.2f} NAR={nar_rtf:.2f})"
+                    status += f" VRAM={peak_vram_mb:.0f}MB tok/s={tokens_per_sec:.1f}"
                     error_rate = None
                     spk_sim = None
 
@@ -974,8 +992,15 @@ def profile_all_configs(args):
 
     _tee(results_fh, "\nLoading VALL-E-X model...")
     t0 = time.time()
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     model, codec, vocos = load_vallex_model(device)
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
     _tee(results_fh, f"Model loaded in {time.time() - t0:.1f}s")
+    model_weight_mb = read_peak_memory_mb(device)
+    _tee(results_fh, f"Model weights + load-time VRAM: {model_weight_mb:.0f} MB")
 
     preset_path = os.path.join(_VALLEX_DIR, "presets", args.preset)
     if not os.path.exists(preset_path):
