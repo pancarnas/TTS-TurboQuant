@@ -70,4 +70,5 @@ nltk_data/
 
 # Benchmark results and logs
 results/
-
+*.json
+*.gz
