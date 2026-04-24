@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vallex-turboquant"
+version = "0.1.0"
+description = "VALL-E-X benchmark dependencies for TurboQuant KV cache compression (English-only)"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+# Minimal benchmark-only dep set (no gradio/matplotlib/sudachipy; no pyopenjtalk/pypinyin — EN-only).
+# The VALL-E-X code is imported via sys.path from within the benchmark script, not pip-installed
+# as a package, so this project is a dep-only install.
+dependencies = [
+  # Core inference
+  "torch",
+  "torchaudio",
+  "numpy",
+  "scipy>=1.10.0",
+  # Audio I/O + features
+  "soundfile",
+  "librosa",
+  # VALL-E-X audio stack
+  "encodec",
+  "vocos",
+  # Tokenization
+  "tokenizers",
+  # English G2P path (english.py + cleaners.py transitive imports)
+  "unidecode",
+  "inflect",
+  "eng_to_ipa",
+  # Module-level imports in utils/g2p/mandarin.py fire even for EN-only text
+  "jieba",
+  "cn2an",
+  # Checkpoint download + progress
+  "wget",
+  "tqdm",
+  # Nicety — some eng_to_ipa paths dip into nltk
+  "nltk",
+  # Quality metrics
+  "openai-whisper",
+  "jiwer",
+  "transformers",
+]
+
+[tool.setuptools]
+# Deps-only install — the upstream VALL-E-X code is resolved via sys.path in the benchmark,
+# not as an importable pip package, because its internal imports are bare (e.g. `from models.vallex import VALLE`).
+py-modules = []

@@ -27,3 +27,9 @@ class TurboQuantConfig:
     protected_bits: int = 8
     seed: int = 42
     enabled: bool = True
+    # Phase-1 change (VALL-E-X): by default the cache stores K/V as fp16 in a
+    # preallocated buffer and reports compression metrics analytically. This
+    # eliminates the per-step cat/compress/decompress overhead that made
+    # TurboQuant 7x slower than baseline on L4. Set to False to run the old
+    # path (useful only for reconstruction-quality A/B tests).
+    track_only: bool = True
