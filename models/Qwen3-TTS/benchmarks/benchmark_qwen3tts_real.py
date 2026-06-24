@@ -533,6 +533,28 @@ def start_nvidia_smi_monitor(prefix: str, interval_s: float = 1.0) -> str:
     return csv_path
 
 
+# Cached voice-clone capability of the loaded checkpoint: None=unknown, True/False
+# once probed. Base models clone; CustomVoice models fall back to the preset speaker.
+_CLONE_SUPPORTED = None
+
+
+def _resolve_voice(item, voice_mode, default_ref_audio, default_ref_text):
+    """Effective (ref_audio, ref_text) for an item under a voice mode.
+
+    ``preset`` → never clone. ``clone`` → use the item's reference, else the
+    supplied default clip (curated groups have none). ``auto`` → clone when the
+    item carries a reference, else preset (run_generation falls back if the
+    checkpoint can't clone). Returns (None, None) to mean "use the preset speaker".
+    """
+    if voice_mode == "preset":
+        return None, None
+    if voice_mode == "clone":
+        if item.ref_audio:
+            return item.ref_audio, item.ref_text
+        return default_ref_audio, default_ref_text
+    return item.ref_audio, item.ref_text  # auto
+
+
 def run_generation(
     model,
     text,
@@ -584,15 +606,34 @@ def run_generation(
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
 
+    global _CLONE_SUPPORTED
     start = time.time()
-    if ref_audio is not None:
-        wavs, sr = model.generate_voice_clone(
-            text=text,
-            language=language,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            **kwargs,
-        )
+    if ref_audio is not None and _CLONE_SUPPORTED is not False:
+        try:
+            wavs, sr = model.generate_voice_clone(
+                text=text,
+                language=language,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                **kwargs,
+            )
+            _CLONE_SUPPORTED = True
+        except ValueError as exc:
+            if "generate_voice_clone" not in str(exc):
+                raise
+            # CustomVoice checkpoints reject cloning (custom_voice != base). The
+            # check fires before any sampling, so the seed is intact — fall back
+            # to the preset speaker. Warn once.
+            if _CLONE_SUPPORTED is None:
+                print(
+                    f"[run_generation] this checkpoint cannot voice-clone — using "
+                    f"the preset speaker {speaker!r} instead. (Use a *-Base model "
+                    f"for cloning; ground-truth SpkSim will reflect preset mismatch.)"
+                )
+            _CLONE_SUPPORTED = False
+            wavs, sr = model.generate_custom_voice(
+                text=text, language=language, speaker=speaker, **kwargs
+            )
     else:
         wavs, sr = model.generate_custom_voice(
             text=text,
@@ -697,6 +738,9 @@ def _sweep_arm(
     data_dir=None,
     num_shards=1,
     shard_id=0,
+    voice_mode="auto",
+    default_ref_audio=None,
+    default_ref_text=None,
 ):
     """Run the full group×sentence×seed×temperature×config sweep for one arm.
 
@@ -766,6 +810,9 @@ def _sweep_arm(
                         device,
                         deterministic,
                         save_wav=(seed == seeds[0] and temp == temps[0]),
+                        voice_mode=voice_mode,
+                        default_ref_audio=default_ref_audio,
+                        default_ref_text=default_ref_text,
                     )
 
         _print_group_averages(results_fh, metrics, group_name, group_results)
@@ -792,11 +839,21 @@ def _sweep_sentence_seed(
     device,
     deterministic,
     save_wav,
+    voice_mode="auto",
+    default_ref_audio=None,
+    default_ref_text=None,
 ):
     """Run all configs for one (sentence, seed, temperature), paired on the same draw."""
     text = item.text
     baseline_wav = None
     baseline_sr = None
+    eff_ref_audio, eff_ref_text = _resolve_voice(
+        item, voice_mode, default_ref_audio, default_ref_text
+    )
+    # In clone mode an item with no reference (and no default clip) can't be voiced.
+    if voice_mode == "clone" and not eff_ref_audio:
+        _tee(results_fh, f"    skip (clone mode, no reference) {group_name}/{idx}")
+        return
     # Ground-truth reference clip (same text) preferred; else the cloning prompt.
     # Loaded once per cell for the side-by-side spk_sim_ref metric.
     ref_wav, ref_sr = _load_reference_clip(item, metrics)
@@ -813,8 +870,8 @@ def _sweep_sentence_seed(
                 seed=seed,
                 gen_overrides=gen_overrides,
                 deterministic=deterministic,
-                ref_audio=item.ref_audio,
-                ref_text=item.ref_text,
+                ref_audio=eff_ref_audio,
+                ref_text=eff_ref_text,
             )
             wav = wavs[0]
             audio_duration = len(wav) / sr
@@ -1070,6 +1127,9 @@ def benchmark_qwen3tts(args):
             data_dir=data_dir,
             num_shards=num_shards,
             shard_id=shard_id,
+            voice_mode=getattr(args, "voice_mode", "auto"),
+            default_ref_audio=getattr(args, "default_ref_audio", None),
+            default_ref_text=getattr(args, "default_ref_text", None),
         )
         _print_arm_summaries(results_fh, metrics, arm, active_groups, summary)
 
@@ -1532,6 +1592,27 @@ def main():
         help="Directory holding the standard eval sets (en/*.lst + prompt-wavs + "
         "ellav_hard.txt) from tools/fetch_eval_data.py. Required for the "
         "seedtts_en / ellav_hard groups; ignored by the curated groups.",
+    )
+    parser.add_argument(
+        "--voice-mode",
+        default="auto",
+        choices=["auto", "preset", "clone"],
+        help="How to voice each sentence. 'preset' = built-in speaker (needs a "
+        "*-CustomVoice checkpoint). 'clone' = zero-shot clone a reference clip "
+        "(needs a *-Base checkpoint + --default-ref-audio for groups without one). "
+        "'auto' (default) = clone when a reference exists, else preset, falling "
+        "back to preset if the checkpoint can't clone.",
+    )
+    parser.add_argument(
+        "--default-ref-audio",
+        default=None,
+        help="Reference WAV used in clone mode for sentences with no own clip "
+        "(the curated groups). Its transcript should be given via --default-ref-text.",
+    )
+    parser.add_argument(
+        "--default-ref-text",
+        default=None,
+        help="Transcript of --default-ref-audio (for ICL cloning).",
     )
     parser.add_argument(
         "--num-shards",
