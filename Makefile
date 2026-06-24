@@ -180,7 +180,7 @@ eval-qwen-parallel:
 	done; \
 	wait
 	@echo "All shards done. Analyze this run with:"
-	@echo "  python tools/analyze_kv_benchmark.py --trials-glob 'results/qwen_trials_shard*_$(RUN_TAG).csv' --out-md results/analysis_$(RUN_TAG).md"
+	@echo "  python tools/analyze_kv_benchmark.py --trials-glob 'results/qwen_trials_shard*_$(RUN_TAG)_*.csv' --out-md results/analysis_$(RUN_TAG).md"
 
 eval-vallex-parallel:
 	@mkdir -p results
@@ -194,7 +194,7 @@ eval-vallex-parallel:
 	done; \
 	wait
 	@echo "All shards done. Analyze this run with:"
-	@echo "  python tools/analyze_kv_benchmark.py --trials-glob 'results/vallex_trials_shard*_$(RUN_TAG).csv' --out-md results/analysis_$(RUN_TAG).md"
+	@echo "  python tools/analyze_kv_benchmark.py --trials-glob 'results/vallex_trials_shard*_$(RUN_TAG)_*.csv' --out-md results/analysis_$(RUN_TAG).md"
 
 # Fast pipeline check: 1 long sentence, real compression (no data fetch needed).
 # Configs should DIFFER (SpkSim < 1.0) — confirms track_only=False reaches generation.
