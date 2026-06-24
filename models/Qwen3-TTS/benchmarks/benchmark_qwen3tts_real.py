@@ -744,6 +744,13 @@ def run_generation(
     if seed is not None:
         set_global_seed(seed, deterministic=deterministic)
 
+    if device is None and hasattr(model, "device"):
+        device = model.device
+
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
     start = time.time()
     wavs, sr = model.generate_custom_voice(
         text=text,

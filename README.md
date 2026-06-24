@@ -1,6 +1,6 @@
 # TTS-TurboQuant
 
-Integration of [TurboQuant](https://arxiv.org/abs/2406.02525) KV cache compression into [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). Reduces KV cache memory by 2-4x during autoregressive speech generation with minimal quality loss.
+Integration of [TurboQuant](https://arxiv.org/pdf/2504.19874v1) KV cache compression into [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). Reduces KV cache memory by 2-4x during autoregressive speech generation with minimal quality loss.
 
 Based on the [TurboQuant reference implementation](https://github.com/0xSero/turboquant).
 
