@@ -249,6 +249,9 @@ class QualityMetrics:
                     .to(self._device)
                     .eval()
                 )
+                # Device for WavLM; flips to CPU on a CUDA OOM (long audio under
+                # multi-shard contention) so a trial row is never dropped.
+                self._wavlm_device = self._device
             except Exception as e:
                 print(
                     f"WARNING: WavLM failed to load ({type(e).__name__}: {e}). "
@@ -258,6 +261,13 @@ class QualityMetrics:
                 self._wavlm_model = False
                 return False
         return True
+
+    def _wavlm_embed(self, inputs):
+        inputs = {k: v.to(self._wavlm_device) for k, v in inputs.items()}
+        with torch.no_grad():
+            emb = self._wavlm_model(**inputs).embeddings
+            emb = torch.nn.functional.normalize(emb, dim=-1)
+        return emb.squeeze().cpu().numpy()
 
     def speaker_embedding(self, wav: np.ndarray, sr: int):
         if not self._load_wavlm():
@@ -270,11 +280,14 @@ class QualityMetrics:
         inputs = self._wavlm_extractor(
             wav, sampling_rate=16000, return_tensors="pt", padding=True
         )
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        with torch.no_grad():
-            emb = self._wavlm_model(**inputs).embeddings
-            emb = torch.nn.functional.normalize(emb, dim=-1)
-        return emb.squeeze().cpu().numpy()
+        try:
+            return self._wavlm_embed(inputs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            self._wavlm_model = self._wavlm_model.to("cpu")
+            self._wavlm_device = "cpu"
+            print("[QualityMetrics] WavLM OOM on GPU — moved to CPU for speaker sim.")
+            return self._wavlm_embed(inputs)
 
     def speaker_cosine_similarity(
         self, wav_a: np.ndarray, sr_a: int, wav_b: np.ndarray, sr_b: int

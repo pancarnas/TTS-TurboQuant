@@ -136,9 +136,24 @@ class QualityMetrics:
                 .to(self._device)
                 .eval()
             )
+            # WavLM self-attention is O(audio_len^2); a long clip can OOM the GPU
+            # under multi-shard contention. Track its device so we can fall back
+            # to CPU permanently on the first OOM rather than dropping a trial row.
+            self._wavlm_device = self._device
+
+    def _wavlm_embed(self, inputs: dict) -> np.ndarray:
+        inputs = {k: v.to(self._wavlm_device) for k, v in inputs.items()}
+        with torch.no_grad():
+            emb = self._wavlm_model(**inputs).embeddings
+            emb = torch.nn.functional.normalize(emb, dim=-1)
+        return emb.squeeze().cpu().numpy()
 
     def speaker_embedding(self, wav: np.ndarray, sr: int) -> np.ndarray:
-        """Extract normalized speaker embedding (512-dim)."""
+        """Extract normalized speaker embedding (512-dim).
+
+        Falls back to CPU permanently on a CUDA OOM (long audio on a contended
+        GPU), so a speaker-sim measurement never silently drops a trial row.
+        """
         self._load_wavlm()
 
         wav = wav.astype(np.float32)
@@ -152,13 +167,14 @@ class QualityMetrics:
         inputs = self._wavlm_extractor(
             wav, sampling_rate=16000, return_tensors="pt", padding=True
         )
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            emb = self._wavlm_model(**inputs).embeddings
-            emb = torch.nn.functional.normalize(emb, dim=-1)
-
-        return emb.squeeze().cpu().numpy()
+        try:
+            return self._wavlm_embed(inputs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            self._wavlm_model = self._wavlm_model.to("cpu")
+            self._wavlm_device = "cpu"
+            print("[QualityMetrics] WavLM OOM on GPU — moved to CPU for speaker sim.")
+            return self._wavlm_embed(inputs)
 
     def speaker_cosine_similarity(
         self, wav_a: np.ndarray, sr_a: int, wav_b: np.ndarray, sr_b: int
