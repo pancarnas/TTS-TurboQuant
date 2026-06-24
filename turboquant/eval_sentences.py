@@ -88,11 +88,20 @@ def parse_seedtts_lst(
 def load_seedtts_en(
     data_dir: str, limit: Optional[int] = None, cross_speaker: bool = False
 ) -> list[EvalItem]:
-    """Load seed-tts-eval ``test-en`` from ``data_dir`` (see ``fetch_eval_data``)."""
+    """Load seed-tts-eval ``test-en`` from ``data_dir`` (see ``fetch_eval_data``).
+
+    Wav paths in the ``.lst`` are relative to the ``.lst``'s own ``en/`` directory
+    (the repo stores them under ``en/prompt-wavs`` / ``en/wavs``), so resolve audio
+    against ``<data_dir>/en`` when that layout is present, else ``<data_dir>``.
+    """
     name = "non_para_reconstruct_meta.lst" if cross_speaker else "meta.lst"
     lst_path = os.path.join(data_dir, "en", name)
+    en_dir = os.path.join(data_dir, "en")
+    audio_root = (
+        en_dir if os.path.isdir(os.path.join(en_dir, "prompt-wavs")) else data_dir
+    )
     with open(lst_path, encoding="utf-8") as fh:
-        items = parse_seedtts_lst(fh, audio_root=data_dir, group="seedtts_en")
+        items = parse_seedtts_lst(fh, audio_root=audio_root, group="seedtts_en")
     return items[:limit] if limit else items
 
 

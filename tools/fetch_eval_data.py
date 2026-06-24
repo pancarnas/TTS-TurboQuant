@@ -20,8 +20,9 @@ import os
 from typing import Optional
 
 SEEDTTS_REPO = "zhaochenyang20/seed-tts-eval"
-# en set references prompt-wavs/common_voice_en_*.wav; wavs/ holds ground truth.
-_SEEDTTS_PATTERNS = ["en/*", "prompt-wavs/*", "wavs/*"]
+# The English set lives entirely under en/ (en/meta.lst + en/prompt-wavs + en/wavs);
+# ** is recursive. Root-level fallbacks kept in case a mirror uses a flat layout.
+_SEEDTTS_PATTERNS = ["en/**", "prompt-wavs/**", "wavs/**"]
 
 # Reconstruction of the ELLA-V-style hard set: word repetitions + tongue-twisters,
 # the patterns that make autoregressive TTS loop/skip (and that KV-compression
@@ -72,6 +73,25 @@ def _referenced_wavs(lst_path: str, limit: Optional[int]) -> list[str]:
     return rels
 
 
+def _resolve_real_paths(rels, repo_files) -> list[str]:
+    """Map ``.lst`` wav refs to actual repo paths (they live under ``en/``, not root).
+
+    The ``.lst`` lists ``prompt-wavs/x.wav`` relative to its own ``en/`` dir, so the
+    real repo path is ``en/prompt-wavs/x.wav``. Match by exact path or path suffix so
+    this works whatever prefix the dataset actually uses. Unmatched refs are dropped.
+    """
+    fileset = set(repo_files)
+    out: list[str] = []
+    for rel in rels:
+        if rel in fileset:
+            out.append(rel)
+            continue
+        match = next((f for f in repo_files if f.endswith("/" + rel)), None)
+        if match:
+            out.append(match)
+    return out
+
+
 def _parallel_download(repo: str, rels, data_dir: str, token, workers: int) -> None:
     """Download repo-relative files concurrently (token raises the anon rate limit)."""
     from concurrent.futures import ThreadPoolExecutor
@@ -102,7 +122,7 @@ def fetch_seedtts(data_dir: str, limit: Optional[int] = None, workers: int = 4) 
     """
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     try:
-        from huggingface_hub import hf_hub_download, snapshot_download
+        from huggingface_hub import HfApi, hf_hub_download, snapshot_download
         from huggingface_hub.errors import HfHubHTTPError
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise SystemExit(
@@ -125,8 +145,13 @@ def fetch_seedtts(data_dir: str, limit: Optional[int] = None, workers: int = 4) 
                 p = os.path.join(data_dir, lst)
                 if os.path.exists(p):
                     rels.update(_referenced_wavs(p, limit))
-            print(f"  fetching {len(rels)} wavs for the first {limit} samples ...")
-            _parallel_download(SEEDTTS_REPO, sorted(rels), data_dir, token, workers)
+            # The .lst paths are relative to en/; resolve to the real repo paths.
+            repo_files = HfApi().list_repo_files(
+                repo_id=SEEDTTS_REPO, repo_type="dataset", token=token
+            )
+            real = _resolve_real_paths(sorted(rels), repo_files)
+            print(f"  fetching {len(real)} wavs for the first {limit} samples ...")
+            _parallel_download(SEEDTTS_REPO, real, data_dir, token, workers)
         else:
             snapshot_download(
                 repo_id=SEEDTTS_REPO,
