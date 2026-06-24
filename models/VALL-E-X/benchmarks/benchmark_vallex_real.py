@@ -112,6 +112,7 @@ import atexit
 import datetime
 import shutil
 import subprocess
+from typing import Optional
 
 # VALL-E-X uses bare module imports (e.g. `from models.vallex import VALLE`);
 # add its directory to sys.path so those resolve.
@@ -121,6 +122,7 @@ sys.path.insert(0, _VALLEX_DIR)
 
 import pathlib
 import platform
+
 if platform.system().lower() != "windows":
     pathlib.WindowsPath = pathlib.PosixPath
 
@@ -131,13 +133,44 @@ import librosa
 
 from models.vallex import VALLE
 from macros import (
-    N_DIM, NUM_HEAD, NUM_LAYERS, PREFIX_MODE, NUM_QUANTIZERS,
-    SAMPLE_RATE, lang2token,
+    N_DIM,
+    NUM_HEAD,
+    NUM_LAYERS,
+    PREFIX_MODE,
+    NUM_QUANTIZERS,
+    SAMPLE_RATE,
+    lang2token,
 )
 from data.tokenizer import AudioTokenizer
 from data.collation import get_text_token_collater
 from utils.g2p import PhonemeBpeTokenizer
 from turboquant_cache import TurboQuantConfig
+
+from turboquant.bench_common import (
+    TRIAL_COLUMNS,
+    config_bits,
+    format_trial_row,
+    parse_arms,
+    parse_seeds,
+    parse_temperatures,
+    sentence_hash,
+    set_global_seed,
+)
+
+
+# VALL-E decode-arm overrides (model.inference takes top_k/temperature directly,
+# not the do_sample/subtalker kwargs the Qwen talker uses). Greedy = argmax
+# (top_k=1); sampling = the model's default top_k=-100 (sample over full vocab).
+def vallex_decode_params(arm: str, temperature: Optional[float] = None) -> dict:
+    if arm == "greedy":
+        # top_k=1 is argmax; temperature is irrelevant, so a swept value is ignored.
+        return {"top_k": 1, "temperature": 1.0}
+    if arm == "sampling":
+        return {
+            "top_k": -100,
+            "temperature": 1.0 if temperature is None else temperature,
+        }
+    raise ValueError(f"unknown decode arm: {arm!r}")
 
 
 # --- Test sentences (mirrors Qwen3-TTS benchmark for direct A/B comparison) ---
@@ -154,6 +187,11 @@ SENTENCE_GROUPS = {
         "He walked slowly down the empty street.",
         "We need to finish this before Friday.",
         "Thank you very much for your help.",
+        "The dog ran across the wide green field.",
+        "I forgot my umbrella at the office again.",
+        "Let us meet for coffee tomorrow afternoon.",
+        "The bridge was closed for repairs today.",
+        "Turn left at the second traffic light.",
     ],
     "medium": [
         "The old man sat quietly on the bench, watching the children play in the park while the sun slowly set behind the distant mountains.",
@@ -163,6 +201,11 @@ SENTENCE_GROUPS = {
         "Running a small business requires patience, creativity, and a willingness to adapt to changing market conditions, especially during times of economic uncertainty.",
         "The documentary explored how traditional farming methods are being combined with modern technology to create more sustainable agricultural practices around the world.",
         "Every morning she would walk through the garden, picking fresh herbs for breakfast while listening to the birds sing their familiar songs in the tall oak trees.",
+        "The committee debated the proposal for nearly three hours before finally agreeing on a compromise that satisfied neither the developers nor the local residents.",
+        "As the storm approached the coast, fishermen hurried to secure their boats while families along the shoreline boarded up their windows and stocked up on supplies.",
+        "The young pianist practiced the same difficult passage over and over, determined to perform it flawlessly at the competition that would take place the next weekend.",
+        "Researchers spent the better part of a decade tracking the migration patterns of the arctic tern, which travels farther each year than almost any other creature.",
+        "The small bakery on the corner had been run by the same family for three generations, and its fresh cinnamon bread drew customers from across the city.",
     ],
     "long": [
         (
@@ -199,9 +242,120 @@ SENTENCE_GROUPS = {
         (
             "The art of cooking has transformed dramatically over the past century. What was once a daily "
             "necessity focused purely on survival has become a global cultural phenomenon. Chefs travel the "
-            "world to study different traditions, combining techniques from Asia, Europe, Africa, and the "
-            "Americas to create dishes that tell stories of migration, trade, and human connection. Food "
+            "world to study different traditions, combining techniques from many continents "
+            "to create dishes that tell stories of migration, trade, and human connection. Food "
             "brings people together across languages and borders in ways that few other things can."
+        ),
+        (
+            "Space exploration has captured the human imagination since the first satellites were launched "
+            "into orbit more than sixty years ago. What began as a fierce competition between rival nations "
+            "has gradually evolved into an era of international cooperation, with astronauts from many "
+            "countries living and working together aboard orbiting laboratories. Today, private companies "
+            "are building reusable rockets, and serious plans are being drawn up to return humans to the Moon "
+            "and eventually send them to Mars."
+        ),
+        (
+            "The invention of the printing press in the fifteenth century transformed the way knowledge "
+            "spread across the world. Before that time, books were copied painstakingly by hand, making them "
+            "rare and extraordinarily expensive. Once printed books became widely available, literacy rates "
+            "climbed, new ideas traveled faster than ever before, and ordinary people gained access to "
+            "information that had once been reserved for the wealthy and the powerful few."
+        ),
+        (
+            "Forests play a vital role in maintaining the delicate balance of life on our planet. They absorb "
+            "carbon dioxide from the atmosphere, release the oxygen we breathe, and provide a home for "
+            "countless species of plants and animals. When large areas of forest are cleared for agriculture "
+            "or development, the consequences ripple outward, affecting rainfall patterns, soil quality, and "
+            "the survival of communities that depend on these ecosystems for their livelihoods."
+        ),
+        (
+            "The internet has fundamentally reshaped how people communicate, work, and learn in the span of a "
+            "single generation. Messages that once took days or weeks to deliver now travel around the globe "
+            "in fractions of a second. Students can attend lectures from universities thousands of miles away, "
+            "businesses can collaborate across continents, and friends separated by oceans can speak face to "
+            "face as though they were sitting in the same room."
+        ),
+        (
+            "Becoming an elite athlete demands far more than natural talent and physical strength. It requires "
+            "years of disciplined training, careful attention to nutrition and rest, and an unshakable mental "
+            "resilience in the face of setbacks and injuries. For every champion who stands on the podium, "
+            "there are countless hours of early mornings, painful defeats, and quiet sacrifices that the "
+            "cheering crowds will never see or fully appreciate."
+        ),
+    ],
+    # Prosodically demanding + long-decode text (numbers, dates, units, codes,
+    # abbreviations). All English (no foreign words / diacritics). Pushes CER off
+    # the ~0% floor so config differences become measurable, and mirrors across
+    # both models for A/B parity.
+    "hard": [
+        (
+            "On 03/17/2026 at 9:45 a.m., the Chicago logistics team delivered 1,348 units to "
+            "Warehouse 7B, invoice number QX-90217, at a unit cost of $12.74, a 6.3% increase over "
+            "the previous quarter's figure of $11.98."
+        ),
+        (
+            "Doctor Nguyen presented the cohort's results: 27 of 312 patients, about 8.7%, exhibited the "
+            "rare CYP2D6 polymorphism, while baseline HbA1c dropped from 9.2% to 6.4% over "
+            "fourteen weeks, with no statistically significant adverse events."
+        ),
+        (
+            "The flight from Denver to Atlanta was delayed nearly three hours, pushing our connection at "
+            "gate B17 back to 11:52 p.m. and forcing an unplanned overnight stay at a hotel near the airport."
+        ),
+        (
+            "She muttered the tongue-twister thrice, reciting 'the sixth sick sheikh's sixth sheep's sick', "
+            "then recited Avogadro's number, 6.022 times ten to the twenty-third, before spelling "
+            "the words 'rhythm', 'colonel', and 'Worcestershire' aloud without a single mistake."
+        ),
+        (
+            "Per the third-quarter earnings call, revenue reached $2.4 billion, up 11.2% year over year, "
+            "the operating margin held at 34%, and the chief financial officer reaffirmed full-year guidance "
+            "of $9.8 to $10.1 billion despite headwinds in several regional segments."
+        ),
+        (
+            "The arbitration clause in Section 14(b), subsection three, caps liability at $2,500,000 and "
+            "mandates venue in Wilmington, Delaware, no later than 30 days after written notice is served."
+        ),
+        (
+            "The Large Hadron Collider accelerates protons to 6.8 trillion electron volts, colliding them "
+            "forty million times per second inside detectors cooled to 1.9 kelvin, barely above absolute zero."
+        ),
+        (
+            "Administer 0.5 milligrams per kilogram intravenously every eight hours, not to exceed "
+            "2 grams daily; monitor creatinine clearance and discontinue if it falls below "
+            "30 milliliters per minute."
+        ),
+        (
+            "The quarterly report listed 4,096 active users, a churn rate of 2.3%, and average revenue "
+            "per user of $18.40, up from $16.75 the previous spring."
+        ),
+        (
+            "On July 14th, 1789, crowds stormed the prison fortress; exactly two hundred and fifteen years "
+            "later, in 2004, the union welcomed ten new member states, expanding from fifteen to twenty-five."
+        ),
+        (
+            "Upgrade the cluster to Kubernetes version 1.29.4, bump the database image from 14.11 to "
+            "16.3, and rotate the security certificates before they expire on 2026-09-08 at 23:59."
+        ),
+        (
+            "The conscientious archaeologist carefully catalogued the ancient cuneiform "
+            "tablets, pronouncing 'Nebuchadnezzar' and 'Gilgamesh' with surprising fluency despite "
+            "a stubborn case of laryngitis."
+        ),
+        (
+            "Down ninety-eight to ninety-six with 4.7 seconds left, she sank a twenty-seven-foot "
+            "three-pointer at the buzzer, finishing with 41 points, 12 rebounds, and 8 assists on "
+            "63 percent shooting."
+        ),
+        (
+            "Preheat the oven to 425 degrees, whisk 250 grams of flour with three quarters "
+            "of a teaspoon of salt, then fold in one and a half cups of buttermilk and bake for "
+            "eighteen to twenty-two minutes."
+        ),
+        (
+            "The Supreme Court ruled six to three that the statute, codified at Section 1331 of Title 28, "
+            "did not preempt the state's 1974 consumer-protection act, remanding the case to the "
+            "appeals court for further proceedings."
         ),
     ],
 }
@@ -219,6 +373,7 @@ TURBOQUANT_CONFIGS = [
 # Quality metrics (mirrors Qwen benchmark)
 # ---------------------------------------------------------------------------
 
+
 class QualityMetrics:
     """Lazy-loaded quality evaluation: Whisper CER, WavLM speaker sim."""
 
@@ -231,11 +386,15 @@ class QualityMetrics:
     def _load_whisper(self):
         if self._whisper is None:
             import whisper
+
             self._whisper = whisper.load_model("base", device=self._device)
 
-    def whisper_cer(self, wav: np.ndarray, sr: int, reference_text: str) -> tuple[float, str]:
+    def whisper_cer(
+        self, wav: np.ndarray, sr: int, reference_text: str
+    ) -> tuple[float, str]:
         self._load_whisper()
         from jiwer import cer
+
         wav = wav.astype(np.float32)
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
@@ -264,12 +423,15 @@ class QualityMetrics:
         if self._wavlm_model is None:
             try:
                 from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+
                 self._wavlm_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
                     "microsoft/wavlm-base-plus-sv"
                 )
-                self._wavlm_model = WavLMForXVector.from_pretrained(
-                    "microsoft/wavlm-base-plus-sv"
-                ).to(self._device).eval()
+                self._wavlm_model = (
+                    WavLMForXVector.from_pretrained("microsoft/wavlm-base-plus-sv")
+                    .to(self._device)
+                    .eval()
+                )
             except Exception as e:
                 print(
                     f"WARNING: WavLM failed to load ({type(e).__name__}: {e}). "
@@ -297,8 +459,9 @@ class QualityMetrics:
             emb = torch.nn.functional.normalize(emb, dim=-1)
         return emb.squeeze().cpu().numpy()
 
-    def speaker_cosine_similarity(self, wav_a: np.ndarray, sr_a: int,
-                                   wav_b: np.ndarray, sr_b: int):
+    def speaker_cosine_similarity(
+        self, wav_a: np.ndarray, sr_a: int, wav_b: np.ndarray, sr_b: int
+    ):
         """Return cosine similarity, or None if WavLM is unavailable."""
         emb_a = self.speaker_embedding(wav_a, sr_a)
         if emb_a is None:
@@ -313,17 +476,11 @@ class QualityMetrics:
 # Model loading & generation
 # ---------------------------------------------------------------------------
 
-def fmt_bytes(n: int) -> str:
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 ** 2:
-        return f"{n / 1024:.1f} KB"
-    return f"{n / 1024 ** 2:.1f} MB"
-
 
 # ---------------------------------------------------------------------------
 # GPU + memory instrumentation
 # ---------------------------------------------------------------------------
+
 
 def _is_cuda(device) -> bool:
     if isinstance(device, torch.device):
@@ -344,7 +501,7 @@ def log_gpu_config(device, sink=None):
             f"  name={torch.cuda.get_device_name(dev)}",
             f"  compute_capability={cap[0]}.{cap[1]} (sm_{cap[0]}{cap[1]})",
             f"  multi_processor_count={props.multi_processor_count}",
-            f"  total_memory={props.total_memory / (1024 ** 3):.1f} GB",
+            f"  total_memory={props.total_memory / (1024**3):.1f} GB",
             f"  torch={torch.__version__} cuda={torch.version.cuda}",
         ]
     out = "\n".join(lines)
@@ -354,15 +511,10 @@ def log_gpu_config(device, sink=None):
         sink.flush()
 
 
-def reset_peak_memory(device):
-    if _is_cuda(device):
-        torch.cuda.reset_peak_memory_stats(device)
-
-
 def read_peak_memory_mb(device) -> float:
     if not _is_cuda(device):
         return 0.0
-    return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    return torch.cuda.max_memory_allocated(device) / (1024**2)
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +599,7 @@ def start_nvidia_smi_monitor(prefix: str, interval_s: float = 1.0) -> str:
 # Incremental results file (so a crash doesn't lose partial data)
 # ---------------------------------------------------------------------------
 
+
 def _open_results_file(prefix: str) -> tuple:
     """Open a line-buffered append handle under <repo>/results/.
 
@@ -460,34 +613,24 @@ def _open_results_file(prefix: str) -> tuple:
     # buffering=1 → line-buffered: each line flushes on newline
     fh = open(path, "a", buffering=1, encoding="utf-8")
     fh.write(f"# {prefix} run started {ts}\n")
-    fh.write(f"# columns: group,idx,config,rtf,cer,spk_sim,peak_vram_mb,tokens_per_sec,"
-             f"sim_compressed_mb,realized_mb,theoretical_ratio,effective_ratio\n")
+    return fh, path
+
+
+def _open_csv_file(prefix: str, columns: list) -> tuple:
+    """Open a real ``.csv`` (header row, no '#') for downstream pandas analysis."""
+    repo_root = os.path.dirname(os.path.dirname(_VALLEX_DIR))
+    results_dir = os.path.join(repo_root, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(results_dir, f"{prefix}_{ts}.csv")
+    fh = open(path, "a", buffering=1, encoding="utf-8")
+    fh.write(",".join(columns) + "\n")
     return fh, path
 
 
 def _write_result_line(fh, **kw):
-    """Append one CSV-ish row. Missing values render as empty.
-
-    sim_compressed_mb: analytical — what compression WOULD store at configured bits.
-    realized_mb: actual VRAM used by the cache's fp16 buffer (track_only=True default).
-    theoretical_ratio: fp16_equiv / sim_compressed (how effective compression would be).
-    effective_ratio: fp16_equiv / realized (what we actually save; 1.0 in track_only mode).
-    """
-    cols = [
-        "group", "idx", "config", "rtf", "cer", "spk_sim",
-        "peak_vram_mb", "tokens_per_sec", "sim_compressed_mb",
-        "realized_mb", "theoretical_ratio", "effective_ratio",
-    ]
-    row = []
-    for c in cols:
-        v = kw.get(c)
-        if v is None:
-            row.append("")
-        elif isinstance(v, float):
-            row.append(f"{v:.6g}")
-        else:
-            row.append(str(v))
-    fh.write(",".join(row) + "\n")
+    """Append one per-trial CSV row using the shared TRIAL_COLUMNS schema."""
+    fh.write(format_trial_row(kw) + "\n")
 
 
 def load_vallex_model(device):
@@ -499,6 +642,7 @@ def load_vallex_model(device):
     if not os.path.exists(checkpoint_path):
         print("Downloading VALL-E-X checkpoint from HuggingFace...")
         import wget
+
         wget.download(
             "https://huggingface.co/Plachta/VALL-E-X/resolve/main/vallex-checkpoint.pt",
             out=checkpoint_path,
@@ -506,12 +650,22 @@ def load_vallex_model(device):
         )
         print()
 
-    model = VALLE(
-        N_DIM, NUM_HEAD, NUM_LAYERS,
-        norm_first=True, add_prenet=False, prefix_mode=PREFIX_MODE,
-        share_embedding=True, nar_scale_factor=1.0,
-        prepend_bos=True, num_quantizers=NUM_QUANTIZERS,
-    ).half().to(device)
+    model = (
+        VALLE(
+            N_DIM,
+            NUM_HEAD,
+            NUM_LAYERS,
+            norm_first=True,
+            add_prenet=False,
+            prefix_mode=PREFIX_MODE,
+            share_embedding=True,
+            nar_scale_factor=1.0,
+            prepend_bos=True,
+            num_quantizers=NUM_QUANTIZERS,
+        )
+        .half()
+        .to(device)
+    )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=False)
@@ -521,6 +675,7 @@ def load_vallex_model(device):
 
     try:
         from vocos import Vocos
+
         vocos = Vocos.from_pretrained("charactr/vocos-encodec-24khz").to(device)
     except ImportError:
         vocos = None
@@ -539,12 +694,32 @@ def decode_audio(codec, vocos, codes, device):
 
 
 @torch.no_grad()
-def run_generation(model, codec, vocos, text, language, preset_path, device, tq_config):
+def run_generation(
+    model,
+    codec,
+    vocos,
+    text,
+    language,
+    preset_path,
+    device,
+    tq_config,
+    seed=None,
+    decode_params=None,
+    deterministic=False,
+):
     """Run one generation end-to-end.
 
     Returns (wav, elapsed, memory_report, peak_vram_mb, n_ar_tokens).
     Wall time covers GPU completion via an explicit sync before/after inference.
+
+    ``seed`` (if given) is applied via set_global_seed right before inference so
+    baseline and every compressed config share the same random draw for this
+    (sentence, seed) — the paired-comparison control. ``decode_params`` overrides
+    top_k/temperature (greedy vs sampling arm).
     """
+    dp = {"top_k": -100, "temperature": 1.0}
+    if decode_params:
+        dp.update(decode_params)
     text_tokenizer = PhonemeBpeTokenizer(
         tokenizer_path=os.path.join(_VALLEX_DIR, "utils", "g2p", "bpe_69.json")
     )
@@ -568,14 +743,17 @@ def run_generation(model, codec, vocos, text, language, preset_path, device, tq_
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
 
+    if seed is not None:
+        set_global_seed(seed, deterministic=deterministic)
+
     start = time.time()
     encoded_frames = model.inference(
         text_tokens.to(device),
         text_tokens_lens.to(device),
         audio_prompts,
         enroll_x_lens=enroll_x_lens,
-        top_k=-100,
-        temperature=1.0,
+        top_k=dp["top_k"],
+        temperature=dp["temperature"],
         prompt_language=lang_pr,
         text_language=langs,
         turboquant_config=tq_config,
@@ -598,12 +776,21 @@ def run_generation(model, codec, vocos, text, language, preset_path, device, tq_
     if tq_config is not None and hasattr(model, "_tq_cache_manager"):
         memory_report = model._tq_cache_manager.memory_report()
 
-    return wav, elapsed, memory_report, peak_vram_mb, n_ar_tokens, ar_elapsed_s, nar_elapsed_s
+    return (
+        wav,
+        elapsed,
+        memory_report,
+        peak_vram_mb,
+        n_ar_tokens,
+        ar_elapsed_s,
+        nar_elapsed_s,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main benchmark loop — mirrors Qwen's per-group averaging structure
 # ---------------------------------------------------------------------------
+
 
 def _out_path(output_dir: str, group_name: str, idx: int, config_name: str) -> str:
     safe = config_name.replace(" ", "_").replace("/", "_")
@@ -617,17 +804,392 @@ def _tee(fh, msg):
         fh.write(msg + "\n")
 
 
+def _vallex_empty_group_results() -> dict:
+    metric_keys = (
+        "rtf",
+        "ar_rtf",
+        "nar_rtf",
+        "cer",
+        "spk_sim",
+        "theoretical_ratio",
+        "effective_ratio",
+        "peak_vram_mb",
+        "tokens_per_sec",
+        "sim_compressed_mb",
+        "realized_mb",
+    )
+    return {name: {k: [] for k in metric_keys} for name, _ in TURBOQUANT_CONFIGS}
+
+
+def _vallex_mem_metrics(mem_report) -> dict:
+    if not mem_report:
+        return {
+            "theoretical_ratio": 1.0,
+            "effective_ratio": 1.0,
+            "sim_compressed_mb": 0.0,
+            "realized_mb": 0.0,
+        }
+    theoretical = mem_report.get(
+        "theoretical_compression_ratio", mem_report.get("compression_ratio", 1.0)
+    )
+    effective = mem_report.get("effective_compression_ratio", theoretical)
+    return {
+        "theoretical_ratio": theoretical,
+        "effective_ratio": effective,
+        "sim_compressed_mb": mem_report.get(
+            "simulated_compressed_bytes", mem_report.get("compressed_bytes", 0)
+        )
+        / (1024**2),
+        "realized_mb": mem_report.get(
+            "realized_fp16_bytes", mem_report.get("total_bytes", 0)
+        )
+        / (1024**2),
+    }
+
+
+def _vallex_sweep_sentence_seed(
+    model,
+    codec,
+    vocos,
+    metrics,
+    preset_path,
+    text,
+    group_name,
+    idx,
+    shash,
+    arm,
+    seed,
+    temperature,
+    decode_params,
+    group_results,
+    output_dir,
+    results_fh,
+    trial_fh,
+    device,
+    deterministic,
+    save_wav,
+):
+    """Run all configs for one (sentence, seed, temperature), paired on the same draw."""
+    baseline_wav = None
+    for config_name, tq_config in TURBOQUANT_CONFIGS:
+        key_bits, value_bits, residual_window = config_bits(tq_config)
+        try:
+            (
+                wav,
+                elapsed,
+                mem_report,
+                peak_vram_mb,
+                n_ar_tokens,
+                ar_elapsed_s,
+                nar_elapsed_s,
+            ) = run_generation(
+                model,
+                codec,
+                vocos,
+                text,
+                "en",
+                preset_path,
+                device,
+                tq_config,
+                seed=seed,
+                decode_params=decode_params,
+                deterministic=deterministic,
+            )
+            audio_duration = len(wav) / SAMPLE_RATE
+            rtf = elapsed / audio_duration if audio_duration > 0 else float("inf")
+            ar_rtf = (
+                ar_elapsed_s / audio_duration
+                if (audio_duration > 0 and ar_elapsed_s > 0)
+                else 0.0
+            )
+            nar_rtf = (
+                nar_elapsed_s / audio_duration
+                if (audio_duration > 0 and nar_elapsed_s > 0)
+                else 0.0
+            )
+            tokens_per_sec = n_ar_tokens / elapsed if elapsed > 0 else 0.0
+            mm = _vallex_mem_metrics(mem_report)
+
+            r = group_results[config_name]
+            r["rtf"].append(rtf)
+            r["ar_rtf"].append(ar_rtf)
+            r["nar_rtf"].append(nar_rtf)
+            r["peak_vram_mb"].append(peak_vram_mb)
+            r["tokens_per_sec"].append(tokens_per_sec)
+            if mem_report:
+                for k in (
+                    "theoretical_ratio",
+                    "effective_ratio",
+                    "sim_compressed_mb",
+                    "realized_mb",
+                ):
+                    r[k].append(mm[k])
+
+            error_rate = None
+            spk_sim = None
+            transcript_len = None
+            if metrics:
+                error_rate, transcript = metrics.whisper_cer(wav, SAMPLE_RATE, text)
+                transcript_len = len(transcript)
+                r["cer"].append(error_rate)
+                if tq_config is None:
+                    baseline_wav = wav
+                elif baseline_wav is not None:
+                    spk_sim = metrics.speaker_cosine_similarity(
+                        baseline_wav, SAMPLE_RATE, wav, SAMPLE_RATE
+                    )
+                    if spk_sim is not None:
+                        r["spk_sim"].append(spk_sim)
+
+            if save_wav:
+                safe = config_name.replace(" ", "_").replace("/", "_")
+                tsuf = "" if temperature is None else f"_t{temperature}"
+                sf.write(
+                    os.path.join(
+                        output_dir,
+                        f"vallex_{group_name}_{idx}_{arm}_s{seed}{tsuf}_{safe}.wav",
+                    ),
+                    wav,
+                    SAMPLE_RATE,
+                )
+
+            status = (
+                f"RTF={rtf:.2f} VRAM={peak_vram_mb:.0f}MB tok/s={tokens_per_sec:.1f}"
+            )
+            if error_rate is not None:
+                status += f" CER={error_rate:.1%}"
+                if spk_sim is not None:
+                    status += f" SpkSim={spk_sim:.4f}"
+            tlabel = "" if temperature is None else f" T={temperature}"
+            _tee(results_fh, f"    s{seed}{tlabel} {config_name:<22} {status}")
+
+            _write_result_line(
+                trial_fh,
+                arm=arm,
+                seed=seed,
+                temperature=temperature,
+                group=group_name,
+                idx=idx,
+                sentence_hash=shash,
+                config=config_name,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                residual_window=residual_window,
+                rtf=rtf,
+                cer=error_rate,
+                transcript_len=transcript_len,
+                spk_sim=spk_sim,
+                peak_vram_mb=peak_vram_mb,
+                tokens_per_sec=tokens_per_sec,
+                n_ar_tokens=n_ar_tokens,
+                sim_compressed_mb=mm["sim_compressed_mb"],
+                realized_mb=mm["realized_mb"],
+                theoretical_ratio=mm["theoretical_ratio"],
+                effective_ratio=mm["effective_ratio"],
+            )
+        except Exception as e:
+            _tee(results_fh, f"    s{seed} {config_name:<22} ERROR: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+
+def _vallex_print_group_averages(
+    results_fh, metrics, group_name, group_results
+) -> None:
+    def _avg(xs, default=0.0):
+        return sum(xs) / len(xs) if xs else default
+
+    _tee(results_fh, f"\n  {'─' * 80}")
+    _tee(results_fh, f"  AVERAGES for {group_name} (pooled over sentences × seeds):")
+    _tee(results_fh, f"  {'─' * 80}")
+    if metrics:
+        _tee(
+            results_fh,
+            f"  {'Config':<22} {'RTF':<7} {'CER':<8} {'SpkSim':<8} "
+            f"{'VRAM(MB)':<10} {'tok/s':<8} {'R_th':<6} {'R_eff':<6}",
+        )
+    else:
+        _tee(
+            results_fh,
+            f"  {'Config':<22} {'RTF':<7} {'VRAM(MB)':<10} {'tok/s':<8} "
+            f"{'R_th':<6} {'R_eff':<6}",
+        )
+    _tee(results_fh, f"  {'-' * 90}")
+    for config_name, tq_config in TURBOQUANT_CONFIGS:
+        r = group_results[config_name]
+        avg_rtf = _avg(r["rtf"])
+        avg_vram = _avg(r["peak_vram_mb"])
+        avg_tps = _avg(r["tokens_per_sec"])
+        avg_th = _avg(r["theoretical_ratio"], default=1.0 if tq_config is None else 0.0)
+        avg_eff = _avg(r["effective_ratio"], default=1.0 if tq_config is None else 0.0)
+        if metrics:
+            avg_cer = _avg(r["cer"])
+            avg_spk = _avg(r["spk_sim"])
+            spk_str = f"{avg_spk:.4f}" if tq_config is not None else "---"
+            _tee(
+                results_fh,
+                f"  {config_name:<22} {avg_rtf:<7.2f} {avg_cer:<8.2%} "
+                f"{spk_str:<8} {avg_vram:<10.0f} {avg_tps:<8.1f} "
+                f"{avg_th:<6.2f} {avg_eff:<6.2f}",
+            )
+        else:
+            _tee(
+                results_fh,
+                f"  {config_name:<22} {avg_rtf:<7.2f} {avg_vram:<10.0f} "
+                f"{avg_tps:<8.1f} {avg_th:<6.2f} {avg_eff:<6.2f}",
+            )
+
+
+def _vallex_sweep_arm(
+    model,
+    codec,
+    vocos,
+    metrics,
+    preset_path,
+    arm,
+    active_groups,
+    max_per_group,
+    seeds,
+    temperatures,
+    output_dir,
+    results_fh,
+    trial_fh,
+    device,
+    deterministic,
+) -> dict:
+    """Full group×sentence×seed×temperature×config sweep for one arm. Returns summary.
+
+    Temperature only varies for the sampling arm (greedy ignores it → single None anchor).
+    """
+    temps = temperatures if (arm == "sampling" and temperatures) else [None]
+    _tee(results_fh, f"\n{'#' * 110}")
+    temp_note = f" temps={temps}" if temps != [None] else ""
+    _tee(results_fh, f"DECODE ARM: {arm}{temp_note}")
+    _tee(results_fh, f"{'#' * 110}")
+    summary = {}
+    for group_name in active_groups:
+        texts = SENTENCE_GROUPS[group_name]
+        if max_per_group is not None:
+            texts = texts[:max_per_group]
+        n = len(texts)
+        _tee(results_fh, f"\n{'=' * 110}")
+        _tee(
+            results_fh,
+            f"[{arm}] Group: {group_name} "
+            f"({n} sentences × {len(seeds)} seeds × {len(temps)} temps)",
+        )
+        _tee(results_fh, f"{'=' * 110}")
+        group_results = _vallex_empty_group_results()
+        for i, text in enumerate(texts):
+            shash = sentence_hash(text)
+            preview = text[:50] + "..." if len(text) > 50 else text
+            _tee(results_fh, f'\n  [{i + 1}/{n}] "{preview}"')
+            for seed in seeds:
+                for temp in temps:
+                    decode_params = vallex_decode_params(arm, temperature=temp)
+                    _vallex_sweep_sentence_seed(
+                        model,
+                        codec,
+                        vocos,
+                        metrics,
+                        preset_path,
+                        text,
+                        group_name,
+                        i,
+                        shash,
+                        arm,
+                        seed,
+                        temp,
+                        decode_params,
+                        group_results,
+                        output_dir,
+                        results_fh,
+                        trial_fh,
+                        device,
+                        deterministic,
+                        save_wav=(seed == seeds[0] and temp == temps[0]),
+                    )
+        _vallex_print_group_averages(results_fh, metrics, group_name, group_results)
+        summary[group_name] = group_results
+    return summary
+
+
+def _vallex_print_arm_summaries(
+    results_fh, metrics, arm, active_groups, summary
+) -> None:
+    if metrics:
+        _tee(results_fh, f"\n{'=' * 110}")
+        _tee(
+            results_fh,
+            f"[{arm}] FINAL SUMMARY — Quality (means across sentences × seeds)",
+        )
+        _tee(results_fh, f"{'=' * 110}")
+        header_row = f"{'Config':<22} "
+        for group_name in active_groups:
+            header_row += f"{'RTF':<7} {'CER':<7} {'SpkSim':<9} "
+        _tee(results_fh, header_row)
+        for config_name, tq_config in TURBOQUANT_CONFIGS:
+            row = f"{config_name:<22} "
+            for group_name in active_groups:
+                r = summary[group_name][config_name]
+                avg_rtf = sum(r["rtf"]) / len(r["rtf"]) if r["rtf"] else 0
+                avg_cer = sum(r["cer"]) / len(r["cer"]) if r["cer"] else 0
+                avg_spk = sum(r["spk_sim"]) / len(r["spk_sim"]) if r["spk_sim"] else 0
+                spk_str = f"{avg_spk:.4f}" if tq_config is not None else "---"
+                row += f"{avg_rtf:<7.2f} {avg_cer:<7.1%} {spk_str:<9} "
+            _tee(results_fh, row)
+
+    _tee(results_fh, f"\n{'=' * 110}")
+    _tee(results_fh, f"[{arm}] FINAL SUMMARY — Memory & Throughput")
+    _tee(results_fh, f"{'=' * 110}")
+    _tee(
+        results_fh,
+        f"{'Config':<22} {'VRAM(MB)':<10} {'tok/s':<8} {'Realized(MB)':<14} "
+        f"{'SimComp(MB)':<14} {'R_theory':<10} {'R_eff':<8}",
+    )
+    _tee(results_fh, "-" * 100)
+    for config_name, tq_config in TURBOQUANT_CONFIGS:
+        vram, tps, realized, sim_comp, th, eff = [], [], [], [], [], []
+        for group_name in active_groups:
+            r = summary[group_name][config_name]
+            vram += r["peak_vram_mb"]
+            tps += r["tokens_per_sec"]
+            realized += r["realized_mb"]
+            sim_comp += r["sim_compressed_mb"]
+            th += r["theoretical_ratio"]
+            eff += r["effective_ratio"]
+        avg_vram = sum(vram) / len(vram) if vram else 0
+        avg_tps = sum(tps) / len(tps) if tps else 0
+        avg_realized = sum(realized) / len(realized) if realized else 0
+        avg_sim = sum(sim_comp) / len(sim_comp) if sim_comp else 0
+        avg_th = sum(th) / len(th) if th else (1.0 if tq_config is None else 0)
+        avg_eff = sum(eff) / len(eff) if eff else (1.0 if tq_config is None else 0)
+        _tee(
+            results_fh,
+            f"{config_name:<22} {avg_vram:<10.0f} {avg_tps:<8.1f} "
+            f"{avg_realized:<14.2f} {avg_sim:<14.2f} {avg_th:<10.2f} {avg_eff:<8.2f}",
+        )
+
+
 def benchmark_vallex(args):
     device = torch.device(args.device)
+    arms = parse_arms(args.decode)
+    seeds = args.seeds
 
     results_fh, results_path = _open_results_file("benchmark_vallex")
+    trial_fh, trial_path = _open_csv_file("vallex_trials", TRIAL_COLUMNS)
     gpu_csv = start_nvidia_smi_monitor("benchmark_vallex")
 
     header = [
         "=" * 110,
-        "VALL-E-X Real-Weights Benchmark",
+        "VALL-E-X Rigorous Benchmark (paired-seed, multi-arm)",
         f"Device: {device} | Quality metrics: {not args.no_quality}",
-        f"Structured results: {results_path}",
+        f"Decode arms: {arms} | Seeds: {seeds} | Deterministic: {args.deterministic}",
+        f"Temperature sweep (sampling arm): {args.temperatures or 'off (model default)'}",
+        "Pairing: each (sentence, seed) reseeds RNG identically before every config.",
+        f"Human log: {results_path}",
+        f"Per-trial CSV: {trial_path}",
         f"GPU monitor CSV: {gpu_csv or '(nvidia-smi unavailable — skipped)'}",
         "=" * 110,
     ]
@@ -665,7 +1227,9 @@ def benchmark_vallex(args):
     _tee(results_fh, "\nWarmup (one per config)...")
     for config_name, tq_config in TURBOQUANT_CONFIGS:
         try:
-            run_generation(model, codec, vocos, "Hello.", "en", preset_path, device, tq_config)
+            run_generation(
+                model, codec, vocos, "Hello.", "en", preset_path, device, tq_config
+            )
         except Exception as e:
             _tee(results_fh, f"  warmup {config_name}: ERROR {e}")
     _tee(results_fh, "Warmup done.\n")
@@ -673,222 +1237,32 @@ def benchmark_vallex(args):
     output_dir = os.path.join(_THIS_DIR, "outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    summary = {}
     active_groups = getattr(args, "active_groups", list(SENTENCE_GROUPS.keys()))
     max_per_group = getattr(args, "max_per_group", None)
 
-    for group_name in active_groups:
-        texts = SENTENCE_GROUPS[group_name]
-        if max_per_group is not None:
-            texts = texts[:max_per_group]
-        n = len(texts)
-        _tee(results_fh, f"\n{'=' * 110}")
-        _tee(results_fh, f"Group: {group_name} ({n} sentences)")
-        _tee(results_fh, f"{'=' * 110}")
+    for arm in arms:
+        summary = _vallex_sweep_arm(
+            model,
+            codec,
+            vocos,
+            metrics,
+            preset_path,
+            arm,
+            active_groups,
+            max_per_group,
+            seeds,
+            args.temperatures,
+            output_dir,
+            results_fh,
+            trial_fh,
+            device,
+            args.deterministic,
+        )
+        _vallex_print_arm_summaries(results_fh, metrics, arm, active_groups, summary)
 
-        group_results = {
-            name: {
-                "rtf": [], "cer": [], "spk_sim": [],
-                "theoretical_ratio": [], "effective_ratio": [],
-                "peak_vram_mb": [], "tokens_per_sec": [],
-                "sim_compressed_mb": [], "realized_mb": [],
-            }
-            for name, _ in TURBOQUANT_CONFIGS
-        }
-
-        for i, text in enumerate(texts):
-            preview = text[:50] + "..." if len(text) > 50 else text
-            _tee(results_fh, f"\n  [{i + 1}/{n}] \"{preview}\"")
-
-            baseline_wav = None
-
-            for config_name, tq_config in TURBOQUANT_CONFIGS:
-                try:
-                    wav, elapsed, mem_report, peak_vram_mb, n_ar_tokens, ar_elapsed_s, nar_elapsed_s = run_generation(
-                        model, codec, vocos, text, "en", preset_path, device, tq_config,
-                    )
-                    audio_duration = len(wav) / SAMPLE_RATE
-                    rtf = elapsed / audio_duration if audio_duration > 0 else float("inf")
-                    ar_rtf = ar_elapsed_s / audio_duration if (audio_duration > 0 and ar_elapsed_s > 0) else 0.0
-                    nar_rtf = nar_elapsed_s / audio_duration if (audio_duration > 0 and nar_elapsed_s > 0) else 0.0
-                    tokens_per_sec = n_ar_tokens / elapsed if elapsed > 0 else 0.0
-
-                    group_results[config_name]["rtf"].append(rtf)
-                    group_results[config_name].setdefault("ar_rtf", []).append(ar_rtf)
-                    group_results[config_name].setdefault("nar_rtf", []).append(nar_rtf)
-                    group_results[config_name]["peak_vram_mb"].append(peak_vram_mb)
-                    group_results[config_name]["tokens_per_sec"].append(tokens_per_sec)
-
-                    theoretical_ratio = 1.0
-                    effective_ratio = 1.0
-                    sim_compressed_mb = 0.0
-                    realized_mb = 0.0
-                    if mem_report:
-                        theoretical_ratio = mem_report.get("theoretical_compression_ratio",
-                                                           mem_report.get("compression_ratio", 1.0))
-                        effective_ratio = mem_report.get("effective_compression_ratio", theoretical_ratio)
-                        # Simulated: what compression WOULD use (analytical); Realized: what the fp16 buffer actually uses.
-                        sim_compressed_mb = mem_report.get(
-                            "simulated_compressed_bytes",
-                            mem_report.get("compressed_bytes", 0),
-                        ) / (1024 ** 2)
-                        realized_mb = mem_report.get(
-                            "realized_fp16_bytes",
-                            mem_report.get("total_bytes", 0),
-                        ) / (1024 ** 2)
-                        group_results[config_name]["theoretical_ratio"].append(theoretical_ratio)
-                        group_results[config_name]["effective_ratio"].append(effective_ratio)
-                        group_results[config_name]["sim_compressed_mb"].append(sim_compressed_mb)
-                        group_results[config_name]["realized_mb"].append(realized_mb)
-
-                    status = f"RTF={rtf:.2f}"
-                    if ar_rtf > 0 or nar_rtf > 0:
-                        status += f" (AR={ar_rtf:.2f} NAR={nar_rtf:.2f})"
-                    status += f" VRAM={peak_vram_mb:.0f}MB tok/s={tokens_per_sec:.1f}"
-                    error_rate = None
-                    spk_sim = None
-
-                    if metrics:
-                        error_rate, _ = metrics.whisper_cer(wav, SAMPLE_RATE, text)
-                        group_results[config_name]["cer"].append(error_rate)
-
-                        if tq_config is None:
-                            baseline_wav = wav
-                        elif baseline_wav is not None:
-                            spk_sim = metrics.speaker_cosine_similarity(
-                                baseline_wav, SAMPLE_RATE, wav, SAMPLE_RATE
-                            )
-                            if spk_sim is not None:
-                                group_results[config_name]["spk_sim"].append(spk_sim)
-
-                        status += f" CER={error_rate:.1%}"
-                        if spk_sim is not None:
-                            status += f" SpkSim={spk_sim:.4f}"
-
-                    if mem_report:
-                        status += f" Ratio_theory={theoretical_ratio:.2f}x eff={effective_ratio:.2f}x"
-
-                    sf.write(_out_path(output_dir, group_name, i, config_name), wav, SAMPLE_RATE)
-                    _tee(results_fh, f"    {config_name:<22} {status}")
-
-                    _write_result_line(
-                        results_fh,
-                        group=group_name, idx=i, config=config_name,
-                        rtf=rtf, cer=error_rate, spk_sim=spk_sim,
-                        peak_vram_mb=peak_vram_mb, tokens_per_sec=tokens_per_sec,
-                        sim_compressed_mb=sim_compressed_mb,
-                        realized_mb=realized_mb,
-                        theoretical_ratio=theoretical_ratio,
-                        effective_ratio=effective_ratio,
-                    )
-
-                except Exception as e:
-                    _tee(results_fh, f"    {config_name:<22} ERROR: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-        # Per-group averages
-        _tee(results_fh, f"\n  {'─' * 80}")
-        _tee(results_fh, f"  AVERAGES for {group_name} ({n} sentences):")
-        _tee(results_fh, f"  {'─' * 80}")
-        if metrics:
-            _tee(results_fh, f"  {'Config':<22} {'RTF':<7} {'CER':<8} {'SpkSim':<8} "
-                             f"{'VRAM(MB)':<10} {'tok/s':<8} {'R_th':<6} {'R_eff':<6}")
-        else:
-            _tee(results_fh, f"  {'Config':<22} {'RTF':<7} {'VRAM(MB)':<10} {'tok/s':<8} "
-                             f"{'R_th':<6} {'R_eff':<6}")
-        _tee(results_fh, f"  {'-' * 90}")
-
-        def _avg(xs, default=0.0):
-            return sum(xs) / len(xs) if xs else default
-
-        for config_name, tq_config in TURBOQUANT_CONFIGS:
-            r = group_results[config_name]
-            avg_rtf = _avg(r["rtf"])
-            avg_vram = _avg(r["peak_vram_mb"])
-            avg_tps = _avg(r["tokens_per_sec"])
-            avg_th = _avg(r["theoretical_ratio"], default=1.0 if tq_config is None else 0.0)
-            avg_eff = _avg(r["effective_ratio"], default=1.0 if tq_config is None else 0.0)
-            if metrics:
-                avg_cer = _avg(r["cer"])
-                avg_spk = _avg(r["spk_sim"])
-                spk_str = f"{avg_spk:.4f}" if tq_config is not None else "---"
-                _tee(results_fh, f"  {config_name:<22} {avg_rtf:<7.2f} {avg_cer:<8.2%} "
-                                 f"{spk_str:<8} {avg_vram:<10.0f} {avg_tps:<8.1f} "
-                                 f"{avg_th:<6.2f} {avg_eff:<6.2f}")
-            else:
-                _tee(results_fh, f"  {config_name:<22} {avg_rtf:<7.2f} {avg_vram:<10.0f} "
-                                 f"{avg_tps:<8.1f} {avg_th:<6.2f} {avg_eff:<6.2f}")
-
-        summary[group_name] = group_results
-
-    # ----- FINAL SUMMARY -----
-    if metrics:
-        _tee(results_fh, f"\n{'=' * 110}")
-        _tee(results_fh, "FINAL SUMMARY — Quality (averages across all sentences)")
-        _tee(results_fh, f"{'=' * 110}")
-        header_row = f"{'Config':<22} "
-        for group_name in active_groups:
-            header_row += f"{'RTF':<7} {'CER':<7} {'SpkSim':<9} "
-        _tee(results_fh, header_row)
-        label_row = f"{'':22} "
-        for group_name in active_groups:
-            n = len(SENTENCE_GROUPS[group_name])
-            label_row += f"{group_name + f' ({n})':<24}"
-        _tee(results_fh, label_row)
-
-        for config_name, tq_config in TURBOQUANT_CONFIGS:
-            row = f"{config_name:<22} "
-            for group_name in active_groups:
-                r = summary[group_name][config_name]
-                avg_rtf = sum(r["rtf"]) / len(r["rtf"]) if r["rtf"] else 0
-                avg_cer = sum(r["cer"]) / len(r["cer"]) if r["cer"] else 0
-                avg_spk = sum(r["spk_sim"]) / len(r["spk_sim"]) if r["spk_sim"] else 0
-                spk_str = f"{avg_spk:.4f}" if tq_config is not None else "---"
-                row += f"{avg_rtf:<7.2f} {avg_cer:<7.1%} {spk_str:<9} "
-            _tee(results_fh, row)
-
-    # Memory & throughput summary — across ALL sentences per config.
-    # Columns explained:
-    #   VRAM(MB)      — peak torch allocator VRAM during the step (includes model + activations + cache)
-    #   Realized(MB)  — what the KV cache itself actually uses (fp16 buffer in track_only mode)
-    #   SimComp(MB)   — analytical: what compression WOULD use if realized (not actual storage)
-    #   R_theory      — fp16_equivalent / SimComp, i.e. the compression ratio if it were realized
-    #   R_eff         — fp16_equivalent / Realized, i.e. actual memory savings (≈1.0 in track_only)
-    _tee(results_fh, f"\n{'=' * 110}")
-    _tee(results_fh, "FINAL SUMMARY — Memory & Throughput (averages across all sentences)")
-    _tee(results_fh, f"{'=' * 110}")
-    _tee(results_fh, f"{'Config':<22} {'VRAM(MB)':<10} {'tok/s':<8} {'Realized(MB)':<14} "
-                     f"{'SimComp(MB)':<14} {'R_theory':<10} {'R_eff':<8}")
-    _tee(results_fh, "-" * 100)
-
-    for config_name, tq_config in TURBOQUANT_CONFIGS:
-        vram = []
-        tps = []
-        realized = []
-        sim_comp = []
-        th = []
-        eff = []
-        for group_name in active_groups:
-            r = summary[group_name][config_name]
-            vram += r["peak_vram_mb"]
-            tps += r["tokens_per_sec"]
-            realized += r["realized_mb"]
-            sim_comp += r["sim_compressed_mb"]
-            th += r["theoretical_ratio"]
-            eff += r["effective_ratio"]
-        avg_vram = sum(vram) / len(vram) if vram else 0
-        avg_tps = sum(tps) / len(tps) if tps else 0
-        avg_realized = sum(realized) / len(realized) if realized else 0
-        avg_sim_comp = sum(sim_comp) / len(sim_comp) if sim_comp else 0
-        avg_th = sum(th) / len(th) if th else (1.0 if tq_config is None else 0)
-        avg_eff = sum(eff) / len(eff) if eff else (1.0 if tq_config is None else 0)
-        _tee(results_fh,
-             f"{config_name:<22} {avg_vram:<10.0f} {avg_tps:<8.1f} "
-             f"{avg_realized:<14.2f} {avg_sim_comp:<14.2f} {avg_th:<10.2f} {avg_eff:<8.2f}")
-
+    trial_fh.close()
     _tee(results_fh, f"\nOutput audio saved to: {output_dir}/")
-    _tee(results_fh, f"Structured results: {results_path}")
+    _tee(results_fh, f"Per-trial CSV (source of truth): {trial_path}")
     results_fh.close()
 
 
@@ -896,9 +1270,20 @@ def benchmark_vallex(args):
 # Profiling mode
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
-def profile_generation(model, codec, vocos, text, preset_path, device,
-                       tq_config, output_dir, config_name, group_name):
+def profile_generation(
+    model,
+    codec,
+    vocos,
+    text,
+    preset_path,
+    device,
+    tq_config,
+    output_dir,
+    config_name,
+    group_name,
+):
     """Profile a single inference with torch.profiler. Returns (prof, elapsed, trace_path)."""
     from torch.profiler import profile, ProfilerActivity
 
@@ -927,10 +1312,12 @@ def profile_generation(model, codec, vocos, text, preset_path, device,
     # Lightweight profile: record_shapes + profile_memory generate huge traces on
     # autoregressive decode (500k+ events under TurboQuant), and export_chrome_trace
     # then takes hours. Kernel timing alone is enough to identify the bottleneck.
-    with profile(activities=activities,
-                 record_shapes=False,
-                 profile_memory=False,
-                 with_stack=False) as prof:
+    with profile(
+        activities=activities,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
         model.inference(
             text_tokens.to(device),
             text_tokens_lens.to(device),
@@ -967,8 +1354,10 @@ def _profile_ratio_classification(prof, elapsed_s: float) -> tuple[float, str]:
     if frac >= 0.5:
         label = f"GPU-BOUND (cuda_time/wall = {frac:.1%}): batching won't materially help throughput."
     else:
-        label = (f"LAUNCH-BOUND (cuda_time/wall = {frac:.1%}): batching would likely help. "
-                 f"Follow-up: patch vallex.py:492 for batch>1.")
+        label = (
+            f"LAUNCH-BOUND (cuda_time/wall = {frac:.1%}): batching would likely help. "
+            f"Follow-up: patch vallex.py:492 for batch>1."
+        )
     return frac, label
 
 
@@ -1009,7 +1398,7 @@ def profile_all_configs(args):
         return
 
     text = SENTENCE_GROUPS[args.profile_sentence][0]
-    _tee(results_fh, f"Profiling text ({args.profile_sentence}): \"{text[:80]}...\"")
+    _tee(results_fh, f'Profiling text ({args.profile_sentence}): "{text[:80]}..."')
 
     output_dir = os.path.join(_THIS_DIR, "outputs")
     os.makedirs(output_dir, exist_ok=True)
@@ -1019,12 +1408,16 @@ def profile_all_configs(args):
     requested_configs = getattr(args, "profile_configs", None)
     if requested_configs:
         requested_names = [c.strip() for c in requested_configs.split(",") if c.strip()]
-        configs_to_run = [(name, cfg) for (name, cfg) in TURBOQUANT_CONFIGS
-                          if name in requested_names]
+        configs_to_run = [
+            (name, cfg) for (name, cfg) in TURBOQUANT_CONFIGS if name in requested_names
+        ]
         if not configs_to_run:
-            _tee(results_fh, f"ERROR: --profile-configs matched nothing. "
-                             f"Requested: {requested_names}. "
-                             f"Available: {[n for n, _ in TURBOQUANT_CONFIGS]}")
+            _tee(
+                results_fh,
+                f"ERROR: --profile-configs matched nothing. "
+                f"Requested: {requested_names}. "
+                f"Available: {[n for n, _ in TURBOQUANT_CONFIGS]}",
+            )
             results_fh.close()
             return
     else:
@@ -1034,7 +1427,9 @@ def profile_all_configs(args):
     _tee(results_fh, "\nWarmup (one per config)...")
     for config_name, tq_config in configs_to_run:
         try:
-            run_generation(model, codec, vocos, "Hello.", "en", preset_path, device, tq_config)
+            run_generation(
+                model, codec, vocos, "Hello.", "en", preset_path, device, tq_config
+            )
         except Exception as e:
             _tee(results_fh, f"  warmup {config_name}: ERROR {e}")
     _tee(results_fh, "Warmup done.\n")
@@ -1045,8 +1440,16 @@ def profile_all_configs(args):
         _tee(results_fh, f"{'=' * 110}")
         try:
             prof, elapsed, trace_path = profile_generation(
-                model, codec, vocos, text, preset_path, device,
-                tq_config, output_dir, config_name, args.profile_sentence,
+                model,
+                codec,
+                vocos,
+                text,
+                preset_path,
+                device,
+                tq_config,
+                output_dir,
+                config_name,
+                args.profile_sentence,
             )
 
             peak_vram_mb = read_peak_memory_mb(device)
@@ -1054,13 +1457,17 @@ def profile_all_configs(args):
             if tq_config is not None and hasattr(model, "_tq_cache_manager"):
                 mem_report = model._tq_cache_manager.memory_report()
 
-            _tee(results_fh, f"Elapsed: {elapsed:.2f}s  Peak VRAM: {peak_vram_mb:.0f} MB")
+            _tee(
+                results_fh, f"Elapsed: {elapsed:.2f}s  Peak VRAM: {peak_vram_mb:.0f} MB"
+            )
             if mem_report:
-                _tee(results_fh,
-                     f"Compressed: {mem_report['compressed_bytes']/1024**2:.2f} MB | "
-                     f"Decomp prefix: {mem_report['decompressed_prefix_bytes']/1024**2:.2f} MB | "
-                     f"R_theory={mem_report['theoretical_compression_ratio']:.2f}x "
-                     f"R_eff={mem_report['effective_compression_ratio']:.2f}x")
+                _tee(
+                    results_fh,
+                    f"Compressed: {mem_report['compressed_bytes'] / 1024**2:.2f} MB | "
+                    f"Decomp prefix: {mem_report['decompressed_prefix_bytes'] / 1024**2:.2f} MB | "
+                    f"R_theory={mem_report['theoretical_compression_ratio']:.2f}x "
+                    f"R_eff={mem_report['effective_compression_ratio']:.2f}x",
+                )
 
             frac, label = _profile_ratio_classification(prof, elapsed)
             _tee(results_fh, label)
@@ -1076,7 +1483,9 @@ def profile_all_configs(args):
 
             # Top-10 CPU self-time (catches CPU bottlenecks)
             try:
-                cpu_table = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10)
+                cpu_table = prof.key_averages().table(
+                    sort_by="self_cpu_time_total", row_limit=10
+                )
             except Exception as e:
                 cpu_table = f"(cpu table failed: {e})"
             _tee(results_fh, "\nTop-10 by self_cpu_time_total:")
@@ -1086,12 +1495,14 @@ def profile_all_configs(args):
         except Exception as e:
             _tee(results_fh, f"Profile {config_name}: ERROR {e}")
             import traceback
+
             traceback.print_exc()
         finally:
             # Release the profiler (retains ~1KB per event) and the TurboQuant
             # cache before moving to the next config. Prevents host-RAM OOM on
             # long profiles (Qwen at 1.7B has ~700k kernel events per run).
             import gc
+
             try:
                 del prof
             except NameError:
@@ -1110,7 +1521,9 @@ def evaluate_saved_wavs(args):
     """Evaluate quality metrics on previously saved wav files (no TTS model needed)."""
     output_dir = os.path.join(_THIS_DIR, "outputs")
     if not os.path.exists(output_dir):
-        print(f"ERROR: No outputs found at {output_dir}. Run generation first (without --evaluate-only).")
+        print(
+            f"ERROR: No outputs found at {output_dir}. Run generation first (without --evaluate-only)."
+        )
         return
 
     print("=" * 80)
@@ -1126,7 +1539,9 @@ def evaluate_saved_wavs(args):
         print(f"{'Config':<22} {'Avg CER':<10} {'Avg SpkSim':<12}")
         print("-" * 45)
 
-        group_results = {name: {"cer": [], "spk_sim": []} for name, _ in TURBOQUANT_CONFIGS}
+        group_results = {
+            name: {"cer": [], "spk_sim": []} for name, _ in TURBOQUANT_CONFIGS
+        }
 
         for i, text in enumerate(texts):
             baseline_wav = None
@@ -1143,7 +1558,9 @@ def evaluate_saved_wavs(args):
                     baseline_wav = wav
                     baseline_sr = sr
                 elif baseline_wav is not None:
-                    spk_sim = metrics.speaker_cosine_similarity(baseline_wav, baseline_sr, wav, sr)
+                    spk_sim = metrics.speaker_cosine_similarity(
+                        baseline_wav, baseline_sr, wav, sr
+                    )
                     if spk_sim is not None:
                         group_results[config_name]["spk_sim"].append(spk_sim)
 
@@ -1156,37 +1573,98 @@ def evaluate_saved_wavs(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark TurboQuant on VALL-E-X with real weights")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else
-                        ("mps" if torch.backends.mps.is_available() else "cpu"),
-                        help="Device to run TTS on")
-    parser.add_argument("--metrics-device", default="cpu",
-                        help="Device for Whisper/WavLM (default cpu; set to cuda on L40s for faster metrics)")
-    parser.add_argument("--preset", default="alan.npz",
-                        help="Voice preset filename under models/VALL-E-X/presets/")
-    parser.add_argument("--no-quality", action="store_true",
-                        help="Skip quality metrics (Whisper CER, WavLM similarity)")
-    parser.add_argument("--evaluate-only", action="store_true",
-                        help="Skip generation, evaluate saved wavs from a previous run")
-    parser.add_argument("--profile", action="store_true",
-                        help="Run torch.profiler on one sentence per config (skips the 22-sentence sweep)")
-    parser.add_argument("--profile-sentence", default="medium",
-                        choices=list(SENTENCE_GROUPS.keys()),
-                        help="Which sentence group's first entry to profile under --profile")
-    parser.add_argument("--profile-configs",
-                        default="baseline (no TQ),K4/V2 rw=128",
-                        help="Comma-separated config names to profile (default: baseline + K4/V2). "
-                             "Use an empty string to profile ALL configs, which can take 60+ minutes.")
-    parser.add_argument("--groups", default=",".join(SENTENCE_GROUPS.keys()),
-                        help="Comma-separated sentence groups to run (default: all). "
-                             "Useful on tight-VRAM GPUs: --groups short,medium to skip long sentences. "
-                             "For a smoke test: --groups short.")
-    parser.add_argument("--max-per-group", type=int, default=None,
-                        help="Cap sentences per group (useful for smoke tests; default: run all).")
-    parser.add_argument("--track-only-off", action="store_true",
-                        help="Disable the Phase-1 fast path and run the legacy compression "
-                             "path on-CUDA. Useful only for reconstruction-quality A/B "
-                             "tests against track_only=True. Makes decode ~7x slower.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark TurboQuant on VALL-E-X with real weights"
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda"
+        if torch.cuda.is_available()
+        else ("mps" if torch.backends.mps.is_available() else "cpu"),
+        help="Device to run TTS on",
+    )
+    parser.add_argument(
+        "--metrics-device",
+        default="cpu",
+        help="Device for Whisper/WavLM (default cpu; set to cuda on L40s for faster metrics)",
+    )
+    parser.add_argument(
+        "--preset",
+        default="alan.npz",
+        help="Voice preset filename under models/VALL-E-X/presets/",
+    )
+    parser.add_argument(
+        "--no-quality",
+        action="store_true",
+        help="Skip quality metrics (Whisper CER, WavLM similarity)",
+    )
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Skip generation, evaluate saved wavs from a previous run",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Run torch.profiler on one sentence per config (skips the 22-sentence sweep)",
+    )
+    parser.add_argument(
+        "--profile-sentence",
+        default="medium",
+        choices=list(SENTENCE_GROUPS.keys()),
+        help="Which sentence group's first entry to profile under --profile",
+    )
+    parser.add_argument(
+        "--profile-configs",
+        default="baseline (no TQ),K4/V2 rw=128",
+        help="Comma-separated config names to profile (default: baseline + K4/V2). "
+        "Use an empty string to profile ALL configs, which can take 60+ minutes.",
+    )
+    parser.add_argument(
+        "--groups",
+        default=",".join(SENTENCE_GROUPS.keys()),
+        help="Comma-separated sentence groups to run (default: all). "
+        "Useful on tight-VRAM GPUs: --groups short,medium to skip long sentences. "
+        "For a smoke test: --groups short.",
+    )
+    parser.add_argument(
+        "--max-per-group",
+        type=int,
+        default=None,
+        help="Cap sentences per group (useful for smoke tests; default: run all).",
+    )
+    parser.add_argument(
+        "--track-only-off",
+        action="store_true",
+        help="Disable the Phase-1 fast path and run the legacy compression "
+        "path on-CUDA. Useful only for reconstruction-quality A/B "
+        "tests against track_only=True. Makes decode ~7x slower.",
+    )
+    parser.add_argument(
+        "--seeds",
+        default="0,1,2,3,4",
+        help="Comma-separated generation seeds for repetition (default: 5 seeds). "
+        "Each (sentence, seed) reseeds every config identically (paired design).",
+    )
+    parser.add_argument(
+        "--decode",
+        default="both",
+        choices=["sampling", "greedy", "both"],
+        help="Decode arm(s): 'sampling' (top_k=-100, stochastic), 'greedy' "
+        "(top_k=1, deterministic argmax), or 'both' (default).",
+    )
+    parser.add_argument(
+        "--temperatures",
+        default="",
+        help="Comma-separated sampling temperatures to sweep, e.g. '0.7,1.0,1.2'. "
+        "Applies to the SAMPLING arm only (greedy ignores temperature). Empty "
+        "(default) = no sweep. Only meaningful together with --track-only-off.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Request deterministic CUDA kernels (slower; run in a fresh process).",
+    )
     args = parser.parse_args()
 
     # Propagate track_only=False into every TurboQuantConfig if requested.
@@ -1201,6 +1679,16 @@ def main():
     if unknown:
         parser.error(f"unknown group(s): {unknown}. Valid: {list(SENTENCE_GROUPS)}")
     args.active_groups = requested
+
+    try:
+        args.seeds = parse_seeds(args.seeds)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Empty --temperatures = no sweep (use model default); else parse the list.
+    args.temperatures = (
+        parse_temperatures(args.temperatures) if args.temperatures.strip() else []
+    )
 
     if args.profile:
         profile_all_configs(args)

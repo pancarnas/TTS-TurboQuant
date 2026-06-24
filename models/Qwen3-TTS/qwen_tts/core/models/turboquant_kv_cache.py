@@ -66,8 +66,9 @@ class TurboQuantKVCache(DynamicCache):
     # Buffer management
     # ---------------------------------------------------------------
 
-    def _ensure_capacity(self, layer_idx: int, needed_len: int,
-                         template: torch.Tensor) -> None:
+    def _ensure_capacity(
+        self, layer_idx: int, needed_len: int, template: torch.Tensor
+    ) -> None:
         """Allocate or grow the layer's buffer so it holds `needed_len` tokens."""
         B, H, _, D = template.shape
         dtype = template.dtype
@@ -75,8 +76,12 @@ class TurboQuantKVCache(DynamicCache):
 
         if layer_idx not in self._buf_k:
             cap = max(_INITIAL_CAPACITY, needed_len)
-            self._buf_k[layer_idx] = torch.empty(B, H, cap, D, dtype=dtype, device=device)
-            self._buf_v[layer_idx] = torch.empty(B, H, cap, D, dtype=dtype, device=device)
+            self._buf_k[layer_idx] = torch.empty(
+                B, H, cap, D, dtype=dtype, device=device
+            )
+            self._buf_v[layer_idx] = torch.empty(
+                B, H, cap, D, dtype=dtype, device=device
+            )
             self._cur_len[layer_idx] = 0
             self._chunks_k[layer_idx] = []
             self._chunks_v[layer_idx] = []
@@ -102,8 +107,9 @@ class TurboQuantKVCache(DynamicCache):
     # Legacy on-path compression (track_only=False)
     # ---------------------------------------------------------------
 
-    def _get_compressor(self, layer_idx: int, head_dim: int,
-                        device: torch.device) -> TurboQuantV3:
+    def _get_compressor(
+        self, layer_idx: int, head_dim: int, device: torch.device
+    ) -> TurboQuantV3:
         if layer_idx not in self._compressors:
             self._compressors[layer_idx] = TurboQuantV3(
                 head_dim=head_dim,
@@ -119,15 +125,21 @@ class TurboQuantKVCache(DynamicCache):
             )
         return self._compressors[layer_idx]
 
-    def _legacy_compress_overflow(self, layer_idx: int, new_total_len: int,
-                                  template: torch.Tensor) -> None:
+    def _legacy_compress_overflow(
+        self, layer_idx: int, new_total_len: int, template: torch.Tensor
+    ) -> None:
         """Run actual compression on tokens that fell outside the residual window."""
         rw = self.config.residual_window
         if new_total_len <= rw:
             return
+        # Count only chunks that are ACTUALLY compressed (have a blob). update()
+        # pre-appends a span-only placeholder before calling us; including it here
+        # would make want_compressed_upper <= already_compressed always true and
+        # compression would never run.
         already_compressed = 0
         for c in self._chunks_k.get(layer_idx, []):
-            already_compressed += c.get("span", 0)
+            if "blob" in c:
+                already_compressed += c.get("span", 0)
         want_compressed_upper = new_total_len - rw
         if want_compressed_upper <= already_compressed:
             return
@@ -175,8 +187,8 @@ class TurboQuantKVCache(DynamicCache):
         self._ensure_capacity(layer_idx, needed, template=key_states)
 
         # Single slice-write — no cat, no per-step dtype conversion.
-        self._buf_k[layer_idx][:, :, s:s + n, :].copy_(key_states)
-        self._buf_v[layer_idx][:, :, s:s + n, :].copy_(value_states)
+        self._buf_k[layer_idx][:, :, s : s + n, :].copy_(key_states)
+        self._buf_v[layer_idx][:, :, s : s + n, :].copy_(value_states)
         self._cur_len[layer_idx] = needed
 
         # Track virtual chunk spans for memory_report / test introspection.
@@ -197,13 +209,60 @@ class TurboQuantKVCache(DynamicCache):
         # keep reporting the right thing.
         self._ensure_layer_stubs(layer_idx)
 
+        if not self.config.track_only:
+            # Real-compression read path: hand attention the lossy reconstruction
+            # (decompressed prefix ++ fp16 residual tail), not the pristine buffer,
+            # so generation actually reflects compression.
+            return self._reconstruct_full(layer_idx, needed, template=key_states)
+
         full_k = self._buf_k[layer_idx][:, :, :needed, :]
         full_v = self._buf_v[layer_idx][:, :, :needed, :]
         return full_k, full_v
 
+    def _reconstruct_full(
+        self, layer_idx: int, needed: int, template: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """track_only=False read path: decompressed prefix ++ fp16 residual tail.
+
+        Tokens older than ``residual_window`` are returned as decompress(compress(·))
+        — carrying real quantization loss — while the recent residual-window tokens
+        stay exact fp16. This is what a compression-aware attention would see, so
+        decode genuinely reflects compression (track_only=True returns the untouched
+        buffer instead, for measurement only).
+
+        Note: re-decompresses all chunks every step, so this path is intentionally
+        the slow one — use it for reconstruction-quality A/B runs, not throughput.
+        """
+        buf_k = self._buf_k[layer_idx]
+        buf_v = self._buf_v[layer_idx]
+        chunks_k = self._chunks_k.get(layer_idx, [])
+        chunks_v = self._chunks_v.get(layer_idx, [])
+        blob_pairs = [
+            (ck, cv)
+            for ck, cv in zip(chunks_k, chunks_v)
+            if "blob" in ck and "blob" in cv
+        ]
+        if not blob_pairs:
+            # Nothing compressed yet (still within the residual window) — exact fp16.
+            return buf_k[:, :, :needed, :], buf_v[:, :, :needed, :]
+
+        comp = self._get_compressor(layer_idx, template.shape[-1], template.device)
+        rk_parts, rv_parts = [], []
+        for ck, cv in blob_pairs:
+            rk, rv = comp.decompress_kv(ck["blob"], cv["blob"])
+            rk_parts.append(rk.to(buf_k.dtype))
+            rv_parts.append(rv.to(buf_v.dtype))
+
+        compressed_end = sum(ck["span"] for ck, _ in blob_pairs)
+        # fp16 tail: residual window plus any current-step tokens not yet compressed.
+        rk_parts.append(buf_k[:, :, compressed_end:needed, :])
+        rv_parts.append(buf_v[:, :, compressed_end:needed, :])
+        return torch.cat(rk_parts, dim=2), torch.cat(rv_parts, dim=2)
+
     def _ensure_layer_stubs(self, layer_idx: int) -> None:
         """Ensure self.layers has enough entries for transformers internals."""
         from transformers.cache_utils import DynamicLayer
+
         while len(self.layers) <= layer_idx:
             self.layers.append(DynamicLayer())
 
@@ -221,9 +280,8 @@ class TurboQuantKVCache(DynamicCache):
 
     def _layer_bit_widths(self, layer_idx: int) -> tuple[int, int]:
         """Mirror TurboQuantV3's layer-adaptive bit selection."""
-        is_protected = (
-            layer_idx < self.config.protected_layers
-            or layer_idx >= (self.n_layers - self.config.protected_layers)
+        is_protected = layer_idx < self.config.protected_layers or layer_idx >= (
+            self.n_layers - self.config.protected_layers
         )
         kb = self.config.protected_bits if is_protected else self.config.key_bits
         vb = self.config.protected_bits if is_protected else self.config.value_bits
@@ -267,10 +325,16 @@ class TurboQuantKVCache(DynamicCache):
                 return idx_bytes + norm_bytes
 
             # Simulated: what compression WOULD store = compressed chunks + fp16 residual.
-            sim_k = (compressed_tokens * _compressed_bytes_per_token(kb)
-                     + rw * D * 2) * B * H
-            sim_v = (compressed_tokens * _compressed_bytes_per_token(vb)
-                     + rw * D * 2) * B * H
+            sim_k = (
+                (compressed_tokens * _compressed_bytes_per_token(kb) + rw * D * 2)
+                * B
+                * H
+            )
+            sim_v = (
+                (compressed_tokens * _compressed_bytes_per_token(vb) + rw * D * 2)
+                * B
+                * H
+            )
             total_compressed_bytes += sim_k + sim_v
 
         total_bytes = total_fp16_recent_bytes
@@ -288,19 +352,20 @@ class TurboQuantKVCache(DynamicCache):
             "realized_fp16_bytes": total_fp16_recent_bytes,
             "theoretical_compression_ratio": compression_ratio,
             "effective_compression_ratio": (
-                fp16_equiv / total_fp16_recent_bytes if total_fp16_recent_bytes > 0 else 1.0
+                fp16_equiv / total_fp16_recent_bytes
+                if total_fp16_recent_bytes > 0
+                else 1.0
             ),
         }
 
     def peak_vram_report(self, device) -> dict:
         """Thin wrapper over torch.cuda allocator stats — returns MB."""
-        is_cuda = (
-            (isinstance(device, torch.device) and device.type == "cuda")
-            or (isinstance(device, str) and device.startswith("cuda"))
+        is_cuda = (isinstance(device, torch.device) and device.type == "cuda") or (
+            isinstance(device, str) and device.startswith("cuda")
         )
         if not is_cuda:
             return {"peak_allocated_mb": 0.0, "current_allocated_mb": 0.0}
         return {
-            "peak_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024 ** 2),
-            "current_allocated_mb": torch.cuda.memory_allocated(device) / (1024 ** 2),
+            "peak_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024**2),
+            "current_allocated_mb": torch.cuda.memory_allocated(device) / (1024**2),
         }
