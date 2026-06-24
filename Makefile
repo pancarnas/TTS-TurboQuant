@@ -1,10 +1,16 @@
-.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda run run-vallex smoke-vallex profile-vallex profile-vallex-full smoke-qwen profile-qwen profile-qwen-full evaluate evaluate-vallex eval-qwen eval-vallex eval-smoke analyze test clean
+.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda fetch-eval-data validate-eval run run-vallex smoke-vallex profile-vallex profile-vallex-full smoke-qwen profile-qwen profile-qwen-full evaluate evaluate-vallex eval-qwen eval-vallex eval-qwen-parallel eval-vallex-parallel eval-smoke analyze test clean
 
 # Compression-evaluation tunables (see the eval-* targets below).
 SEEDS ?= 0,1,2,3,4
 DECODE ?= both
 TEMPS ?=
 GROUPS ?=
+# Eval data dir (seed-tts-eval + ellav_hard) — created by `make fetch-eval-data`.
+DATA_DIR ?= data
+# Parallel workers for eval-*-parallel (NO default — set WORKERS=N explicitly).
+WORKERS ?=
+# Shared label so a parallel launch's shard CSVs group for `analyze --trials-glob`.
+RUN_TAG ?= $(shell date +%Y%m%d_%H%M%S)
 
 DEVICE ?= $(shell python -c "import torch; print('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))" 2>/dev/null || echo cpu)
 METRICS_DEVICE ?= $(DEVICE)
@@ -41,6 +47,23 @@ install-sox:
 install-cuda:
 	pip install torch torchvision torchaudio --force-reinstall --index-url https://download.pytorch.org/whl/cu124
 
+# --- Eval data ---
+
+# Download seed-tts-eval test-en (HF) + write the ELLA-V hard text into DATA_DIR.
+# Required for the seedtts_en / ellav_hard groups (curated smoke/long work offline).
+fetch-eval-data:
+	python tools/fetch_eval_data.py --data-dir $(DATA_DIR)
+
+# Validate the eval text BEFORE the big run: baseline-only CER per sentence
+# (flags floor / un-synthesizable), token-length histogram, reference-clip ASR check.
+# Writes results/eval_set_report.md. GROUPS empty = all groups.
+validate-eval:
+	@mkdir -p results
+	python tools/validate_eval_set.py --device $(DEVICE) \
+		--metrics-device $(METRICS_DEVICE) --data-dir $(DATA_DIR) $(_GROUPS_ARG) \
+		--out-md results/eval_set_report.md 2>&1 \
+		| tee results/validate_eval_$(shell date +%Y%m%d_%H%M%S).log
+
 # --- Run ---
 
 run:
@@ -51,21 +74,21 @@ run:
 smoke-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
-		--groups short --max-per-group 2 --no-quality 2>&1 \
+		--groups smoke --max-per-group 2 --no-quality 2>&1 \
 		| tee results/smoke_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
-# torch.profiler run for Qwen. Default: short sentence, baseline + K4/V2 (~5-10 min).
+# torch.profiler run for Qwen. Default: smoke sentence, baseline + K4/V2 (~5-10 min).
 profile-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
-		--profile --profile-sentence short --no-quality 2>&1 \
+		--profile --profile-sentence smoke --no-quality 2>&1 \
 		| tee results/profile_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
-# Full Qwen profile: medium sentence, all 5 configs.
+# Full Qwen profile: long sentence, all 5 configs.
 profile-qwen-full:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
-		--profile --profile-sentence medium --profile-configs "" --no-quality 2>&1 \
+		--profile --profile-sentence long --profile-configs "" --no-quality 2>&1 \
 		| tee results/profile_qwen_full_$(shell date +%Y%m%d_%H%M%S).log
 
 run-vallex:
@@ -77,7 +100,7 @@ run-vallex:
 smoke-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--groups short --max-per-group 2 --no-quality 2>&1 \
+		--groups smoke --max-per-group 2 --no-quality 2>&1 \
 		| tee results/smoke_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
 # torch.profiler run. Default: short sentence, baseline + K4/V2 only (~5-8 min).
@@ -86,14 +109,14 @@ smoke-vallex:
 profile-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--profile --profile-sentence short --no-quality 2>&1 \
+		--profile --profile-sentence smoke --no-quality 2>&1 \
 		| tee results/profile_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
-# Full-coverage profile: medium sentence, all 5 configs. ~30-60 min.
+# Full-coverage profile: long sentence, all 5 configs. ~30-60 min.
 profile-vallex-full:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--profile --profile-sentence medium --profile-configs "" --no-quality 2>&1 \
+		--profile --profile-sentence long --profile-configs "" --no-quality 2>&1 \
 		| tee results/profile_vallex_full_$(shell date +%Y%m%d_%H%M%S).log
 
 evaluate:
@@ -111,31 +134,66 @@ evaluate-vallex:
 #   Scoped/fast:        make eval-qwen GROUPS=hard SEEDS=0,1
 _TEMPS_ARG = $(if $(TEMPS),--temperatures $(TEMPS),)
 _GROUPS_ARG = $(if $(GROUPS),--groups $(GROUPS),)
+_DATA_ARG = $(if $(DATA_DIR),--data-dir $(DATA_DIR),)
 
 eval-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 		--metrics-device $(METRICS_DEVICE) --track-only-off \
-		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) 2>&1 \
+		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) 2>&1 \
 		| tee results/eval_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
 eval-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) 2>&1 \
+		--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) 2>&1 \
 		| tee results/eval_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
-# Fast pipeline check: 1 hard sentence, real compression. Configs should now DIFFER
-# (SpkSim < 1.0) — confirms track_only=False applies compression to generation.
+# Parallel quality sweep: launch WORKERS shards on the single GPU (AR decode is
+# latency-bound, so co-location reclaims idle compute). CER/SpkSim are identical to
+# a serial run; gather RTF/VRAM separately with WORKERS=1. Shards share RUN_TAG so
+# `analyze --trials-glob` reassembles exactly this launch. Set WORKERS=N (e.g. 4).
+eval-qwen-parallel:
+	@mkdir -p results
+	@test -n "$(WORKERS)" || { echo "ERROR: set WORKERS=N (e.g. WORKERS=4)"; exit 1; }
+	@echo "Launching $(WORKERS) Qwen shards on $(DEVICE), run-tag=$(RUN_TAG)"
+	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
+		python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
+			--metrics-device $(METRICS_DEVICE) --track-only-off \
+			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) \
+			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
+			> results/eval_qwen_shard$${i}_$(RUN_TAG).log 2>&1 & \
+	done; \
+	wait
+	@echo "All shards done. Analyze this run with:"
+	@echo "  python tools/analyze_kv_benchmark.py --trials-glob 'results/qwen_trials_shard*_$(RUN_TAG).csv' --out-md results/analysis_$(RUN_TAG).md"
+
+eval-vallex-parallel:
+	@mkdir -p results
+	@test -n "$(WORKERS)" || { echo "ERROR: set WORKERS=N (e.g. WORKERS=4)"; exit 1; }
+	@echo "Launching $(WORKERS) VALL-E shards on $(DEVICE), run-tag=$(RUN_TAG)"
+	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
+		python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
+			--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) \
+			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
+			> results/eval_vallex_shard$${i}_$(RUN_TAG).log 2>&1 & \
+	done; \
+	wait
+	@echo "All shards done. Analyze this run with:"
+	@echo "  python tools/analyze_kv_benchmark.py --trials-glob 'results/vallex_trials_shard*_$(RUN_TAG).csv' --out-md results/analysis_$(RUN_TAG).md"
+
+# Fast pipeline check: 1 long sentence, real compression (no data fetch needed).
+# Configs should DIFFER (SpkSim < 1.0) — confirms track_only=False reaches generation.
 eval-smoke:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 		--metrics-device $(METRICS_DEVICE) --track-only-off \
-		--groups hard --max-per-group 1 --seeds 0,1 --decode sampling 2>&1 \
+		--groups long --max-per-group 1 --seeds 0,1 --decode sampling 2>&1 \
 		| tee results/eval_smoke_$(shell date +%Y%m%d_%H%M%S).log
 
 # Statistical analysis of the most recent run: mean±CI, paired Wilcoxon vs baseline,
-# CER variance decomposition, temperature trend, intrinsic compression ranking.
+# CER variance decomposition, temperature + length trends, intrinsic ranking.
+# For a parallel run use the --trials-glob command printed by eval-*-parallel.
 analyze:
 	python tools/analyze_kv_benchmark.py --results-dir results --out-md results/analysis_$(shell date +%Y%m%d_%H%M%S).md
 

@@ -83,6 +83,12 @@ def test_temperature_is_in_trial_schema() -> None:
     assert "temperature" in TRIAL_COLUMNS
 
 
+def test_spk_sim_ref_is_in_trial_schema() -> None:
+    # Ground-truth speaker similarity reported side-by-side with baseline-as-ref.
+    assert "spk_sim_ref" in TRIAL_COLUMNS
+    assert TRIAL_COLUMNS.index("spk_sim_ref") == TRIAL_COLUMNS.index("spk_sim") + 1
+
+
 def test_decode_overrides_greedy_forces_both_samplers_off() -> None:
     ov = decode_overrides("greedy")
     assert ov["do_sample"] is False

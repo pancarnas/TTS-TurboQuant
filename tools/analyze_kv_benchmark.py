@@ -55,6 +55,28 @@ def _latest(results_dir: str, suffix: str) -> Optional[str]:
     return max(matches, key=os.path.getmtime)
 
 
+def load_trials(
+    trials: Optional[str], trials_glob: Optional[str], results_dir: str
+) -> tuple[Optional[pd.DataFrame], list[str]]:
+    """Load the per-trial frame, concatenating shard CSVs when a glob is given.
+
+    Precedence: explicit ``--trials-glob`` (concat every match — this is how a
+    parallel sharded run is reassembled) > explicit ``--trials`` (one file) >
+    auto-discover the latest ``*_trials_*.csv``. Returns (df, paths_used) so the
+    set of concatenated files is reported, never silently truncated.
+    """
+    if trials_glob:
+        paths = sorted(glob.glob(trials_glob))
+        if not paths:
+            return None, []
+        frames = [pd.read_csv(p) for p in paths]
+        return pd.concat(frames, ignore_index=True), paths
+    path = trials or _latest(results_dir, "_trials_*.csv")
+    if path and os.path.exists(path):
+        return pd.read_csv(path), [path]
+    return None, []
+
+
 def _is_baseline(df: pd.DataFrame) -> pd.Series:
     """A row is baseline when it carries no key_bits (the uncompressed config)."""
     return df["key_bits"].isna()
@@ -152,6 +174,13 @@ def _emit(lines: list[str], text: str = "") -> None:
     lines.append(text)
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """Column ``name`` if present, else an empty float series (CSV back-compat)."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series(dtype=float)
+
+
 def _normalize_temperature(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure a string ``temperature`` column exists. Blank/NaN -> 'default'.
 
@@ -181,8 +210,8 @@ def section_means(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
         sub = df[df["arm"] == arm]
         _emit(
             lines,
-            f"{'group':<8} {'temp':>7} {'config':<22} {'n':>4}  "
-            f"{'CER mean':>9} {'[95% CI]':>20}   {'SpkSim mean':>11}",
+            f"{'group':<10} {'temp':>7} {'config':<22} {'n':>4}  "
+            f"{'CER mean':>9} {'[95% CI]':>20}   {'SpkSim':>8} {'SpkSimRef':>10}",
         )
         for group in sorted(sub["group"].dropna().unique()):
             for temp in sorted(sub[sub["group"] == group]["temperature"].unique()):
@@ -191,12 +220,14 @@ def section_means(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
                     cell = cells[cells["config"] == config]
                     cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
                     sm, _, _ = bootstrap_ci(cell["spk_sim"], n_boot)
+                    smr, _, _ = bootstrap_ci(_col(cell, "spk_sim_ref"), n_boot)
                     ci = f"[{clo:.4f}, {chi:.4f}]"
                     sm_str = "---" if np.isnan(sm) else f"{sm:.4f}"
+                    smr_str = "---" if np.isnan(smr) else f"{smr:.4f}"
                     _emit(
                         lines,
-                        f"{group:<8} {str(temp):>7} {config:<22} {len(cell):>4}  "
-                        f"{cm:>9.4f} {ci:>20}   {sm_str:>11}",
+                        f"{group:<10} {str(temp):>7} {config:<22} {len(cell):>4}  "
+                        f"{cm:>9.4f} {ci:>20}   {sm_str:>8} {smr_str:>10}",
                     )
         _emit(lines)
 
@@ -366,6 +397,50 @@ def section_temperature_trend(df: pd.DataFrame, n_boot: int, lines: list[str]) -
         _emit(lines, row)
 
 
+def section_length_trend(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
+    """CER (mean ± CI) per config across decode-length buckets.
+
+    The project's headline long-context result: KV-compression error grows with
+    sequence length (more cache to quantize). Buckets ``n_ar_tokens`` into terciles
+    so you can read off whether the gap to baseline widens for longer decodes.
+    Emitted only when there is a real spread of decode lengths.
+    """
+    if "n_ar_tokens" not in df.columns:
+        return
+    lengths = pd.to_numeric(df["n_ar_tokens"], errors="coerce")
+    if lengths.dropna().nunique() < 3:
+        return
+    # Bucket by RANK so ties (e.g. many identical short decodes) never collapse the
+    # quantile edges; this yields up to 3 equal-count groups ordered by length.
+    codes = pd.qcut(lengths.rank(method="first"), 3, labels=False, duplicates="drop")
+    work = df.assign(_bucket=codes)
+    present = sorted(int(c) for c in work["_bucket"].dropna().unique())
+    if len(present) < 2:
+        return
+
+    _emit(lines, "\n## 7. CER vs decode length (pooled over arms × seeds × temps)\n")
+    _emit(lines, "  Compression error should grow with decode length if the long-")
+    _emit(lines, "  context hypothesis holds: the gap to baseline widens left→right.\n")
+    edges = work.groupby("_bucket", observed=True)["n_ar_tokens"].agg(["min", "max"])
+    order = present
+    labels = {
+        b: f"{int(edges.loc[b, 'min'])}-{int(edges.loc[b, 'max'])}tok" for b in order
+    }
+    header = f"{'config':<22}" + "".join(f"{labels[b]:>20}" for b in order)
+    _emit(lines, header)
+    for config in work["config"].dropna().unique():
+        row = f"{config:<22}"
+        for b in order:
+            cell = work[(work["config"] == config) & (work["_bucket"] == b)]
+            cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
+            row += (
+                f"{f'{cm:.3f}[{clo:.3f},{chi:.3f}]':>20}"
+                if not np.isnan(cm)
+                else f"{'---':>20}"
+            )
+        _emit(lines, row)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -382,6 +457,12 @@ def main() -> None:
     )
     parser.add_argument("--trials", default=None, help="Explicit per-trial CSV path.")
     parser.add_argument(
+        "--trials-glob",
+        default=None,
+        help="Glob of per-trial CSVs to concatenate — use this to reassemble a "
+        "parallel sharded run, e.g. 'results/qwen_trials_shard*_<run-tag>.csv'.",
+    )
+    parser.add_argument(
         "--kv-recon", default=None, help="Explicit KV-reconstruction CSV path."
     )
     parser.add_argument(
@@ -392,20 +473,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    trials_path = args.trials or _latest(args.results_dir, "_trials_*.csv")
+    trials_df, trials_used = load_trials(
+        args.trials, args.trials_glob, args.results_dir
+    )
     kv_path = args.kv_recon or _latest(args.results_dir, "_kv_recon_*.csv")
 
     lines: list[str] = []
     _emit(lines, "# Rigorous KV-Quantization Benchmark — Analysis\n")
 
-    if trials_path and os.path.exists(trials_path):
-        _emit(lines, f"Per-trial CSV: {trials_path}")
-        df = _normalize_temperature(pd.read_csv(trials_path))
+    if trials_df is not None:
+        _emit(lines, f"Per-trial CSV(s): {', '.join(trials_used)}")
+        df = _normalize_temperature(trials_df)
         section_means(df, args.n_boot, lines)
         section_paired_tests(df, lines)
         section_variance(df, lines)
         section_arm_contrast(df, lines)
         section_temperature_trend(df, args.n_boot, lines)
+        section_length_trend(df, args.n_boot, lines)
     else:
         _emit(lines, "No per-trial CSV found — skipping downstream sections.")
 

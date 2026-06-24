@@ -58,194 +58,14 @@ from turboquant.bench_common import (
     sentence_hash,
     set_global_seed,
 )
+from turboquant.eval_sentences import available_groups, iter_eval_items
 
 
-# --- Test sentences (varying lengths) ---
+# --- Test sentences ---
+# The evaluation set now lives in turboquant.eval_sentences (shared with the
+# VALL-E benchmark for A/B parity): curated `smoke`/`long` groups plus the
+# disk-backed `seedtts_en` / `ellav_hard` standard sets. See iter_eval_items.
 
-SENTENCE_GROUPS = {
-    "short": [
-        "Hello, how are you doing today?",
-        "The weather is beautiful this morning.",
-        "Please pass me the salt and pepper.",
-        "I will be back in just a minute.",
-        "She said she would be here by noon.",
-        "Can you help me with this problem?",
-        "The train arrives at half past three.",
-        "He walked slowly down the empty street.",
-        "We need to finish this before Friday.",
-        "Thank you very much for your help.",
-        "The dog ran across the wide green field.",
-        "I forgot my umbrella at the office again.",
-        "Let us meet for coffee tomorrow afternoon.",
-        "The bridge was closed for repairs today.",
-        "Turn left at the second traffic light.",
-    ],
-    "medium": [
-        "The old man sat quietly on the bench, watching the children play in the park while the sun slowly set behind the distant mountains.",
-        "Scientists have discovered a new species of deep sea fish that can produce its own light, allowing it to survive in the darkest parts of the ocean.",
-        "After years of hard work and dedication, she finally received the promotion she had been hoping for, along with a corner office on the top floor.",
-        "The ancient library contained thousands of manuscripts, some dating back over a thousand years, carefully preserved behind glass cases in temperature controlled rooms.",
-        "Running a small business requires patience, creativity, and a willingness to adapt to changing market conditions, especially during times of economic uncertainty.",
-        "The documentary explored how traditional farming methods are being combined with modern technology to create more sustainable agricultural practices around the world.",
-        "Every morning she would walk through the garden, picking fresh herbs for breakfast while listening to the birds sing their familiar songs in the tall oak trees.",
-        "The committee debated the proposal for nearly three hours before finally agreeing on a compromise that satisfied neither the developers nor the local residents.",
-        "As the storm approached the coast, fishermen hurried to secure their boats while families along the shoreline boarded up their windows and stocked up on supplies.",
-        "The young pianist practiced the same difficult passage over and over, determined to perform it flawlessly at the competition that would take place the next weekend.",
-        "Researchers spent the better part of a decade tracking the migration patterns of the arctic tern, which travels farther each year than almost any other creature.",
-        "The small bakery on the corner had been run by the same family for three generations, and its fresh cinnamon bread drew customers from across the city.",
-    ],
-    "long": [
-        (
-            "The history of human civilization is a remarkable story of innovation and perseverance. "
-            "From the earliest cave paintings to the development of written language, from the invention "
-            "of the wheel to the creation of the internet, each generation has built upon the achievements "
-            "of those who came before. Today we stand at a crossroads where artificial intelligence and "
-            "biotechnology promise to reshape our world in ways we can barely imagine. The choices we make "
-            "now will determine the course of human history for centuries to come."
-        ),
-        (
-            "The ocean covers more than seventy percent of the Earth's surface and contains ninety seven "
-            "percent of all the water on our planet. Despite centuries of exploration, we have mapped less "
-            "than twenty percent of the ocean floor. The deep sea remains one of the last great frontiers, "
-            "home to creatures that have evolved in complete darkness, under pressures that would crush "
-            "most land animals, and at temperatures near freezing."
-        ),
-        (
-            "Education is the most powerful tool for changing the world. A good education "
-            "gives people the ability to think critically, solve complex problems, and communicate "
-            "effectively with others. It opens doors to new opportunities and helps break the cycle of poverty. "
-            "When we invest in education, we invest in the future of our communities and our nations. Every "
-            "child deserves access to quality learning regardless of where they were born or what challenges "
-            "they face in their daily lives."
-        ),
-        (
-            "Music has been a fundamental part of human culture for tens of thousands of years. Archaeological "
-            "evidence suggests that early humans created simple flutes from bird bones and mammoth ivory over "
-            "forty thousand years ago. Throughout history, music has served many purposes, from ceremonies "
-            "to entertainment, from communication to emotional expression. Today, music continues "
-            "to evolve, blending traditional instruments with digital technology to create entirely new sounds "
-            "that would have been unimaginable to our ancestors."
-        ),
-        (
-            "The art of cooking has transformed dramatically over the past century. What was once a daily "
-            "necessity focused purely on survival has become a global cultural phenomenon. Chefs travel the "
-            "world to study different traditions, combining techniques from many continents "
-            "to create dishes that tell stories of migration, trade, and human connection. Food "
-            "brings people together across languages and borders in ways that few other things can."
-        ),
-        (
-            "Space exploration has captured the human imagination since the first satellites were launched "
-            "into orbit more than sixty years ago. What began as a fierce competition between rival nations "
-            "has gradually evolved into an era of international cooperation, with astronauts from many "
-            "countries living and working together aboard orbiting laboratories. Today, private companies "
-            "are building reusable rockets, and serious plans are being drawn up to return humans to the Moon "
-            "and eventually send them to Mars."
-        ),
-        (
-            "The invention of the printing press in the fifteenth century transformed the way knowledge "
-            "spread across the world. Before that time, books were copied painstakingly by hand, making them "
-            "rare and extraordinarily expensive. Once printed books became widely available, literacy rates "
-            "climbed, new ideas traveled faster than ever before, and ordinary people gained access to "
-            "information that had once been reserved for the wealthy and the powerful few."
-        ),
-        (
-            "Forests play a vital role in maintaining the delicate balance of life on our planet. They absorb "
-            "carbon dioxide from the atmosphere, release the oxygen we breathe, and provide a home for "
-            "countless species of plants and animals. When large areas of forest are cleared for agriculture "
-            "or development, the consequences ripple outward, affecting rainfall patterns, soil quality, and "
-            "the survival of communities that depend on these ecosystems for their livelihoods."
-        ),
-        (
-            "The internet has fundamentally reshaped how people communicate, work, and learn in the span of a "
-            "single generation. Messages that once took days or weeks to deliver now travel around the globe "
-            "in fractions of a second. Students can attend lectures from universities thousands of miles away, "
-            "businesses can collaborate across continents, and friends separated by oceans can speak face to "
-            "face as though they were sitting in the same room."
-        ),
-        (
-            "Becoming an elite athlete demands far more than natural talent and physical strength. It requires "
-            "years of disciplined training, careful attention to nutrition and rest, and an unshakable mental "
-            "resilience in the face of setbacks and injuries. For every champion who stands on the podium, "
-            "there are countless hours of early mornings, painful defeats, and quiet sacrifices that the "
-            "cheering crowds will never see or fully appreciate."
-        ),
-    ],
-    # Prosodically demanding + long-decode text (numbers, dates, units, codes,
-    # abbreviations). All English (no foreign words / diacritics). Pushes CER off
-    # the ~0% floor so config differences become measurable, and mirrors across
-    # both models for A/B parity.
-    "hard": [
-        (
-            "On 03/17/2026 at 9:45 a.m., the Chicago logistics team delivered 1,348 units to "
-            "Warehouse 7B, invoice number QX-90217, at a unit cost of $12.74, a 6.3% increase over "
-            "the previous quarter's figure of $11.98."
-        ),
-        (
-            "Doctor Nguyen presented the cohort's results: 27 of 312 patients, about 8.7%, exhibited the "
-            "rare CYP2D6 polymorphism, while baseline HbA1c dropped from 9.2% to 6.4% over "
-            "fourteen weeks, with no statistically significant adverse events."
-        ),
-        (
-            "The flight from Denver to Atlanta was delayed nearly three hours, pushing our connection at "
-            "gate B17 back to 11:52 p.m. and forcing an unplanned overnight stay at a hotel near the airport."
-        ),
-        (
-            "She muttered the tongue-twister thrice, reciting 'the sixth sick sheikh's sixth sheep's sick', "
-            "then recited Avogadro's number, 6.022 times ten to the twenty-third, before spelling "
-            "the words 'rhythm', 'colonel', and 'Worcestershire' aloud without a single mistake."
-        ),
-        (
-            "Per the third-quarter earnings call, revenue reached $2.4 billion, up 11.2% year over year, "
-            "the operating margin held at 34%, and the chief financial officer reaffirmed full-year guidance "
-            "of $9.8 to $10.1 billion despite headwinds in several regional segments."
-        ),
-        (
-            "The arbitration clause in Section 14(b), subsection three, caps liability at $2,500,000 and "
-            "mandates venue in Wilmington, Delaware, no later than 30 days after written notice is served."
-        ),
-        (
-            "The Large Hadron Collider accelerates protons to 6.8 trillion electron volts, colliding them "
-            "forty million times per second inside detectors cooled to 1.9 kelvin, barely above absolute zero."
-        ),
-        (
-            "Administer 0.5 milligrams per kilogram intravenously every eight hours, not to exceed "
-            "2 grams daily; monitor creatinine clearance and discontinue if it falls below "
-            "30 milliliters per minute."
-        ),
-        (
-            "The quarterly report listed 4,096 active users, a churn rate of 2.3%, and average revenue "
-            "per user of $18.40, up from $16.75 the previous spring."
-        ),
-        (
-            "On July 14th, 1789, crowds stormed the prison fortress; exactly two hundred and fifteen years "
-            "later, in 2004, the union welcomed ten new member states, expanding from fifteen to twenty-five."
-        ),
-        (
-            "Upgrade the cluster to Kubernetes version 1.29.4, bump the database image from 14.11 to "
-            "16.3, and rotate the security certificates before they expire on 2026-09-08 at 23:59."
-        ),
-        (
-            "The conscientious archaeologist carefully catalogued the ancient cuneiform "
-            "tablets, pronouncing 'Nebuchadnezzar' and 'Gilgamesh' with surprising fluency despite "
-            "a stubborn case of laryngitis."
-        ),
-        (
-            "Down ninety-eight to ninety-six with 4.7 seconds left, she sank a twenty-seven-foot "
-            "three-pointer at the buzzer, finishing with 41 points, 12 rebounds, and 8 assists on "
-            "63 percent shooting."
-        ),
-        (
-            "Preheat the oven to 425 degrees, whisk 250 grams of flour with three quarters "
-            "of a teaspoon of salt, then fold in one and a half cups of buttermilk and bake for "
-            "eighteen to twenty-two minutes."
-        ),
-        (
-            "The Supreme Court ruled six to three that the statute, codified at Section 1331 of Title 28, "
-            "did not preempt the state's 1974 consumer-protection act, remanding the case to the "
-            "appeals court for further proceedings."
-        ),
-    ],
-}
 
 TURBOQUANT_CONFIGS = [
     ("baseline (no TQ)", None),
@@ -492,7 +312,14 @@ def measure_kv_reconstruction(
 
 
 def run_intrinsic_metrics(
-    model, speaker, active_groups, max_per_group, seed, device, results_fh
+    model,
+    speaker,
+    active_groups,
+    max_per_group,
+    seed,
+    device,
+    results_fh,
+    data_dir=None,
 ):
     """Deterministic compression-distortion sweep (KV reconstruction).
 
@@ -510,10 +337,9 @@ def run_intrinsic_metrics(
 
     pooled = {}  # config -> variant -> list of (cos, relmse)
     for group_name in active_groups:
-        texts = SENTENCE_GROUPS[group_name]
-        if max_per_group is not None:
-            texts = texts[:max_per_group]
-        for i, text in enumerate(texts):
+        items = iter_eval_items([group_name], max_per_group, data_dir)
+        for i, item in enumerate(items):
+            text = item.text
             agg = measure_kv_reconstruction(
                 model,
                 text,
@@ -717,6 +543,8 @@ def run_generation(
     seed=None,
     gen_overrides=None,
     deterministic=False,
+    ref_audio=None,
+    ref_text=None,
 ):
     """Run a single generation.
 
@@ -727,6 +555,11 @@ def run_generation(
     decoding so baseline and every compressed config share the same random
     draw for this (sentence, seed) — the paired-comparison control.
     ``gen_overrides`` merges decode-arm kwargs (e.g. greedy do_sample=False).
+
+    ``ref_audio`` (with optional ``ref_text``) switches to zero-shot voice
+    cloning via ``generate_voice_clone``; both clone and preset paths forward
+    ``turboquant_config`` to the same ``model.generate``, so compression applies
+    identically either way. Without ``ref_audio`` the preset speaker is used.
     """
     kwargs = {}
     if tq_config is not None:
@@ -752,12 +585,21 @@ def run_generation(
         torch.cuda.reset_peak_memory_stats(device)
 
     start = time.time()
-    wavs, sr = model.generate_custom_voice(
-        text=text,
-        language=language,
-        speaker=speaker,
-        **kwargs,
-    )
+    if ref_audio is not None:
+        wavs, sr = model.generate_voice_clone(
+            text=text,
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            **kwargs,
+        )
+    else:
+        wavs, sr = model.generate_custom_voice(
+            text=text,
+            language=language,
+            speaker=speaker,
+            **kwargs,
+        )
     if _is_cuda(device):
         torch.cuda.synchronize(device)
     elapsed = time.time() - start
@@ -785,6 +627,7 @@ def _empty_group_results() -> dict:
         "rtf",
         "cer",
         "spk_sim",
+        "spk_sim_ref",
         "theoretical_ratio",
         "effective_ratio",
         "peak_vram_mb",
@@ -793,6 +636,24 @@ def _empty_group_results() -> dict:
         "realized_mb",
     )
     return {name: {k: [] for k in metric_keys} for name, _ in TURBOQUANT_CONFIGS}
+
+
+def _load_reference_clip(item, metrics):
+    """Load the reference clip for ground-truth SpkSim: ground truth, else prompt.
+
+    Returns ``(wav_np, sr)`` or ``(None, None)`` when there is no reference or no
+    metrics. Loaded once per cell so it isn't re-read for every config.
+    """
+    ref_path = getattr(item, "ground_truth_audio", None) or getattr(
+        item, "ref_audio", None
+    )
+    if not ref_path or metrics is None:
+        return None, None
+    try:
+        wav, sr = librosa.load(ref_path, sr=None, mono=True)
+        return wav, sr
+    except Exception:
+        return None, None
 
 
 def _extract_mem_metrics(mem_report) -> dict:
@@ -833,6 +694,9 @@ def _sweep_arm(
     trial_fh,
     device,
     deterministic,
+    data_dir=None,
+    num_shards=1,
+    shard_id=0,
 ):
     """Run the full group×sentence×seed×temperature×config sweep for one arm.
 
@@ -855,11 +719,13 @@ def _sweep_arm(
     _tee(results_fh, f"{'#' * 110}")
 
     summary = {}
+    # Round-robin shard counter over (group, sentence, seed, temperature) cells.
+    # The config loop runs whole inside each cell, so a baseline always stays in
+    # the same process as the configs it anchors (baseline-as-ref SpkSim).
+    cell_idx = 0
     for group_name in active_groups:
-        texts = SENTENCE_GROUPS[group_name]
-        if max_per_group is not None:
-            texts = texts[:max_per_group]
-        n = len(texts)
+        items = iter_eval_items([group_name], max_per_group, data_dir)
+        n = len(items)
         _tee(results_fh, f"\n{'=' * 110}")
         _tee(
             results_fh,
@@ -869,18 +735,23 @@ def _sweep_arm(
         _tee(results_fh, f"{'=' * 110}")
 
         group_results = _empty_group_results()
-        for i, text in enumerate(texts):
+        for i, item in enumerate(items):
+            text = item.text
             shash = sentence_hash(text)
             preview = text[:50] + "..." if len(text) > 50 else text
             _tee(results_fh, f'\n  [{i + 1}/{n}] "{preview}"')
             for seed in seeds:
                 for temp in temps:
+                    this_cell = cell_idx
+                    cell_idx += 1
+                    if this_cell % num_shards != shard_id:
+                        continue
                     gen_overrides = decode_overrides(arm, temperature=temp)
                     _sweep_sentence_seed(
                         model,
                         metrics,
                         speaker,
-                        text,
+                        item,
                         group_name,
                         i,
                         shash,
@@ -906,7 +777,7 @@ def _sweep_sentence_seed(
     model,
     metrics,
     speaker,
-    text,
+    item,
     group_name,
     idx,
     shash,
@@ -923,8 +794,12 @@ def _sweep_sentence_seed(
     save_wav,
 ):
     """Run all configs for one (sentence, seed, temperature), paired on the same draw."""
+    text = item.text
     baseline_wav = None
     baseline_sr = None
+    # Ground-truth reference clip (same text) preferred; else the cloning prompt.
+    # Loaded once per cell for the side-by-side spk_sim_ref metric.
+    ref_wav, ref_sr = _load_reference_clip(item, metrics)
     for config_name, tq_config in TURBOQUANT_CONFIGS:
         key_bits, value_bits, residual_window = config_bits(tq_config)
         try:
@@ -938,6 +813,8 @@ def _sweep_sentence_seed(
                 seed=seed,
                 gen_overrides=gen_overrides,
                 deterministic=deterministic,
+                ref_audio=item.ref_audio,
+                ref_text=item.ref_text,
             )
             wav = wavs[0]
             audio_duration = len(wav) / sr
@@ -960,6 +837,7 @@ def _sweep_sentence_seed(
 
             error_rate = None
             spk_sim = None
+            spk_sim_ref = None
             transcript_len = None
             if metrics:
                 error_rate, transcript = metrics.whisper_cer(wav, sr, text)
@@ -973,6 +851,14 @@ def _sweep_sentence_seed(
                     )
                     if spk_sim is not None:
                         r["spk_sim"].append(spk_sim)
+                # Ground-truth SIM (vs an external reference clip) — reported for
+                # every config incl. baseline, since the reference is not the run.
+                if ref_wav is not None:
+                    spk_sim_ref = metrics.speaker_cosine_similarity(
+                        ref_wav, ref_sr, wav, sr
+                    )
+                    if spk_sim_ref is not None:
+                        r["spk_sim_ref"].append(spk_sim_ref)
 
             if save_wav:
                 safe = config_name.replace(" ", "_").replace("/", "_")
@@ -990,6 +876,8 @@ def _sweep_sentence_seed(
                 status += f" CER={error_rate:.1%}"
                 if spk_sim is not None:
                     status += f" SpkSim={spk_sim:.4f}"
+                if spk_sim_ref is not None:
+                    status += f" SpkSimRef={spk_sim_ref:.4f}"
             tlabel = "" if temperature is None else f" T={temperature}"
             _tee(results_fh, f"    s{seed}{tlabel} {config_name:<22} {status}")
 
@@ -1009,6 +897,7 @@ def _sweep_sentence_seed(
                 cer=error_rate,
                 transcript_len=transcript_len,
                 spk_sim=spk_sim,
+                spk_sim_ref=spk_sim_ref,
                 peak_vram_mb=peak_vram_mb,
                 tokens_per_sec=tokens_per_sec,
                 n_ar_tokens=n_ar_tokens,
@@ -1076,8 +965,18 @@ def benchmark_qwen3tts(args):
     arms = parse_arms(args.decode)
     seeds = args.seeds
 
+    num_shards = getattr(args, "num_shards", 1)
+    shard_id = getattr(args, "shard_id", 0)
+    data_dir = getattr(args, "data_dir", None)
+    run_tag = getattr(args, "run_tag", "") or ""
+    # Each parallel worker writes its own shard CSV so workers never collide; the
+    # shared run_tag lets analyze concat one launch's shards (and only those).
+    trial_tag = "qwen_trials" if num_shards == 1 else f"qwen_trials_shard{shard_id}"
+    if run_tag:
+        trial_tag = f"{trial_tag}_{run_tag}"
+
     results_fh, results_path = _open_results_file("benchmark_qwen3tts")
-    trial_fh, trial_path = _open_csv_file("qwen_trials", TRIAL_COLUMNS)
+    trial_fh, trial_path = _open_csv_file(trial_tag, TRIAL_COLUMNS)
     gpu_csv = start_nvidia_smi_monitor("benchmark_qwen3tts")
 
     header = [
@@ -1150,7 +1049,7 @@ def benchmark_qwen3tts(args):
     output_dir = os.path.join(_THIS_DIR, "outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    active_groups = getattr(args, "active_groups", list(SENTENCE_GROUPS.keys()))
+    active_groups = getattr(args, "active_groups", available_groups())
     max_per_group = getattr(args, "max_per_group", None)
 
     for arm in arms:
@@ -1168,6 +1067,9 @@ def benchmark_qwen3tts(args):
             trial_fh,
             device,
             args.deterministic,
+            data_dir=data_dir,
+            num_shards=num_shards,
+            shard_id=shard_id,
         )
         _print_arm_summaries(results_fh, metrics, arm, active_groups, summary)
 
@@ -1176,9 +1078,17 @@ def benchmark_qwen3tts(args):
     _tee(results_fh, f"Per-trial CSV (source of truth): {trial_path}")
 
     # Deterministic intrinsic distortion metrics (no sampling noise, no CER floor).
-    if not args.no_intrinsic:
+    # Only the first shard runs it (it is deterministic and not sharded).
+    if not args.no_intrinsic and shard_id == 0:
         run_intrinsic_metrics(
-            model, speaker, active_groups, max_per_group, seeds[0], device, results_fh
+            model,
+            speaker,
+            active_groups,
+            max_per_group,
+            seeds[0],
+            device,
+            results_fh,
+            data_dir=data_dir,
         )
 
     results_fh.close()
@@ -1356,7 +1266,11 @@ def profile_all_configs(args):
     speaker = speakers[0] if speakers else "Ryan"
     _tee(results_fh, f"Using speaker: {speaker}")
 
-    text = SENTENCE_GROUPS[args.profile_sentence][0]
+    text = iter_eval_items(
+        [args.profile_sentence],
+        max_per_group=1,
+        data_dir=getattr(args, "data_dir", None),
+    )[0].text
     _tee(results_fh, f'Profiling text ({args.profile_sentence}): "{text[:80]}..."')
 
     output_dir = os.path.join(_THIS_DIR, "outputs")
@@ -1496,9 +1410,13 @@ def evaluate_saved_wavs(args):
 
     metrics = QualityMetrics(device="cpu")
 
-    for group_name, texts in SENTENCE_GROUPS.items():
+    active_groups = getattr(args, "active_groups", available_groups())
+    data_dir = getattr(args, "data_dir", None)
+    max_per_group = getattr(args, "max_per_group", None)
+    for group_name in active_groups:
+        items = iter_eval_items([group_name], max_per_group, data_dir)
         print(f"\n{'─' * 80}")
-        print(f"Group: {group_name} ({len(texts)} sentences)")
+        print(f"Group: {group_name} ({len(items)} sentences)")
         print(f"{'─' * 80}")
         print(f"{'Config':<22} {'Avg CER':<10} {'Avg SpkSim':<12}")
         print("-" * 45)
@@ -1507,7 +1425,8 @@ def evaluate_saved_wavs(args):
             name: {"cer": [], "spk_sim": []} for name, _ in TURBOQUANT_CONFIGS
         }
 
-        for i, text in enumerate(texts):
+        for i, item in enumerate(items):
+            text = item.text
             baseline_wav = None
             baseline_sr = None
             for config_name, tq_config in TURBOQUANT_CONFIGS:
@@ -1584,8 +1503,8 @@ def main():
     )
     parser.add_argument(
         "--profile-sentence",
-        default="medium",
-        choices=list(SENTENCE_GROUPS.keys()),
+        default="long",
+        choices=available_groups(),
         help="Which sentence group's first entry to profile under --profile",
     )
     parser.add_argument(
@@ -1596,16 +1515,44 @@ def main():
     )
     parser.add_argument(
         "--groups",
-        default=",".join(SENTENCE_GROUPS.keys()),
-        help="Comma-separated sentence groups to run (default: all). "
-        "Useful on tight-VRAM GPUs: --groups short,medium to skip long sentences. "
-        "For a smoke test: --groups short.",
+        default=",".join(available_groups()),
+        help="Comma-separated sentence groups to run (default: all). Valid: "
+        f"{available_groups()}. seedtts_en / ellav_hard need --data-dir "
+        "(run fetch-eval-data first). Smoke test: --groups smoke.",
     )
     parser.add_argument(
         "--max-per-group",
         type=int,
         default=None,
         help="Cap sentences per group (useful for smoke tests; default: run all).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directory holding the standard eval sets (en/*.lst + prompt-wavs + "
+        "ellav_hard.txt) from tools/fetch_eval_data.py. Required for the "
+        "seedtts_en / ellav_hard groups; ignored by the curated groups.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Split the work-list across N parallel workers (round-robin over "
+        "(group, sentence, seed, temperature) cells). Each shard writes its own "
+        "trials CSV. Use WORKERS=1 for the serial performance pass.",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="This worker's shard index in [0, num-shards). Only the 0th shard "
+        "runs the deterministic intrinsic-distortion probe.",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default="",
+        help="Shared label embedded in the trials CSV name so the parallel "
+        "launcher's shards group into one run for analyze --trials-glob.",
     )
     parser.add_argument(
         "--seeds",
@@ -1660,10 +1607,16 @@ def main():
                 cfg.track_only = False
 
     requested = [g.strip() for g in args.groups.split(",") if g.strip()]
-    unknown = [g for g in requested if g not in SENTENCE_GROUPS]
+    unknown = [g for g in requested if g not in available_groups()]
     if unknown:
-        parser.error(f"unknown group(s): {unknown}. Valid: {list(SENTENCE_GROUPS)}")
+        parser.error(f"unknown group(s): {unknown}. Valid: {available_groups()}")
     args.active_groups = requested
+
+    if args.num_shards < 1 or not (0 <= args.shard_id < args.num_shards):
+        parser.error(
+            f"invalid sharding: shard-id {args.shard_id} must be in "
+            f"[0, num-shards={args.num_shards})"
+        )
 
     try:
         args.seeds = parse_seeds(args.seeds)

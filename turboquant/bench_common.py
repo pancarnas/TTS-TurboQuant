@@ -151,6 +151,7 @@ TRIAL_COLUMNS = [
     "cer",
     "transcript_len",
     "spk_sim",
+    "spk_sim_ref",
     "peak_vram_mb",
     "tokens_per_sec",
     "n_ar_tokens",
