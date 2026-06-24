@@ -63,7 +63,7 @@ fetch-eval-data:
 validate-eval:
 	@mkdir -p results
 	python tools/validate_eval_set.py --device $(DEVICE) \
-		--metrics-device $(METRICS_DEVICE) --data-dir $(DATA_DIR) $(_GROUPS_ARG) \
+		--metrics-device $(METRICS_DEVICE) --data-dir $(DATA_DIR) $(_GROUPS_ARG) $(_MPG_ARG) \
 		--out-md results/eval_set_report.md 2>&1 \
 		| tee results/validate_eval_$(shell date +%Y%m%d_%H%M%S).log
 
@@ -138,6 +138,10 @@ evaluate-vallex:
 _TEMPS_ARG = $(if $(TEMPS),--temperatures $(TEMPS),)
 _GROUPS_ARG = $(if $(GROUPS),--groups $(GROUPS),)
 _DATA_ARG = $(if $(DATA_DIR),--data-dir $(DATA_DIR),)
+# Cap sentences PER GROUP. Important for seedtts_en (1088 rows) — match it to the
+# LIMIT you fetched, e.g. MAX_PER_GROUP=100. Smaller groups (ellav_hard=20, long=4)
+# are unaffected by a larger cap.
+_MPG_ARG = $(if $(MAX_PER_GROUP),--max-per-group $(MAX_PER_GROUP),)
 # Voice strategy (Qwen). MODEL switches checkpoint; VOICE={auto,preset,clone}.
 # Preset run (default CustomVoice): leave VOICE unset (auto → preset).
 # Clone run: MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base VOICE=clone DEFAULT_REF=<wav> DEFAULT_REF_TEXT="..."
@@ -150,13 +154,13 @@ eval-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 		--metrics-device $(METRICS_DEVICE) --track-only-off \
-		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
+		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
 		| tee results/eval_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
 eval-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) 2>&1 \
+		--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) 2>&1 \
 		| tee results/eval_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
 # Parallel quality sweep: launch WORKERS shards on the single GPU (AR decode is
@@ -170,7 +174,7 @@ eval-qwen-parallel:
 	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
 		python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 			--metrics-device $(METRICS_DEVICE) --track-only-off \
-			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_QWEN_VOICE_ARGS) \
+			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_QWEN_VOICE_ARGS) \
 			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
 			> results/eval_qwen_shard$${i}_$(RUN_TAG).log 2>&1 & \
 	done; \
@@ -184,7 +188,7 @@ eval-vallex-parallel:
 	@echo "Launching $(WORKERS) VALL-E shards on $(DEVICE), run-tag=$(RUN_TAG)"
 	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
 		python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-			--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) \
+			--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) \
 			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
 			> results/eval_vallex_shard$${i}_$(RUN_TAG).log 2>&1 & \
 	done; \
