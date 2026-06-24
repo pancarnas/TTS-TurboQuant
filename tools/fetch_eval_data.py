@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import Optional
 
 SEEDTTS_REPO = "zhaochenyang20/seed-tts-eval"
 # en set references prompt-wavs/common_voice_en_*.wav; wavs/ holds ground truth.
@@ -50,17 +51,58 @@ _ELLAV_RECON = [
 ]
 
 
-def fetch_seedtts(data_dir: str) -> int:
+_SEEDTTS_LSTS = ("en/meta.lst", "en/non_para_reconstruct_meta.lst")
+
+
+def _referenced_wavs(lst_path: str, limit: Optional[int]) -> list[str]:
+    """Repo-relative wav paths referenced by the first ``limit`` rows of an .lst."""
+    rels: list[str] = []
+    rows = 0
+    with open(lst_path, encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.strip().split("|")
+            if len(parts) < 4:
+                continue
+            rels.append(parts[2])  # prompt wav
+            if len(parts) >= 5 and parts[4].strip():
+                rels.append(parts[4])  # ground-truth wav
+            rows += 1
+            if limit and rows >= limit:
+                break
+    return rels
+
+
+def _parallel_download(repo: str, rels, data_dir: str, token, workers: int) -> None:
+    """Download repo-relative files concurrently (token raises the anon rate limit)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from huggingface_hub import hf_hub_download
+
+    def _one(rel: str) -> None:
+        hf_hub_download(
+            repo_id=repo,
+            repo_type="dataset",
+            filename=rel,
+            local_dir=data_dir,
+            token=token,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_one, rels))
+
+
+def fetch_seedtts(data_dir: str, limit: Optional[int] = None, workers: int = 4) -> int:
     """Download seed-tts-eval test-en into ``data_dir``; return en sample count.
 
-    Disables the Xet transfer (its anonymous ``xet-read-token`` endpoint rate-limits
-    hard — the common 429) so it falls back to plain HTTPS. Uses an HF token from
-    ``HF_TOKEN``/``HUGGING_FACE_HUB_TOKEN`` (or a cached login) when present, which
-    raises the anonymous limit; set one if you still get 429s.
+    Disables Xet (its anonymous ``xet-read-token`` endpoint rate-limits hard — the
+    common 429), so it uses plain HTTPS. With ``limit`` set, fetches only the wav
+    clips the first N rows reference (≈100-200 files, not all ~2,170) — far faster
+    and rate-limit-safe. ``workers`` controls download concurrency. An HF token
+    (``HF_TOKEN`` / cached login) raises the anonymous limit; set one for 429s.
     """
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download, snapshot_download
         from huggingface_hub.errors import HfHubHTTPError
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise SystemExit(
@@ -68,20 +110,39 @@ def fetch_seedtts(data_dir: str) -> int:
         ) from exc
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     try:
-        snapshot_download(
-            repo_id=SEEDTTS_REPO,
-            repo_type="dataset",
-            local_dir=data_dir,
-            allow_patterns=_SEEDTTS_PATTERNS,
-            token=token,
-            max_workers=2,  # smaller request burst → fewer rate-limit hits
-        )
+        # The .lst index files are tiny — always grab them first.
+        for lst in _SEEDTTS_LSTS:
+            hf_hub_download(
+                repo_id=SEEDTTS_REPO,
+                repo_type="dataset",
+                filename=lst,
+                local_dir=data_dir,
+                token=token,
+            )
+        if limit:
+            rels: set[str] = set()
+            for lst in _SEEDTTS_LSTS:
+                p = os.path.join(data_dir, lst)
+                if os.path.exists(p):
+                    rels.update(_referenced_wavs(p, limit))
+            print(f"  fetching {len(rels)} wavs for the first {limit} samples ...")
+            _parallel_download(SEEDTTS_REPO, sorted(rels), data_dir, token, workers)
+        else:
+            snapshot_download(
+                repo_id=SEEDTTS_REPO,
+                repo_type="dataset",
+                local_dir=data_dir,
+                allow_patterns=_SEEDTTS_PATTERNS,
+                token=token,
+                max_workers=workers,
+            )
     except HfHubHTTPError as exc:
         if "429" in str(exc):
             raise SystemExit(
-                "HF rate-limited this IP (429). Authenticate to raise the limit:\n"
+                "HF rate-limited this IP (429). Either pass --limit N (fetch only "
+                "the wavs you need) or authenticate to raise the limit:\n"
                 "  huggingface-cli login   # or: export HF_TOKEN=hf_...\n"
-                "then re-run. Xet is already disabled via HF_HUB_DISABLE_XET=1."
+                "Xet is already disabled via HF_HUB_DISABLE_XET=1."
             ) from exc
         raise
     meta = os.path.join(data_dir, "en", "meta.lst")
@@ -121,14 +182,30 @@ def main() -> None:
         action="store_true",
         help="Overwrite an existing ellav_hard.txt.",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Fetch only the wav clips the first N seed-tts rows reference "
+        "(≈100-200 files vs all ~2,170). Match this to the --max-per-group you "
+        "will run. Default: download the whole test-en set.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallel download workers (default 4). Raise with an HF token set.",
+    )
     args = parser.parse_args()
     os.makedirs(args.data_dir, exist_ok=True)
 
     print(f"== Eval-data fetch into {args.data_dir} ==")
     seed_n = 0
     if not args.skip_seedtts:
-        seed_n = fetch_seedtts(args.data_dir)
-        print(f"seed-tts-eval test-en: {seed_n} samples  (source: HF {SEEDTTS_REPO})")
+        seed_n = fetch_seedtts(args.data_dir, limit=args.limit, workers=args.workers)
+        print(
+            f"seed-tts-eval test-en: {seed_n} samples indexed  (source: HF {SEEDTTS_REPO})"
+        )
     ellav_n = write_ellav_hard(args.data_dir, overwrite=args.overwrite_ellav)
     print(f"ellav_hard: {ellav_n} sentences  (source: vendored reconstruction)")
     print(

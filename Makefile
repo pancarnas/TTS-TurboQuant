@@ -51,8 +51,11 @@ install-cuda:
 
 # Download seed-tts-eval test-en (HF) + write the ELLA-V hard text into DATA_DIR.
 # Required for the seedtts_en / ellav_hard groups (curated smoke/long work offline).
+# LIMIT=N fetches only the wavs the first N samples reference (avoids the ~2,170-file
+# pull + HF 429); match it to the seedtts_en --max-per-group you plan to run.
 fetch-eval-data:
-	python tools/fetch_eval_data.py --data-dir $(DATA_DIR)
+	python tools/fetch_eval_data.py --data-dir $(DATA_DIR) \
+		$(if $(LIMIT),--limit $(LIMIT),) $(if $(FETCH_WORKERS),--workers $(FETCH_WORKERS),)
 
 # Validate the eval text BEFORE the big run: baseline-only CER per sentence
 # (flags floor / un-synthesizable), token-length histogram, reference-clip ASR check.
