@@ -51,19 +51,39 @@ _ELLAV_RECON = [
 
 
 def fetch_seedtts(data_dir: str) -> int:
-    """Download seed-tts-eval test-en into ``data_dir``; return en sample count."""
+    """Download seed-tts-eval test-en into ``data_dir``; return en sample count.
+
+    Disables the Xet transfer (its anonymous ``xet-read-token`` endpoint rate-limits
+    hard — the common 429) so it falls back to plain HTTPS. Uses an HF token from
+    ``HF_TOKEN``/``HUGGING_FACE_HUB_TOKEN`` (or a cached login) when present, which
+    raises the anonymous limit; set one if you still get 429s.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     try:
         from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import HfHubHTTPError
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise SystemExit(
             "huggingface_hub not installed (uv add huggingface_hub)"
         ) from exc
-    snapshot_download(
-        repo_id=SEEDTTS_REPO,
-        repo_type="dataset",
-        local_dir=data_dir,
-        allow_patterns=_SEEDTTS_PATTERNS,
-    )
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    try:
+        snapshot_download(
+            repo_id=SEEDTTS_REPO,
+            repo_type="dataset",
+            local_dir=data_dir,
+            allow_patterns=_SEEDTTS_PATTERNS,
+            token=token,
+            max_workers=2,  # smaller request burst → fewer rate-limit hits
+        )
+    except HfHubHTTPError as exc:
+        if "429" in str(exc):
+            raise SystemExit(
+                "HF rate-limited this IP (429). Authenticate to raise the limit:\n"
+                "  huggingface-cli login   # or: export HF_TOKEN=hf_...\n"
+                "then re-run. Xet is already disabled via HF_HUB_DISABLE_XET=1."
+            ) from exc
+        raise
     meta = os.path.join(data_dir, "en", "meta.lst")
     if not os.path.exists(meta):
         return 0
