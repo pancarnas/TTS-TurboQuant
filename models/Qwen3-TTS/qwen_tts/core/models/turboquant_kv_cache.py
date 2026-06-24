@@ -159,6 +159,19 @@ class TurboQuantKVCache(DynamicCache):
             self._chunks_k[layer_idx].append({"blob": ck, "span": span})
             self._chunks_v[layer_idx].append({"blob": cv, "span": span})
 
+        # Write the lossy reconstruction back into the buffer ONCE, here, for the
+        # span we just compressed (its source fp16 is still pristine). After this the
+        # buffer holds [lossy compressed prefix][exact fp16 residual tail], so update()
+        # can return a plain buffer slice — no per-step re-decompression. Each token is
+        # decompressed exactly once → O(seq) total instead of O(seq^2).
+        rk, rv = comp.decompress_kv(ck, cv)
+        self._buf_k[layer_idx][:, :, start:end, :].copy_(
+            rk.to(self._buf_k[layer_idx].dtype)
+        )
+        self._buf_v[layer_idx][:, :, start:end, :].copy_(
+            rv.to(self._buf_v[layer_idx].dtype)
+        )
+
     # ---------------------------------------------------------------
     # Public API — matches DynamicCache
     # ---------------------------------------------------------------
@@ -209,55 +222,13 @@ class TurboQuantKVCache(DynamicCache):
         # keep reporting the right thing.
         self._ensure_layer_stubs(layer_idx)
 
-        if not self.config.track_only:
-            # Real-compression read path: hand attention the lossy reconstruction
-            # (decompressed prefix ++ fp16 residual tail), not the pristine buffer,
-            # so generation actually reflects compression.
-            return self._reconstruct_full(layer_idx, needed, template=key_states)
-
+        # In track_only=False mode, _legacy_compress_overflow has already written the
+        # lossy reconstruction back into the buffer for the compressed prefix, so the
+        # plain buffer slice already carries quantization loss (older tokens) + exact
+        # fp16 (residual window). track_only=True leaves the buffer pristine.
         full_k = self._buf_k[layer_idx][:, :, :needed, :]
         full_v = self._buf_v[layer_idx][:, :, :needed, :]
         return full_k, full_v
-
-    def _reconstruct_full(
-        self, layer_idx: int, needed: int, template: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """track_only=False read path: decompressed prefix ++ fp16 residual tail.
-
-        Tokens older than ``residual_window`` are returned as decompress(compress(·))
-        — carrying real quantization loss — while the recent residual-window tokens
-        stay exact fp16. This is what a compression-aware attention would see, so
-        decode genuinely reflects compression (track_only=True returns the untouched
-        buffer instead, for measurement only).
-
-        Note: re-decompresses all chunks every step, so this path is intentionally
-        the slow one — use it for reconstruction-quality A/B runs, not throughput.
-        """
-        buf_k = self._buf_k[layer_idx]
-        buf_v = self._buf_v[layer_idx]
-        chunks_k = self._chunks_k.get(layer_idx, [])
-        chunks_v = self._chunks_v.get(layer_idx, [])
-        blob_pairs = [
-            (ck, cv)
-            for ck, cv in zip(chunks_k, chunks_v)
-            if "blob" in ck and "blob" in cv
-        ]
-        if not blob_pairs:
-            # Nothing compressed yet (still within the residual window) — exact fp16.
-            return buf_k[:, :, :needed, :], buf_v[:, :, :needed, :]
-
-        comp = self._get_compressor(layer_idx, template.shape[-1], template.device)
-        rk_parts, rv_parts = [], []
-        for ck, cv in blob_pairs:
-            rk, rv = comp.decompress_kv(ck["blob"], cv["blob"])
-            rk_parts.append(rk.to(buf_k.dtype))
-            rv_parts.append(rv.to(buf_v.dtype))
-
-        compressed_end = sum(ck["span"] for ck, _ in blob_pairs)
-        # fp16 tail: residual window plus any current-step tokens not yet compressed.
-        rk_parts.append(buf_k[:, :, compressed_end:needed, :])
-        rv_parts.append(buf_v[:, :, compressed_end:needed, :])
-        return torch.cat(rk_parts, dim=2), torch.cat(rv_parts, dim=2)
 
     def _ensure_layer_stubs(self, layer_idx: int) -> None:
         """Ensure self.layers has enough entries for transformers internals."""

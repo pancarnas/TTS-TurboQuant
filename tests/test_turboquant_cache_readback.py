@@ -114,3 +114,39 @@ def _prefix_key_mse(key_bits: int, value_bits: int) -> float:
 def test_more_aggressive_compression_is_more_lossy() -> None:
     # The core research property: fewer bits => larger reconstruction error.
     assert _prefix_key_mse(4, 2) < _prefix_key_mse(2, 2)
+
+
+def test_decompress_is_called_once_per_chunk_not_per_step() -> None:
+    """Guards the O(seq) write-back path: each compressed span is decompressed
+    exactly once (at compression time), NOT re-decompressed on every read. A
+    regression to per-step reconstruction would make this scale with steps."""
+    cfg = TurboQuantConfig(
+        key_bits=2,
+        value_bits=2,
+        residual_window=16,
+        protected_layers=0,
+        protected_bits=8,
+        track_only=False,
+    )
+    cache = TurboQuantKVCache(cfg, n_layers=1)
+
+    calls = {"n": 0}
+    orig_get = cache._get_compressor
+
+    def counting_get(layer_idx, head_dim, device):
+        comp = orig_get(layer_idx, head_dim, device)
+        if not getattr(comp, "_wrapped", False):
+            comp._wrapped = True
+            real = comp.decompress_kv
+
+            def wrapped(*a, **k):
+                calls["n"] += 1
+                return real(*a, **k)
+
+            comp.decompress_kv = wrapped
+        return comp
+
+    cache._get_compressor = counting_get
+    _feed(cache, steps=6, step_len=8)  # 48 tokens, rw=16 → 4 overflow chunks
+    # One decompress per overflow chunk, never per read/step.
+    assert calls["n"] <= 6, f"decompress called {calls['n']}x — not O(seq)"
