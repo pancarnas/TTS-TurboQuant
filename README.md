@@ -54,36 +54,84 @@ TTS-TurboQuant/
 
 ## Setup
 
-### Quick start (Makefile)
+### Install with uv (recommended)
 
 ```bash
 git clone https://github.com/pancarnas/TTS-TurboQuant.git
 cd TTS-TurboQuant
-make install-sox      # install sox (audio processing)
-make install-cuda     # install torch + torchaudio with CUDA support
-make install-all      # install turboquant + Qwen3-TTS + quality metrics
-make run              # run Qwen3-TTS benchmark
+
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+
+# project packages + quality metrics
+uv pip install -e .
+uv pip install -e models/Qwen3-TTS/
+uv pip install -e models/VALL-E-X/
+uv pip install openai-whisper jiwer soundfile librosa pandas scipy
+
+# CUDA torch installed last (matched cu124 build)
+uv pip install --reinstall torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu124
 ```
 
-Individual targets:
+### Quick start with pip / Makefile (alternative)
+
+```bash
+git clone https://github.com/pancarnas/TTS-TurboQuant.git
+cd TTS-TurboQuant
+make install-cuda install-sox install-all install-vallex
+```
+
+Four chained Makefile targets in a single `make` invocation:
+
+| Target | Installs |
+|---|---|
+| `install-cuda` | torch + torchaudio on CUDA 12.4 |
+| `install-sox` | `libsox` system lib (auto-detects apt / brew / conda) |
+| `install-all` | turboquant + Qwen3-TTS deps + Whisper + jiwer (quality metrics) |
+| `install-vallex` | VALL-E-X deps (encodec, vocos, tokenizers, jieba, …) |
+
+On SageMaker, you may additionally need to remove tensorflow to avoid a cuDNN ABI conflict that breaks WavLM speaker similarity:
+```bash
+pip uninstall -y tensorflow tensorflow-cpu tf-keras 2>/dev/null; true
+```
+
+### Then run a benchmark
+
+```bash
+make run              # Qwen3-TTS 22-sentence sweep
+make run-vallex       # VALL-E-X 22-sentence sweep
+make smoke-vallex     # VALL-E-X quick pipeline check (2 short sentences)
+make smoke-qwen       # Qwen3-TTS quick pipeline check
+make profile-vallex   # torch.profiler on VALL-E-X (Perfetto traces)
+make profile-qwen     # torch.profiler on Qwen3-TTS
+```
+
+### Individual install targets (if you only want part of the stack)
+
 ```bash
 make install          # turboquant only
 make install-qwen     # turboquant + Qwen3-TTS
+make install-vallex   # turboquant + VALL-E-X
+make install-all      # turboquant + Qwen3-TTS + quality metrics
 make install-metrics  # Whisper CER + WavLM speaker similarity
 make install-sox      # auto-detects apt/brew/conda
 make install-cuda     # fix CUDA torch if torchaudio errors
 ```
 
-### Manual setup
+### Manual setup (if not using the Makefile)
 
 #### CUDA (Linux / Cloud GPU)
 
 ```bash
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 sudo apt-get install -y sox libsox-dev
-pip install -e .
-pip install -e models/Qwen3-TTS/
-pip install openai-whisper jiwer
+pip install -e .                          # turboquant
+pip install -e models/Qwen3-TTS/          # Qwen3-TTS
+pip install -e models/VALL-E-X/           # VALL-E-X
+pip install openai-whisper jiwer          # quality metrics
+# Optional: remove tensorflow to fix WavLM on SageMaker
+pip uninstall -y tensorflow tensorflow-cpu tf-keras 2>/dev/null; true
 ```
 
 #### macOS (MPS)
@@ -93,6 +141,7 @@ pip install torch torchaudio
 brew install sox
 pip install -e .
 pip install -e models/Qwen3-TTS/
+pip install -e models/VALL-E-X/
 pip install openai-whisper jiwer
 ```
 
@@ -102,6 +151,7 @@ pip install openai-whisper jiwer
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install -e .
 pip install -e models/Qwen3-TTS/
+pip install -e models/VALL-E-X/
 ```
 
 ## Quick start

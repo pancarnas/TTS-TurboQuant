@@ -27,5 +27,5 @@ dependencies = [
 packages = { find = { where = ["."], include = ["turboquant*"] } }
 
 [tool.pytest.ini_options]
-testpaths = ["models/Qwen3-TTS/tests"]
+testpaths = ["tests", "models/Qwen3-TTS/tests"]
 pythonpath = [".", "models/Qwen3-TTS"]

@@ -70,6 +70,5 @@ nltk_data/
 
 # Benchmark results and logs
 results/
-
-# VALL-E-X (kept locally, not tracked)
-models/VALL-E-X/
+*.json
+*.gz
