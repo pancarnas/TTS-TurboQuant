@@ -122,10 +122,11 @@ _PBAR = None  # set in benchmark_qwen3tts() while the sweep runs
 _WINDOW_S = 3.0
 _HOP_S = 1.5
 
-# Generation-length cap = _MAX_TOK_FACTOR × predicted tokens (floor _MAX_TOK_FLOOR).
-# Stops rw=0 runaway generations from hitting the model's 8250-token ceiling.
-# Set from CLI; <=0 disables.
-_MAX_TOK_FACTOR = 2.5
+# Compressed-config generation cap = _MAX_TOK_FACTOR × the baseline's actual length
+# for that sentence (floor _MAX_TOK_FLOOR). Bounds rw=0 runaway per sentence without
+# truncating legit output. Baseline itself gets a generous word-estimate backstop in
+# run_generation. Set from CLI; <=0 disables.
+_MAX_TOK_FACTOR = 2.0
 _MAX_TOK_FLOOR = 128
 
 
@@ -737,13 +738,13 @@ def run_generation(
     if gen_overrides:
         kwargs.update(gen_overrides)
 
-    # Cap generation length so a collapsed config (rw=0 can break the stop token →
-    # runaway to the model's 8250-token ceiling) doesn't burn ~17 min on garbage.
-    # Cap = factor × predicted tokens (floor _MAX_TOK_FLOOR); a config that can't
-    # produce the sentence within that has failed — CER stays ~100%, just measured
-    # fast. Disabled when _MAX_TOK_FACTOR <= 0. User-supplied value wins.
+    # Generation-length cap: the precise per-sentence cap (baseline-relative) is set
+    # by the caller via gen_overrides["max_new_tokens"] and wins. As a backstop for
+    # direct callers (warmup/profile) that pass none, fall back to a GENEROUS
+    # word-estimate cap that never truncates legit output but bounds an 8250-token
+    # runaway. Disabled when _MAX_TOK_FACTOR <= 0.
     if _MAX_TOK_FACTOR > 0 and "max_new_tokens" not in kwargs:
-        cap = max(_MAX_TOK_FLOOR, math.ceil(_MAX_TOK_FACTOR * predict_tokens(text)))
+        cap = max(_MAX_TOK_FLOOR, math.ceil(4.0 * predict_tokens(text)))
         kwargs["max_new_tokens"] = int(cap)
 
     if device is None and hasattr(model, "device"):
@@ -1039,8 +1040,16 @@ def _sweep_sentence_seed(
         and ref_wav is not None
     )
     ref_emb = metrics.speaker_embedding(ref_wav, ref_sr) if do_windowed else None
+    # Baseline runs first (uncompressed → correct length); its token count caps the
+    # compressed configs at factor× that, so an rw=0 runaway is bounded per sentence.
+    baseline_ntok = None
     for config_name, tq_config in TURBOQUANT_CONFIGS:
         key_bits, value_bits, residual_window = config_bits(tq_config)
+        cfg_overrides = dict(gen_overrides or {})
+        if tq_config is not None and baseline_ntok and _MAX_TOK_FACTOR > 0:
+            cfg_overrides["max_new_tokens"] = max(
+                _MAX_TOK_FLOOR, math.ceil(_MAX_TOK_FACTOR * baseline_ntok)
+            )
         try:
             wavs, sr, elapsed, mem_report, peak_vram_mb, n_ar_tokens = run_generation(
                 model,
@@ -1050,11 +1059,13 @@ def _sweep_sentence_seed(
                 tq_config,
                 device=device,
                 seed=seed,
-                gen_overrides=gen_overrides,
+                gen_overrides=cfg_overrides,
                 deterministic=deterministic,
                 ref_audio=eff_ref_audio,
                 ref_text=eff_ref_text,
             )
+            if tq_config is None:
+                baseline_ntok = n_ar_tokens
             wav = wavs[0]
             audio_duration = len(wav) / sr
             rtf = elapsed / audio_duration if audio_duration > 0 else float("inf")
@@ -1951,10 +1962,11 @@ def main():
     parser.add_argument(
         "--max-token-factor",
         type=float,
-        default=2.5,
-        help="Cap generation at this multiple of predicted tokens (≈6.4×words), "
-        "floor --max-token-floor. Stops rw=0 collapsed configs from running away to "
-        "the 8250-token ceiling (~17 min of garbage). <=0 disables. Default 2.5.",
+        default=2.0,
+        help="Cap each COMPRESSED config at this multiple of the baseline's actual "
+        "generated length for the same sentence (floor --max-token-floor). Bounds "
+        "rw=0 runaway per-sentence without truncating legit output. <=0 disables. "
+        "Default 2.0.",
     )
     parser.add_argument(
         "--max-token-floor",
