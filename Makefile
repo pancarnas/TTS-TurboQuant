@@ -213,7 +213,7 @@ eval-vallex-parallel:
 eval-smoke:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
-		--metrics-device $(METRICS_DEVICE) --track-only-off \
+		--metrics-device $(METRICS_DEVICE) --track-only-off $(_RW_ARG) \
 		--groups long --max-per-group 1 --seeds 0,1 --decode sampling 2>&1 \
 		| tee results/eval_smoke_$(shell date +%Y%m%d_%H%M%S).log
 
