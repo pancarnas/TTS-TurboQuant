@@ -147,6 +147,7 @@ class QualityMetrics:
         self._whisper = None
         self._wavlm_model = None
         self._wavlm_extractor = None
+        self._normalizer = None
 
     # --- Whisper CER ---
 
@@ -156,29 +157,41 @@ class QualityMetrics:
 
             self._whisper = whisper.load_model("base", device=self._device)
 
+    def _normalize(self, text: str) -> str:
+        """Whisper's EnglishTextNormalizer — the standard pre-CER cleanup used by
+        seed-tts-eval / F5-TTS: lowercases, strips punctuation, and normalizes
+        numbers ('fifty'→'50') and contractions, applied identically to reference
+        and hypothesis so format differences aren't counted as errors.
+        """
+        if self._normalizer is None:
+            from whisper.normalizers import EnglishTextNormalizer
+
+            self._normalizer = EnglishTextNormalizer()
+        return self._normalizer(text)
+
+    def cer_text(self, reference_text: str, hypothesis: str) -> float:
+        """Normalized CER between a reference and an ASR hypothesis."""
+        from jiwer import cer
+
+        ref = self._normalize(reference_text)
+        hyp = self._normalize(hypothesis)
+        if not ref:
+            return 0.0
+        return float(cer(ref, hyp))
+
     def whisper_cer(
         self, wav: np.ndarray, sr: int, reference_text: str
     ) -> tuple[float, str]:
-        """Returns (cer, transcript)."""
+        """Returns (normalized CER, raw transcript)."""
         self._load_whisper()
-        from jiwer import cer
 
         # Whisper expects float32 numpy at any sample rate (resamples internally)
         wav = wav.astype(np.float32)
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
 
-        result = self._whisper.transcribe(wav)
-        transcript = result["text"].strip()
-
-        ref = reference_text.strip()
-        hyp = transcript
-
-        if not ref:
-            return 0.0, transcript
-
-        error_rate = cer(ref, hyp)
-        return float(error_rate), transcript
+        transcript = self._whisper.transcribe(wav)["text"].strip()
+        return self.cer_text(reference_text, transcript), transcript
 
     # --- WavLM speaker embedding cosine similarity ---
 
@@ -261,7 +274,6 @@ class QualityMetrics:
         proportional slice of ``target_text`` (TTS reads in order). Returns rows
         ``{window_idx, t_start, spk_sim_win, cer_win}``.
         """
-        from jiwer import cer as _cer
 
         from turboquant.bench_common import plan_windows, proportional_text_span
 
@@ -288,7 +300,7 @@ class QualityMetrics:
                 if t0 <= 0.5 * (s["start"] + s["end"]) < t1
             ).strip()
             ref_span = proportional_text_span(target_text, t0 / duration, t1 / duration)
-            cer_win = float(_cer(ref_span, hyp)) if ref_span else 0.0
+            cer_win = self.cer_text(ref_span, hyp) if ref_span else 0.0
             rows.append(
                 {
                     "window_idx": wi,
