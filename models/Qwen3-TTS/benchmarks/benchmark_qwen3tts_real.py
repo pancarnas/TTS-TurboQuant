@@ -82,8 +82,9 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
     CSVs and reports are self-describing across a window sweep.
     """
     rw = residual_window
-    # 2×2 factorial over key∈{4,3} × value∈{4,3} — isolates key-bit vs value-bit
-    # effect. Baseline first (the per-sentence cap keys off the baseline length).
+    # Value sweep at SAFE 4-bit keys: 3-bit keys collapse AR-codec TTS (confirmed by
+    # ear), so keys stay at 4 and we probe how low VALUES can go. Baseline first
+    # (the per-sentence cap keys off the baseline length).
     return [
         ("baseline (no TQ)", None),
         (
@@ -95,12 +96,8 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
             TurboQuantConfig(key_bits=4, value_bits=3, residual_window=rw),
         ),
         (
-            f"K3/V4 rw={rw}",
-            TurboQuantConfig(key_bits=3, value_bits=4, residual_window=rw),
-        ),
-        (
-            f"K3/V3 rw={rw}",
-            TurboQuantConfig(key_bits=3, value_bits=3, residual_window=rw),
+            f"K4/V2 rw={rw}",
+            TurboQuantConfig(key_bits=4, value_bits=2, residual_window=rw),
         ),
     ]
 
