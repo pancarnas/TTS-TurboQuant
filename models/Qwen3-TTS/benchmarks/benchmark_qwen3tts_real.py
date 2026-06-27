@@ -113,6 +113,10 @@ except ImportError:  # pragma: no cover
     _tqdm = None
 _PBAR = None  # set in benchmark_qwen3tts() while the sweep runs
 
+# Windowed-metrics window/hop (seconds); set from CLI in benchmark_qwen3tts().
+_WINDOW_S = 3.0
+_HOP_S = 1.5
+
 
 # ---------------------------------------------------------------------------
 # Quality metrics
@@ -1076,7 +1080,9 @@ def _sweep_sentence_seed(
                         r["spk_sim_ref"].append(spk_sim_ref)
                 # Windowed temporal series (long audio): one sidecar row per window.
                 if do_windowed and ref_emb is not None:
-                    for w in metrics.windowed_metrics(wav, sr, text, ref_emb):
+                    for w in metrics.windowed_metrics(
+                        wav, sr, text, ref_emb, window_s=_WINDOW_S, hop_s=_HOP_S
+                    ):
                         _write_windowed_line(
                             windowed_fh,
                             group=group_name,
@@ -1287,7 +1293,9 @@ def benchmark_qwen3tts(args):
     active_groups = getattr(args, "active_groups", available_groups())
     max_per_group = getattr(args, "max_per_group", None)
 
-    global _PBAR
+    global _PBAR, _WINDOW_S, _HOP_S
+    _WINDOW_S = getattr(args, "window_s", 3.0)
+    _HOP_S = getattr(args, "hop_s", 1.5)
     if _tqdm is not None:
         _PBAR = _tqdm(desc="cells", unit="cell", dynamic_ncols=True)
 
@@ -1875,6 +1883,19 @@ def main():
         help="Also emit per-window CER(t)/SpkSim(t) series for long groups "
         "(libritts_long/long) to a windowed sidecar CSV — locates WHERE compression "
         "starts failing. Adds Whisper+WavLM passes per window; long-audio only.",
+    )
+    parser.add_argument(
+        "--window-s",
+        type=float,
+        default=3.0,
+        help="Windowed-metrics window length in seconds (default 3.0; WavLM "
+        "speaker embeddings need ~2-3s to be stable).",
+    )
+    parser.add_argument(
+        "--hop-s",
+        type=float,
+        default=1.5,
+        help="Windowed-metrics hop in seconds (default 1.5 = 50%% overlap).",
     )
     parser.add_argument(
         "--track-only-off",

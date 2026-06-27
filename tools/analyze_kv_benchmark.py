@@ -670,17 +670,35 @@ def section_windowed(windowed_glob: Optional[str], lines: list[str]) -> None:
         c_on, c_t = _fmt(cer_on)
         _emit(lines, f"{cfg:<22} {s_on:>10} {s_t:>7} {c_on:>10} {c_t:>7}")
 
-    # Compact SpkSim(t) curve (capped to ~12 windows) so the shape is visible.
-    idxs = sorted(sim.index)[:12]
-    _emit(lines, "\n  SpkSim(t) by window (mean over items/seeds):")
-    _emit(lines, f"{'config':<22}" + "".join(f"w{i:>4}" for i in idxs))
-    for cfg in configs:
-        if cfg not in sim:
+    # SpkSim(t) & CER(t) vs ABSOLUTE TIME, binned across the whole duration so the
+    # decline over audio length is visible regardless of how many windows each clip
+    # has. Later bins are reached only by the longer clips (that's the point).
+    tmax = float(w["t_start"].max())
+    nbins = 12
+    if tmax <= 0:
+        return
+    edges = np.linspace(0.0, tmax + 1e-6, nbins + 1)
+    centers = [(edges[i] + edges[i + 1]) / 2 for i in range(nbins)]
+    wb = w.assign(
+        _tb=pd.cut(w["t_start"], bins=edges, labels=False, include_lowest=True)
+    )
+    for metric, title in (("spk_sim_win", "SpkSim(t)"), ("cer_win", "CER(t)")):
+        piv = wb.groupby(["config", "_tb"])[metric].mean().unstack(0)
+        present = [b for b in range(nbins) if b in piv.index]
+        if not present:
             continue
-        row = f"{cfg:<22}" + "".join(
-            f"{sim[cfg].get(i, float('nan')):>5.2f}" for i in idxs
+        _emit(lines, f"\n  {title} vs audio time (mean over items), bins in seconds:")
+        _emit(
+            lines, f"{'config':<22}" + "".join(f"{centers[b]:>6.0f}s" for b in present)
         )
-        _emit(lines, row)
+        for cfg in configs:
+            if cfg not in piv.columns:
+                continue
+            row = f"{cfg:<22}"
+            for b in present:
+                v = piv.loc[b, cfg] if b in piv.index else float("nan")
+                row += ("   ---" if (v != v) else f"{v:>6.2f}") + " "
+            _emit(lines, row.rstrip())
 
 
 # ---------------------------------------------------------------------------

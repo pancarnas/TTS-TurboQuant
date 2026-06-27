@@ -152,8 +152,9 @@ _MPG_ARG = $(if $(MAX_PER_GROUP),--max-per-group $(MAX_PER_GROUP),)
 # Unset → benchmark default (128, the length-gated Exp-1 behavior).
 _RW_ARG = $(if $(RW),--residual-window $(RW),)
 # WINDOWED=1 emits per-window CER(t)/SpkSim(t) series for long groups (where it
-# starts failing) into a windowed sidecar CSV.
-_WINDOWED_ARG = $(if $(WINDOWED),--windowed-metrics,)
+# starts failing) into a windowed sidecar CSV. WINDOW_S/HOP_S tune the slice
+# (default 3.0s window / 1.5s hop).
+_WINDOWED_ARG = $(if $(WINDOWED),--windowed-metrics,) $(if $(WINDOW_S),--window-s $(WINDOW_S),) $(if $(HOP_S),--hop-s $(HOP_S),)
 # Voice strategy (Qwen). MODEL switches checkpoint; VOICE={auto,preset,clone}.
 # Preset run (default CustomVoice): leave VOICE unset (auto → preset).
 # Clone run: MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base VOICE=clone DEFAULT_REF=<wav> DEFAULT_REF_TEXT="..."
