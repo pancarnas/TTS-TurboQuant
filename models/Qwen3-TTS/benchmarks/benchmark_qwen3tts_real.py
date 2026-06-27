@@ -1276,12 +1276,41 @@ def benchmark_qwen3tts(args):
         metrics = QualityMetrics(device=args.metrics_device)
 
     # One warmup per config so TurboQuant lazy-init / CUDA kernel autotune
-    # doesn't skew the first-sentence measurement.
+    # doesn't skew the first-sentence measurement. Resolve a reference matching the
+    # run's voice mode — a *-Base checkpoint ONLY clones, so a preset warmup errors.
+    voice_mode = getattr(args, "voice_mode", "auto")
+    warm_ref_audio = warm_ref_text = None
+    if voice_mode != "preset":
+        try:
+            probe = iter_eval_items(
+                getattr(args, "active_groups", available_groups()),
+                getattr(args, "max_per_group", None),
+                data_dir,
+            )
+            for it in probe:
+                ra, rt = _resolve_voice(
+                    it,
+                    voice_mode,
+                    getattr(args, "default_ref_audio", None),
+                    getattr(args, "default_ref_text", None),
+                )
+                if ra:
+                    warm_ref_audio, warm_ref_text = ra, rt
+                    break
+        except Exception:
+            pass
     _tee(results_fh, "\nWarmup (one per config)...")
     for config_name, tq_config in TURBOQUANT_CONFIGS:
         try:
             run_generation(
-                model, "Hello world.", "English", speaker, tq_config, device=device
+                model,
+                "Hello world.",
+                "English",
+                speaker,
+                tq_config,
+                device=device,
+                ref_audio=warm_ref_audio,
+                ref_text=warm_ref_text,
             )
         except Exception as e:
             _tee(results_fh, f"  warmup {config_name}: ERROR {e}")
