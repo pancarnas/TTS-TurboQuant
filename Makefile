@@ -155,6 +155,9 @@ _RW_ARG = $(if $(RW),--residual-window $(RW),)
 # starts failing) into a windowed sidecar CSV. WINDOW_S/HOP_S tune the slice
 # (default 3.0s window / 1.5s hop).
 _WINDOWED_ARG = $(if $(WINDOWED),--windowed-metrics,) $(if $(WINDOW_S),--window-s $(WINDOW_S),) $(if $(HOP_S),--hop-s $(HOP_S),)
+# MAX_TOK_FACTOR caps generation at N× predicted tokens (default 2.5 in-code) so
+# rw=0 collapsed configs can't run away to the 8250-token ceiling. Set 0 to disable.
+_MAXTOK_ARG = $(if $(MAX_TOK_FACTOR),--max-token-factor $(MAX_TOK_FACTOR),)
 # Voice strategy (Qwen). MODEL switches checkpoint; VOICE={auto,preset,clone}.
 # Preset run (default CustomVoice): leave VOICE unset (auto → preset).
 # Clone run: MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base VOICE=clone DEFAULT_REF=<wav> DEFAULT_REF_TEXT="..."
@@ -167,7 +170,7 @@ eval-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 		--metrics-device $(METRICS_DEVICE) --track-only-off \
-		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
+		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_MAXTOK_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
 		| tee results/eval_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
 eval-vallex:
@@ -187,7 +190,7 @@ eval-qwen-parallel:
 	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
 		python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 			--metrics-device $(METRICS_DEVICE) --track-only-off \
-			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_QWEN_VOICE_ARGS) \
+			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_MAXTOK_ARG) $(_QWEN_VOICE_ARGS) \
 			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
 			> results/eval_qwen_shard$${i}_$(RUN_TAG).log 2>&1 & \
 	done; \

@@ -34,6 +34,7 @@ import time
 import argparse
 import atexit
 import datetime
+import math
 import shutil
 import subprocess
 
@@ -59,7 +60,11 @@ from turboquant.bench_common import (
     sentence_hash,
     set_global_seed,
 )
-from turboquant.eval_sentences import available_groups, iter_eval_items
+from turboquant.eval_sentences import (
+    available_groups,
+    iter_eval_items,
+    predict_tokens,
+)
 
 
 # --- Test sentences ---
@@ -116,6 +121,12 @@ _PBAR = None  # set in benchmark_qwen3tts() while the sweep runs
 # Windowed-metrics window/hop (seconds); set from CLI in benchmark_qwen3tts().
 _WINDOW_S = 3.0
 _HOP_S = 1.5
+
+# Generation-length cap = _MAX_TOK_FACTOR × predicted tokens (floor _MAX_TOK_FLOOR).
+# Stops rw=0 runaway generations from hitting the model's 8250-token ceiling.
+# Set from CLI; <=0 disables.
+_MAX_TOK_FACTOR = 2.5
+_MAX_TOK_FLOOR = 128
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +737,15 @@ def run_generation(
     if gen_overrides:
         kwargs.update(gen_overrides)
 
+    # Cap generation length so a collapsed config (rw=0 can break the stop token →
+    # runaway to the model's 8250-token ceiling) doesn't burn ~17 min on garbage.
+    # Cap = factor × predicted tokens (floor _MAX_TOK_FLOOR); a config that can't
+    # produce the sentence within that has failed — CER stays ~100%, just measured
+    # fast. Disabled when _MAX_TOK_FACTOR <= 0. User-supplied value wins.
+    if _MAX_TOK_FACTOR > 0 and "max_new_tokens" not in kwargs:
+        cap = max(_MAX_TOK_FLOOR, math.ceil(_MAX_TOK_FACTOR * predict_tokens(text)))
+        kwargs["max_new_tokens"] = int(cap)
+
     if device is None and hasattr(model, "device"):
         device = model.device
 
@@ -1322,9 +1342,11 @@ def benchmark_qwen3tts(args):
     active_groups = getattr(args, "active_groups", available_groups())
     max_per_group = getattr(args, "max_per_group", None)
 
-    global _PBAR, _WINDOW_S, _HOP_S
+    global _PBAR, _WINDOW_S, _HOP_S, _MAX_TOK_FACTOR, _MAX_TOK_FLOOR
     _WINDOW_S = getattr(args, "window_s", 3.0)
     _HOP_S = getattr(args, "hop_s", 1.5)
+    _MAX_TOK_FACTOR = getattr(args, "max_token_factor", 2.5)
+    _MAX_TOK_FLOOR = getattr(args, "max_token_floor", 128)
     if _tqdm is not None:
         _PBAR = _tqdm(desc="cells", unit="cell", dynamic_ncols=True)
 
@@ -1925,6 +1947,21 @@ def main():
         type=float,
         default=1.5,
         help="Windowed-metrics hop in seconds (default 1.5 = 50%% overlap).",
+    )
+    parser.add_argument(
+        "--max-token-factor",
+        type=float,
+        default=2.5,
+        help="Cap generation at this multiple of predicted tokens (≈6.4×words), "
+        "floor --max-token-floor. Stops rw=0 collapsed configs from running away to "
+        "the 8250-token ceiling (~17 min of garbage). <=0 disables. Default 2.5.",
+    )
+    parser.add_argument(
+        "--max-token-floor",
+        type=int,
+        default=128,
+        help="Minimum generation cap in tokens (default 128), so short sentences "
+        "still have headroom.",
     )
     parser.add_argument(
         "--track-only-off",
