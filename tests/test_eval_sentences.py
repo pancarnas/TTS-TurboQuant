@@ -164,8 +164,8 @@ def test_shard_cells_rejects_bad_shard_id() -> None:
 
 
 def test_predict_tokens_uses_word_count_heuristic() -> None:
-    # ≈6.4 tokens/word (Exp-1 empirical fit)
-    assert predict_tokens("one two three four five") == round(6.4 * 5)
+    # ≈7 tokens/word (conservative word→talker-token estimate)
+    assert predict_tokens("one two three four five") == round(7.0 * 5)
     assert predict_tokens("") == 0
 
 

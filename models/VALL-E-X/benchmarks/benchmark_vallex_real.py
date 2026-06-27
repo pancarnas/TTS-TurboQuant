@@ -184,23 +184,24 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
     paper-faithful TurboQuant (quantize every token). Labels embed the window.
     """
     rw = residual_window
+    # 2×2 factorial over key∈{4,3} × value∈{4,3}; baseline first (twin of Qwen).
     return [
         ("baseline (no TQ)", None),
         (
-            f"K4/V2 rw={rw}",
-            TurboQuantConfig(key_bits=4, value_bits=2, residual_window=rw),
+            f"K4/V4 rw={rw}",
+            TurboQuantConfig(key_bits=4, value_bits=4, residual_window=rw),
+        ),
+        (
+            f"K4/V3 rw={rw}",
+            TurboQuantConfig(key_bits=4, value_bits=3, residual_window=rw),
+        ),
+        (
+            f"K3/V4 rw={rw}",
+            TurboQuantConfig(key_bits=3, value_bits=4, residual_window=rw),
         ),
         (
             f"K3/V3 rw={rw}",
             TurboQuantConfig(key_bits=3, value_bits=3, residual_window=rw),
-        ),
-        (
-            f"K3/V2 rw={rw}",
-            TurboQuantConfig(key_bits=3, value_bits=2, residual_window=rw),
-        ),
-        (
-            f"K2/V2 rw={rw}",
-            TurboQuantConfig(key_bits=2, value_bits=2, residual_window=rw),
         ),
     ]
 

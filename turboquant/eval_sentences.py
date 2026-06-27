@@ -289,7 +289,7 @@ _DISK_GROUPS = ("seedtts_en", "ellav_hard")
 # ≈0.53 s/word. Used to (a) bin sentences into short/medium/long and (b) target
 # curated lengths so compression bites across the whole range at rw=0.
 
-TOKENS_PER_WORD = 6.4
+TOKENS_PER_WORD = 7.0
 SHORT_MAX_TOKENS = 96  # ≈15 words — boundary sits in the gap above the short band
 MEDIUM_MAX_TOKENS = 384  # ≈60 words — boundary sits in the gap below the long band
 
