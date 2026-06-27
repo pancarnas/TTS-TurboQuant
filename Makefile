@@ -151,6 +151,9 @@ _MPG_ARG = $(if $(MAX_PER_GROUP),--max-per-group $(MAX_PER_GROUP),)
 # TurboQuant (quantize every token) — makes short/medium sentences compress too.
 # Unset → benchmark default (128, the length-gated Exp-1 behavior).
 _RW_ARG = $(if $(RW),--residual-window $(RW),)
+# NO_INTRINSIC=1 skips the deterministic KV-reconstruction pass (an extra greedy
+# generation per sentence on shard 0) — faster when you only need CER/SpkSim.
+_NOINTRINSIC_ARG = $(if $(NO_INTRINSIC),--no-intrinsic,)
 # WINDOWED=1 emits per-window CER(t)/SpkSim(t) series for long groups (where it
 # starts failing) into a windowed sidecar CSV. WINDOW_S/HOP_S tune the slice
 # (default 3.0s window / 1.5s hop).
@@ -170,7 +173,7 @@ eval-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 		--metrics-device $(METRICS_DEVICE) --track-only-off \
-		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_MAXTOK_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
+		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_NOINTRINSIC_ARG) $(_WINDOWED_ARG) $(_MAXTOK_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
 		| tee results/eval_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
 eval-vallex:
@@ -190,7 +193,7 @@ eval-qwen-parallel:
 	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
 		python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 			--metrics-device $(METRICS_DEVICE) --track-only-off \
-			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_MAXTOK_ARG) $(_QWEN_VOICE_ARGS) \
+			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_NOINTRINSIC_ARG) $(_WINDOWED_ARG) $(_MAXTOK_ARG) $(_QWEN_VOICE_ARGS) \
 			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
 			> results/eval_qwen_shard$${i}_$(RUN_TAG).log 2>&1 & \
 	done; \

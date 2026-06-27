@@ -382,19 +382,42 @@ def _recon_variants():
 
 
 def measure_kv_reconstruction(
-    model, text, speaker, seed, group_name, idx, shash, kv_fh, results_fh
+    model,
+    text,
+    speaker,
+    seed,
+    group_name,
+    idx,
+    shash,
+    kv_fh,
+    results_fh,
+    ref_audio=None,
+    ref_text=None,
 ):
     """Generate one deterministic (greedy) baseline, then compress/decompress the
     SAME fp16 KV cache under every config + variant. Fully deterministic — no
     sampling noise, no CER floor — so it yields the definitive per-config
     compression-distortion ranking. Writes per-layer rows to ``kv_fh`` and
     returns ``{config: {variant: (mean_cos, mean_relmse)}}`` for the summary.
+
+    The generation only needs to populate a KV cache to measure reconstruction on
+    (audio quality is irrelevant here), so it goes through ``run_generation`` —
+    which clones when a ``ref_audio`` is given (required for *-Base checkpoints
+    that can't use the preset speaker).
     """
     from turboquant.compressors_v3 import TurboQuantV3
 
     set_global_seed(seed, deterministic=False)
-    model.generate_custom_voice(
-        text=text, language="English", speaker=speaker, **decode_overrides("greedy")
+    run_generation(
+        model,
+        text,
+        "English",
+        speaker,
+        None,  # uncompressed → fp16 KV to compress/measure
+        seed=seed,
+        gen_overrides=decode_overrides("greedy"),
+        ref_audio=ref_audio,
+        ref_text=ref_text,
     )
     n_layers, fp16_keys, fp16_values = _extract_fp16_kv(
         getattr(model.model, "last_kv_cache", None)
@@ -461,6 +484,9 @@ def run_intrinsic_metrics(
     device,
     results_fh,
     data_dir=None,
+    voice_mode="auto",
+    default_ref_audio=None,
+    default_ref_text=None,
 ):
     """Deterministic compression-distortion sweep (KV reconstruction).
 
@@ -481,6 +507,9 @@ def run_intrinsic_metrics(
         items = iter_eval_items([group_name], max_per_group, data_dir)
         for i, item in enumerate(items):
             text = item.text
+            eff_ref_audio, eff_ref_text = _resolve_voice(
+                item, voice_mode, default_ref_audio, default_ref_text
+            )
             agg = measure_kv_reconstruction(
                 model,
                 text,
@@ -491,6 +520,8 @@ def run_intrinsic_metrics(
                 sentence_hash(text),
                 kv_fh,
                 results_fh,
+                ref_audio=eff_ref_audio,
+                ref_text=eff_ref_text,
             )
             for cname, variants in agg.items():
                 for variant, (cos, relmse) in variants.items():
@@ -1423,6 +1454,9 @@ def benchmark_qwen3tts(args):
             device,
             results_fh,
             data_dir=data_dir,
+            voice_mode=getattr(args, "voice_mode", "auto"),
+            default_ref_audio=getattr(args, "default_ref_audio", None),
+            default_ref_text=getattr(args, "default_ref_text", None),
         )
 
     results_fh.close()
