@@ -171,14 +171,17 @@ def main() -> None:
                 continue  # no same-speaker prompt available — skip
             n = per_bucket.get(b, 0)
             per_bucket[b] = n + 1
-            gt_path = os.path.join(gt_dir, f"long_{b}_{n}.wav")
-            ref_path = os.path.join(refs_dir, f"long_{b}_{n}_ref.wav")
-            _write_concat(rec["member_wavs"], audio, gt_path)
-            _write_concat([rec["ref_wav"]], audio, ref_path)
-            # seed-tts-style row: id|ref_text|ref_wav|target_text|gt_wav (abs paths).
+            # Full paths to WRITE the audio; manifest stores paths RELATIVE to the
+            # libritts_long root (gt/…, refs/…) because the loader re-joins them
+            # against that root — storing the prefixed path double-prefixes it.
+            gt_rel = os.path.join("gt", f"long_{b}_{n}.wav")
+            ref_rel = os.path.join("refs", f"long_{b}_{n}_ref.wav")
+            _write_concat(rec["member_wavs"], audio, os.path.join(out_dir, gt_rel))
+            _write_concat([rec["ref_wav"]], audio, os.path.join(out_dir, ref_rel))
+            # seed-tts-style row: id|ref_text|ref_wav|target_text|gt_wav.
             fh.write(
-                f"long_{b}_{n}|{rec['ref_text']}|{ref_path}|"
-                f"{rec['target_text']}|{gt_path}\n"
+                f"long_{b}_{n}|{rec['ref_text']}|{ref_rel}|"
+                f"{rec['target_text']}|{gt_rel}\n"
             )
             written += 1
 
