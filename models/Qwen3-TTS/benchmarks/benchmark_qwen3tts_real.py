@@ -126,9 +126,11 @@ _HOP_S = 1.5
 
 # Compressed-config generation cap = _MAX_TOK_FACTOR × the baseline's actual length
 # for that sentence (floor _MAX_TOK_FLOOR). Bounds rw=0 runaway per sentence without
-# truncating legit output. Baseline itself gets a generous word-estimate backstop in
-# run_generation. Set from CLI; <=0 disables.
-_MAX_TOK_FACTOR = 2.0
+# truncating legit output. 3× chosen from data: degraded-but-self-terminating configs
+# were observed at ~2-2.2× baseline, true runaway at the 8250 ceiling, so 3× sits in
+# the gap. Baseline gets a generous word-estimate backstop in run_generation.
+# Set from CLI; <=0 disables.
+_MAX_TOK_FACTOR = 3.0
 _MAX_TOK_FLOOR = 128
 
 
@@ -1964,11 +1966,11 @@ def main():
     parser.add_argument(
         "--max-token-factor",
         type=float,
-        default=2.0,
+        default=3.0,
         help="Cap each COMPRESSED config at this multiple of the baseline's actual "
         "generated length for the same sentence (floor --max-token-floor). Bounds "
-        "rw=0 runaway per-sentence without truncating legit output. <=0 disables. "
-        "Default 2.0.",
+        "rw=0 runaway without truncating self-terminating degraded configs (observed "
+        "~2-2.2× baseline; runaway hits 8250). <=0 disables. Default 3.0.",
     )
     parser.add_argument(
         "--max-token-floor",
