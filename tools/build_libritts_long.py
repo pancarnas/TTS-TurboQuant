@@ -1,18 +1,20 @@
 """Build the long-context set by concatenating LibriTTS-R utterances.
 
-Consumes the fetched LibriTTS-R test-clean (``<data-dir>/libritts_r``), groups
-utterances by (speaker, chapter), and uses the pure, tested
+Consumes the fetched LibriTTS-R test-clean (``<data-dir>/libritts_r``), which the
+HF dataset ships as **parquet shards** (audio + text are columns, not a flac
+tree). Groups utterances by (speaker, chapter) and uses the pure, tested
 ``plan_long_concatenations`` to form graduated-length passages (256/512/1024/
-2048 talker tokens). For each passage it stitches the member wavs into one real
-recording (the ground truth) and writes a seed-tts-style manifest the loader
-reads:
+2048 talker tokens). For each passage it stitches the member clips into one real
+recording (the ground truth), writes the prompt clip, and emits a seed-tts-style
+manifest the loader reads:
 
   ``<data-dir>/libritts_long/manifest.lst``  — ``id|ref_text|ref_wav|target_text|gt_wav``
   ``<data-dir>/libritts_long/gt/*.wav``       — concatenated ground-truth audio
+  ``<data-dir>/libritts_long/refs/*.wav``     — same-speaker prompt clips
 
-``ref_wav`` is a same-speaker utterance NOT in the passage (chosen by the planner)
-so the clone prompt never leaks the target. Run AFTER
-``fetch_eval_data.py --fetch-libritts``. Box-only (needs the audio + soundfile).
+``ref_wav`` is a same-speaker utterance NOT in the passage (chosen by the
+planner) so the clone prompt never leaks the target. Run AFTER
+``fetch_eval_data.py --fetch-libritts``. Needs pandas+pyarrow + soundfile.
 
 Run: ``python tools/build_libritts_long.py --data-dir data``
 """
@@ -21,58 +23,110 @@ from __future__ import annotations
 
 import argparse
 import glob
+import io
 import os
 
 from turboquant.eval_sentences import LONG_BUCKETS, plan_long_concatenations
 
 
-def _read_text(wav_path: str) -> str:
-    """LibriTTS ships ``<utt>.normalized.txt`` (preferred) / ``.original.txt``."""
-    for suffix in (".normalized.txt", ".original.txt"):
-        cand = wav_path.rsplit(".wav", 1)[0] + suffix
-        if os.path.exists(cand):
-            with open(cand, encoding="utf-8") as fh:
-                return fh.read().strip()
-    return ""
+def _find_col(columns, *candidates):
+    for c in candidates:
+        if c in columns:
+            return c
+    return None
 
 
-def collect_utterances(libritts_root: str) -> list[dict]:
-    """Scan LibriTTS-R wavs → records {speaker, chapter, idx, text, wav}.
+def _uid_from(row, id_col) -> str:
+    """Utterance id, e.g. ``1089_134686_000001_000001`` (strip dir/ext if a path)."""
+    raw = str(row[id_col])
+    base = os.path.basename(raw)
+    return base[:-4] if base.endswith(".wav") else base
 
-    Filenames are ``<spk>_<chapter>_<utt>_<seg>.wav``; idx orders utterances within
-    a chapter. Utterances with no transcript file are skipped.
-    """
-    records: list[dict] = []
-    for wav in glob.glob(os.path.join(libritts_root, "**", "*.wav"), recursive=True):
-        stem = os.path.basename(wav)[: -len(".wav")]
-        parts = stem.split("_")
-        if len(parts) < 4:
-            continue
-        spk, chapter, utt, seg = parts[0], parts[1], parts[2], parts[3]
-        text = _read_text(wav)
-        if not text:
-            continue
-        try:
-            idx = int(utt) * 1000 + int(seg)
-        except ValueError:
-            idx = 0
-        records.append(
-            {"speaker": spk, "chapter": chapter, "idx": idx, "text": text, "wav": wav}
+
+def _idx_from_uid(uid: str) -> int:
+    parts = uid.split("_")
+    try:
+        return int(parts[2]) * 1000 + int(parts[3])
+    except (IndexError, ValueError):
+        return 0
+
+
+def load_libritts_rows(libritts_root: str):
+    """Read parquet shards → (records, audio map). ``records`` are planner inputs
+    {speaker, chapter, idx, text, wav=uid}; ``audio`` maps uid → raw audio cell."""
+    import pandas as pd
+
+    files = sorted(
+        glob.glob(os.path.join(libritts_root, "**", "*.parquet"), recursive=True)
+    )
+    if not files:
+        raise SystemExit(
+            f"no .parquet under {libritts_root} — run "
+            "`make fetch-eval-data FETCH_LIBRITTS=1` first"
         )
-    return records
+    records: list[dict] = []
+    audio: dict[str, object] = {}
+    for f in files:
+        df = pd.read_parquet(f)
+        spk_c = _find_col(df.columns, "speaker_id", "speaker")
+        chap_c = _find_col(df.columns, "chapter_id", "chapter")
+        text_c = _find_col(
+            df.columns, "text_normalized", "normalized_text", "text_original", "text"
+        )
+        id_c = _find_col(df.columns, "id", "utterance_id", "path", "file")
+        audio_c = _find_col(df.columns, "audio", "wav")
+        if not (text_c and audio_c and id_c):
+            raise SystemExit(f"unexpected LibriTTS-R columns: {list(df.columns)}")
+        for _, row in df.iterrows():
+            uid = _uid_from(row, id_c)
+            spk = str(row[spk_c]) if spk_c else uid.split("_")[0]
+            chap = str(row[chap_c]) if chap_c else uid.split("_")[1]
+            text = str(row[text_c]).strip()
+            if not text:
+                continue
+            records.append(
+                {
+                    "speaker": spk,
+                    "chapter": chap,
+                    "idx": _idx_from_uid(uid),
+                    "text": text,
+                    "wav": uid,
+                }
+            )
+            audio[uid] = row[audio_c]
+    return records, audio
 
 
-def _concat_wavs(member_wavs: list[str], out_path: str) -> None:
+def _decode(cell):
+    """Decode one HF audio cell → (np.float array, sr). Handles {bytes}/{array}."""
+    import numpy as np
+    import soundfile as sf
+
+    if isinstance(cell, dict):
+        if cell.get("bytes") is not None:
+            wav, sr = sf.read(io.BytesIO(cell["bytes"]))
+        elif cell.get("array") is not None:
+            wav, sr = np.asarray(cell["array"]), int(cell.get("sampling_rate", 24000))
+        else:  # {'path': ...}
+            wav, sr = sf.read(cell["path"])
+    else:
+        wav, sr = (
+            sf.read(io.BytesIO(cell)) if isinstance(cell, bytes) else sf.read(cell)
+        )
+    if getattr(wav, "ndim", 1) > 1:
+        wav = wav.mean(axis=1)
+    return wav, sr
+
+
+def _write_concat(uids: list[str], audio: dict, out_path: str) -> None:
     import numpy as np
     import soundfile as sf
 
     chunks, sr = [], None
-    for w in member_wavs:
-        audio, this_sr = sf.read(w)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
+    for uid in uids:
+        wav, this_sr = _decode(audio[uid])
         sr = sr or this_sr
-        chunks.append(audio)
+        chunks.append(wav)
     if chunks:
         sf.write(out_path, np.concatenate(chunks), sr or 24000)
 
@@ -91,16 +145,18 @@ def main() -> None:
     libritts_root = os.path.join(args.data_dir, "libritts_r")
     out_dir = os.path.join(args.data_dir, "libritts_long")
     gt_dir = os.path.join(out_dir, "gt")
+    refs_dir = os.path.join(out_dir, "refs")
     os.makedirs(gt_dir, exist_ok=True)
+    os.makedirs(refs_dir, exist_ok=True)
 
     try:
         from tqdm import tqdm
     except ImportError:
         tqdm = None
 
-    utts = collect_utterances(libritts_root)
-    print(f"collected {len(utts)} LibriTTS-R utterances")
-    plan = plan_long_concatenations(utts, buckets=LONG_BUCKETS)
+    records, audio = load_libritts_rows(libritts_root)
+    print(f"collected {len(records)} LibriTTS-R utterances from parquet")
+    plan = plan_long_concatenations(records, buckets=LONG_BUCKETS)
 
     manifest = os.path.join(out_dir, "manifest.lst")
     per_bucket: dict[int, int] = {}
@@ -116,10 +172,12 @@ def main() -> None:
             n = per_bucket.get(b, 0)
             per_bucket[b] = n + 1
             gt_path = os.path.join(gt_dir, f"long_{b}_{n}.wav")
-            _concat_wavs(rec["member_wavs"], gt_path)
+            ref_path = os.path.join(refs_dir, f"long_{b}_{n}_ref.wav")
+            _write_concat(rec["member_wavs"], audio, gt_path)
+            _write_concat([rec["ref_wav"]], audio, ref_path)
             # seed-tts-style row: id|ref_text|ref_wav|target_text|gt_wav (abs paths).
             fh.write(
-                f"long_{b}_{n}|{rec['ref_text']}|{rec['ref_wav']}|"
+                f"long_{b}_{n}|{rec['ref_text']}|{ref_path}|"
                 f"{rec['target_text']}|{gt_path}\n"
             )
             written += 1
