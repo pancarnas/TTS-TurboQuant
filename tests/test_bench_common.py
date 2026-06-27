@@ -4,12 +4,16 @@ import pytest
 
 from turboquant.bench_common import (
     TRIAL_COLUMNS,
+    WINDOWED_COLUMNS,
     config_bits,
     decode_overrides,
+    degradation_onset,
     format_trial_row,
     parse_arms,
     parse_seeds,
     parse_temperatures,
+    plan_windows,
+    proportional_text_span,
     sentence_hash,
     set_global_seed,
 )
@@ -155,3 +159,53 @@ def test_set_global_seed_makes_torch_rng_reproducible() -> None:
     set_global_seed(123)
     b = torch.randn(5)
     assert torch.equal(a, b)
+
+
+# --- windowed temporal metrics (pure helpers) -------------------------------
+
+
+def test_windowed_columns_schema() -> None:
+    for col in ("window_idx", "t_start", "spk_sim_win", "cer_win"):
+        assert col in WINDOWED_COLUMNS
+
+
+def test_plan_windows_covers_clip_and_clamps_tail() -> None:
+    w = plan_windows(10.0, window_s=3.0, hop_s=1.5)
+    assert w[0] == (0.0, 3.0)
+    assert w[-1][1] == 10.0  # tail clamped to clip end
+    # monotonic starts, hop = 1.5
+    assert all(b[0] - a[0] == pytest.approx(1.5) for a, b in zip(w, w[1:]))
+
+
+def test_plan_windows_short_clip_single_window() -> None:
+    assert plan_windows(2.0, window_s=3.0, hop_s=1.5) == [(0.0, 2.0)]
+    assert plan_windows(0.0) == []
+
+
+def test_proportional_text_span_slices_on_word_fraction() -> None:
+    text = " ".join(f"w{i}" for i in range(10))
+    assert proportional_text_span(text, 0.0, 0.5) == "w0 w1 w2 w3 w4"
+    assert proportional_text_span(text, 0.5, 1.0) == "w5 w6 w7 w8 w9"
+    assert proportional_text_span("", 0.0, 1.0) == ""
+
+
+def test_degradation_onset_spk_sim_drops() -> None:
+    # SpkSim higher-is-better: baseline flat high, compressed drops at window 3.
+    base = [0.95, 0.95, 0.95, 0.95, 0.95]
+    comp = [0.94, 0.94, 0.93, 0.70, 0.60]
+    assert degradation_onset(base, comp, higher_is_better=True, abs_threshold=0.1) == 3
+
+
+def test_degradation_onset_cer_rises() -> None:
+    # CER lower-is-better: compressed CER spikes at window 2.
+    base = [0.02, 0.02, 0.02, 0.02]
+    comp = [0.03, 0.04, 0.50, 0.80]
+    assert degradation_onset(base, comp, higher_is_better=False, abs_threshold=0.2) == 2
+
+
+def test_degradation_onset_none_when_no_crossing() -> None:
+    base = [0.9, 0.9, 0.9]
+    comp = [0.9, 0.89, 0.88]
+    assert (
+        degradation_onset(base, comp, higher_is_better=True, abs_threshold=0.1) is None
+    )

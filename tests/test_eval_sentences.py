@@ -11,10 +11,19 @@ import pytest
 from turboquant.eval_sentences import (
     EvalItem,
     as_eval_item,
+    available_groups,
     iter_eval_items,
+    length_category,
+    load_curated_cell,
     load_ellav_hard,
+    load_librispeech_pc,
+    load_libritts_long,
+    load_seedtts_cell,
     parse_seedtts_lst,
+    plan_long_concatenations,
+    predict_tokens,
     shard_cells,
+    text_difficulty,
 )
 
 
@@ -149,3 +158,164 @@ def test_shard_cells_single_shard_is_identity() -> None:
 def test_shard_cells_rejects_bad_shard_id() -> None:
     with pytest.raises(ValueError):
         shard_cells([1, 2, 3], num_shards=2, shard_id=2)
+
+
+# --- length heuristic + difficulty classifier (3×3 grid) --------------------
+
+
+def test_predict_tokens_uses_word_count_heuristic() -> None:
+    # ≈6.4 tokens/word (Exp-1 empirical fit)
+    assert predict_tokens("one two three four five") == round(6.4 * 5)
+    assert predict_tokens("") == 0
+
+
+def test_length_category_bins_by_predicted_tokens() -> None:
+    assert length_category("hello there friend") == "short"  # 3 words → ~19 tok
+    medium = " ".join(["word"] * 30)  # ~192 tok
+    assert length_category(medium) == "medium"
+    long = " ".join(["word"] * 120)  # ~768 tok
+    assert length_category(long) == "long"
+
+
+def test_text_difficulty_easy_medium_hard() -> None:
+    assert text_difficulty("the cat sat on the warm mat today") == "easy"
+    # proper noun + number → medium
+    assert text_difficulty("Sarah bought 12 apples at the market") == "medium"
+    # adjacent repetition → hard
+    assert text_difficulty("she said said the words very very fast") == "hard"
+    # alliteration run → hard
+    assert text_difficulty("Peter picked a peck of pickled peppers proudly") == "hard"
+
+
+def test_grid_cells_are_available_groups() -> None:
+    groups = available_groups()
+    for length in ("short", "medium", "long"):
+        for diff in ("easy", "medium", "hard"):
+            assert f"{length}_{diff}" in groups
+
+
+def test_load_curated_cell_reads_data_dir(tmp_path) -> None:
+    cell_dir = tmp_path / "curated"
+    cell_dir.mkdir()
+    (cell_dir / "long_hard.txt").write_text(
+        "# header comment\nfirst dense passage here\n\nsecond passage too\n",
+        encoding="utf-8",
+    )
+    items = load_curated_cell(str(tmp_path), "long_hard")
+    assert [i.text for i in items] == [
+        "first dense passage here",
+        "second passage too",
+    ]
+    assert all(i.group == "long_hard" and i.ref_audio is None for i in items)
+
+
+def test_load_seedtts_cell_filters_and_retags(tmp_path) -> None:
+    en = tmp_path / "en"
+    en.mkdir()
+    (en / "prompt-wavs").mkdir()
+    # short+easy natural line vs a medium (has number+proper noun) line
+    (en / "meta.lst").write_text(
+        "id1|prompt|prompt-wavs/p1.wav|the dog ran across the green field\n"
+        "id2|prompt|prompt-wavs/p2.wav|Sarah counted 15 red apples in March\n",
+        encoding="utf-8",
+    )
+    easy = load_seedtts_cell(str(tmp_path), "short_easy")
+    assert [i.text for i in easy] == ["the dog ran across the green field"]
+    assert easy[0].group == "short_easy"
+    assert easy[0].ref_audio.endswith("prompt-wavs/p1.wav")  # own ref kept
+    medium = load_seedtts_cell(str(tmp_path), "short_medium")
+    assert [i.text for i in medium] == ["Sarah counted 15 red apples in March"]
+
+
+# --- standard-corpus loaders (paper-foundation) -----------------------------
+
+
+def test_load_librispeech_pc_six_field_tab(tmp_path) -> None:
+    root = tmp_path / "librispeech_pc"
+    root.mkdir()
+    # Real F5-TTS format: ref_utt, ref_dur, ref_text, gen_utt, gen_dur, gen_text (TAB).
+    (root / "librispeech_pc_test_clean_cross_sentence.lst").write_text(
+        "4992-41806-0009\t4.35\texclaimed Bill to his wife\t"
+        "4992-23283-0000\t6.64\tBut the more forgetfulness had then prevailed\n",
+        encoding="utf-8",
+    )
+    items = load_librispeech_pc(str(tmp_path))
+    assert len(items) == 1
+    it = items[0]
+    assert it.group == "librispeech_pc"
+    assert it.text == "But the more forgetfulness had then prevailed"  # gen_text
+    assert it.ref_text == "exclaimed Bill to his wife"  # ref_text (prompt)
+    # ids resolve to flac under LibriSpeech/test-clean/SPK/CHAPTER/ID.flac
+    assert it.ref_audio.endswith(
+        "LibriSpeech/test-clean/4992/41806/4992-41806-0009.flac"
+    )
+    assert it.ground_truth_audio.endswith(
+        "LibriSpeech/test-clean/4992/23283/4992-23283-0000.flac"
+    )
+
+
+def test_load_libritts_long_parses_manifest(tmp_path) -> None:
+    root = tmp_path / "libritts_long"
+    root.mkdir()
+    (root / "manifest.lst").write_text(
+        "long0|prompt text|refs/r0.wav|a long concatenated passage here|gt/g0.wav\n",
+        encoding="utf-8",
+    )
+    items = load_libritts_long(str(tmp_path))
+    assert len(items) == 1 and items[0].group == "libritts_long"
+    assert items[0].ground_truth_audio.endswith("gt/g0.wav")
+
+
+def _utt(speaker, chapter, idx, words, wav):
+    return {
+        "speaker": speaker,
+        "chapter": chapter,
+        "idx": idx,
+        "text": " ".join(["word"] * words),
+        "wav": wav,
+    }
+
+
+def test_plan_long_concatenations_reaches_buckets_nonoverlapping() -> None:
+    # ~6.4 tok/word → ~16 words ≈ 100 tok per utt; bucket 256 needs ~3 utts.
+    utts = [_utt("spkA", "ch1", i, 16, f"a_{i}.wav") for i in range(12)]
+    utts += [_utt("spkA", "ch2", 0, 16, "a_ref.wav")]  # other-chapter ref source
+    plan = plan_long_concatenations(utts, buckets=(256, 512))
+    assert plan, "should emit passages"
+    for rec in plan:
+        assert rec["actual_tokens"] >= rec["bucket"]  # reached the target
+        assert rec["ref_wav"] not in rec["member_wavs"]  # ref not leaked
+        assert rec["ref_wav"] is not None  # same-speaker ref assigned
+    # Non-overlapping within a bucket: each member wav used at most once per bucket.
+    for bucket in (256, 512):
+        used = [w for r in plan if r["bucket"] == bucket for w in r["member_wavs"]]
+        assert len(used) == len(set(used))
+
+
+def test_assign_rotating_refs_for_ellav(tmp_path) -> None:
+    # ELLA-V (text-only) gets references rotated from a LibriSpeech-PC pool.
+    root = tmp_path / "librispeech_pc"
+    root.mkdir()
+    (root / "librispeech_pc_test_clean_cross_sentence.lst").write_text(
+        "10-20-0001\t3.0\tprompt one\t10-20-0002\t3.0\ttarget one\n"
+        "11-21-0001\t3.0\tprompt two\t11-21-0002\t3.0\ttarget two\n",
+        encoding="utf-8",
+    )
+    ella_path = tmp_path / "ellav_hard.txt"
+    ella_path.write_text(
+        "she sells sea shells by the shore\n"
+        "the the report report said it twice\n"
+        "Peter picked a peck of pickled peppers proudly\n",
+        encoding="utf-8",
+    )
+    items = iter_eval_items(["ellav_hard"], data_dir=str(tmp_path))
+    refs = [i.ref_audio for i in items]
+    assert all(r is not None for r in refs)  # all got a reference
+    assert refs[0].endswith("10/20/10-20-0001.flac")
+    assert refs[1].endswith("11/21/11-21-0001.flac")
+    assert refs[2].endswith("10/20/10-20-0001.flac")  # rotation wraps (pool of 2)
+
+
+def test_standard_groups_registered() -> None:
+    groups = available_groups()
+    assert "librispeech_pc" in groups and "libritts_long" in groups

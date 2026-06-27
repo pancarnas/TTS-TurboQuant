@@ -49,6 +49,7 @@ from qwen_tts.core.models.turboquant_kv_cache import TurboQuantConfig
 
 from turboquant.bench_common import (
     TRIAL_COLUMNS,
+    WINDOWED_COLUMNS,
     config_bits,
     decode_overrides,
     format_trial_row,
@@ -67,13 +68,50 @@ from turboquant.eval_sentences import available_groups, iter_eval_items
 # disk-backed `seedtts_en` / `ellav_hard` standard sets. See iter_eval_items.
 
 
-TURBOQUANT_CONFIGS = [
-    ("baseline (no TQ)", None),
-    ("K4/V2 rw=128", TurboQuantConfig(key_bits=4, value_bits=2, residual_window=128)),
-    ("K3/V3 rw=128", TurboQuantConfig(key_bits=3, value_bits=3, residual_window=128)),
-    ("K3/V2 rw=128", TurboQuantConfig(key_bits=3, value_bits=2, residual_window=128)),
-    ("K2/V2 rw=128", TurboQuantConfig(key_bits=2, value_bits=2, residual_window=128)),
-]
+def build_turboquant_configs(residual_window: int = 128) -> list:
+    """The 5-config sweep at a given residual window.
+
+    ``residual_window`` is the count of most-recent tokens kept fp16-exact;
+    older tokens are quantized. ``rw=0`` is paper-faithful TurboQuant (quantize
+    every token, including during streaming). Labels embed the window so trial
+    CSVs and reports are self-describing across a window sweep.
+    """
+    rw = residual_window
+    return [
+        ("baseline (no TQ)", None),
+        (
+            f"K4/V2 rw={rw}",
+            TurboQuantConfig(key_bits=4, value_bits=2, residual_window=rw),
+        ),
+        (
+            f"K3/V3 rw={rw}",
+            TurboQuantConfig(key_bits=3, value_bits=3, residual_window=rw),
+        ),
+        (
+            f"K3/V2 rw={rw}",
+            TurboQuantConfig(key_bits=3, value_bits=2, residual_window=rw),
+        ),
+        (
+            f"K2/V2 rw={rw}",
+            TurboQuantConfig(key_bits=2, value_bits=2, residual_window=rw),
+        ),
+    ]
+
+
+# Default sweep (rw=128); main() rebuilds this from --residual-window before any
+# consumer runs. Functions read the module global at call-time, so the rebind
+# propagates everywhere.
+TURBOQUANT_CONFIGS = build_turboquant_configs(128)
+
+# Groups long enough for the windowed temporal-degradation analysis (CER(t)/SIM(t)).
+WINDOWED_GROUPS = ("libritts_long", "long")
+
+# Optional tqdm progress bar over cells; soft import (falls back to plain prints).
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover
+    _tqdm = None
+_PBAR = None  # set in benchmark_qwen3tts() while the sweep runs
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +220,64 @@ class QualityMetrics:
         emb_a = self.speaker_embedding(wav_a, sr_a)
         emb_b = self.speaker_embedding(wav_b, sr_b)
         return float(np.dot(emb_a, emb_b))
+
+    # --- windowed temporal metrics (where it starts failing, long audio) ---
+
+    def windowed_metrics(
+        self,
+        wav: np.ndarray,
+        sr: int,
+        target_text: str,
+        ref_emb: np.ndarray,
+        window_s: float = 3.0,
+        hop_s: float = 1.5,
+    ) -> list[dict]:
+        """Per-window (spk_sim_win vs ``ref_emb``, cer_win) series over the clip.
+
+        SpkSim-vs-time: each window's WavLM embedding cosine'd against the FIXED
+        reference embedding ``ref_emb`` (no cross-audio alignment, robust to
+        compression-induced length drift). CER-vs-time: Whisper segment timestamps
+        give the hypothesis spoken in each window; the reference span is the
+        proportional slice of ``target_text`` (TTS reads in order). Returns rows
+        ``{window_idx, t_start, spk_sim_win, cer_win}``.
+        """
+        from jiwer import cer as _cer
+
+        from turboquant.bench_common import plan_windows, proportional_text_span
+
+        wav = wav.astype(np.float32)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        duration = len(wav) / sr if sr else 0.0
+        if duration <= 0:
+            return []
+
+        self._load_whisper()
+        segments = self._whisper.transcribe(wav).get("segments", [])
+        min_chunk = int(0.2 * sr)  # WavLM needs a non-trivial window
+
+        rows: list[dict] = []
+        for wi, (t0, t1) in enumerate(plan_windows(duration, window_s, hop_s)):
+            chunk = wav[int(t0 * sr) : int(t1 * sr)]
+            spk = float("nan")
+            if len(chunk) >= min_chunk:
+                spk = float(np.dot(self.speaker_embedding(chunk, sr), ref_emb))
+            hyp = " ".join(
+                s["text"].strip()
+                for s in segments
+                if t0 <= 0.5 * (s["start"] + s["end"]) < t1
+            ).strip()
+            ref_span = proportional_text_span(target_text, t0 / duration, t1 / duration)
+            cer_win = float(_cer(ref_span, hyp)) if ref_span else 0.0
+            rows.append(
+                {
+                    "window_idx": wi,
+                    "t_start": round(t0, 3),
+                    "spk_sim_win": spk,
+                    "cer_win": cer_win,
+                }
+            )
+        return rows
 
 
 # ---------------------------------------------------------------------------
@@ -474,9 +570,30 @@ def _write_result_line(fh, **kw):
     fh.write(format_trial_row(kw) + "\n")
 
 
+def _write_windowed_line(fh, **kw):
+    """Append one windowed-metrics row in WINDOWED_COLUMNS order; None -> empty."""
+    row = []
+    for col in WINDOWED_COLUMNS:
+        v = kw.get(col)
+        if v is None:
+            row.append("")
+        elif isinstance(v, float):
+            row.append(f"{v:.6g}")
+        else:
+            row.append(str(v))
+    fh.write(",".join(row) + "\n")
+
+
 def _tee(fh, msg):
-    """Print to stdout and to the results file (if any)."""
-    print(msg)
+    """Print to stdout and to the results file (if any).
+
+    Routes through ``tqdm.write`` while a progress bar is active so per-trial
+    lines don't fragment the bar.
+    """
+    if _PBAR is not None and _tqdm is not None:
+        _tqdm.write(msg)
+    else:
+        print(msg)
     if fh is not None:
         fh.write(msg + "\n")
 
@@ -695,14 +812,19 @@ def _empty_group_results() -> dict:
     return {name: {k: [] for k in metric_keys} for name, _ in TURBOQUANT_CONFIGS}
 
 
-def _load_reference_clip(item, metrics):
-    """Load the reference clip for ground-truth SpkSim: ground truth, else prompt.
+def _load_reference_clip(item, metrics, fallback_ref_audio=None):
+    """Load the reference clip for SpkSimRef: ground truth, else own prompt, else
+    the effective clone reference (``fallback_ref_audio``).
 
-    Returns ``(wav_np, sr)`` or ``(None, None)`` when there is no reference or no
-    metrics. Loaded once per cell so it isn't re-read for every config.
+    The fallback is what makes SpkSimRef meaningful for the curated cells, which
+    carry no own clip but are cloned from the shared ``--default-ref-audio`` — so
+    SpkSimRef there is clone fidelity vs that known voice. Returns ``(wav_np, sr)``
+    or ``(None, None)``. Loaded once per cell so it isn't re-read for every config.
     """
-    ref_path = getattr(item, "ground_truth_audio", None) or getattr(
-        item, "ref_audio", None
+    ref_path = (
+        getattr(item, "ground_truth_audio", None)
+        or getattr(item, "ref_audio", None)
+        or fallback_ref_audio
     )
     if not ref_path or metrics is None:
         return None, None
@@ -757,6 +879,8 @@ def _sweep_arm(
     voice_mode="auto",
     default_ref_audio=None,
     default_ref_text=None,
+    windowed_fh=None,
+    windowed_groups=(),
 ):
     """Run the full group×sentence×seed×temperature×config sweep for one arm.
 
@@ -794,6 +918,8 @@ def _sweep_arm(
         )
         _tee(results_fh, f"{'=' * 110}")
 
+        if _PBAR is not None:
+            _PBAR.set_description(f"{arm}:{group_name}")
         group_results = _empty_group_results()
         for i, item in enumerate(items):
             text = item.text
@@ -829,7 +955,11 @@ def _sweep_arm(
                         voice_mode=voice_mode,
                         default_ref_audio=default_ref_audio,
                         default_ref_text=default_ref_text,
+                        windowed_fh=windowed_fh,
+                        windowed_groups=windowed_groups,
                     )
+                    if _PBAR is not None:
+                        _PBAR.update(1)
 
         _print_group_averages(results_fh, metrics, group_name, group_results)
         summary[group_name] = group_results
@@ -858,6 +988,8 @@ def _sweep_sentence_seed(
     voice_mode="auto",
     default_ref_audio=None,
     default_ref_text=None,
+    windowed_fh=None,
+    windowed_groups=(),
 ):
     """Run all configs for one (sentence, seed, temperature), paired on the same draw."""
     text = item.text
@@ -870,9 +1002,19 @@ def _sweep_sentence_seed(
     if voice_mode == "clone" and not eff_ref_audio:
         _tee(results_fh, f"    skip (clone mode, no reference) {group_name}/{idx}")
         return
-    # Ground-truth reference clip (same text) preferred; else the cloning prompt.
-    # Loaded once per cell for the side-by-side spk_sim_ref metric.
-    ref_wav, ref_sr = _load_reference_clip(item, metrics)
+    # Ground-truth reference clip (same text) preferred; else the cloning prompt;
+    # else the effective clone reference (so curated cells get SpkSimRef vs the
+    # default voice they cloned). Loaded once per cell for the spk_sim_ref metric.
+    ref_wav, ref_sr = _load_reference_clip(item, metrics, eff_ref_audio)
+    # For windowed temporal metrics on long audio: a single fixed reference speaker
+    # embedding (computed once per cell) that each window is cosine'd against.
+    do_windowed = (
+        windowed_fh is not None
+        and group_name in windowed_groups
+        and metrics is not None
+        and ref_wav is not None
+    )
+    ref_emb = metrics.speaker_embedding(ref_wav, ref_sr) if do_windowed else None
     for config_name, tq_config in TURBOQUANT_CONFIGS:
         key_bits, value_bits, residual_window = config_bits(tq_config)
         try:
@@ -932,6 +1074,18 @@ def _sweep_sentence_seed(
                     )
                     if spk_sim_ref is not None:
                         r["spk_sim_ref"].append(spk_sim_ref)
+                # Windowed temporal series (long audio): one sidecar row per window.
+                if do_windowed and ref_emb is not None:
+                    for w in metrics.windowed_metrics(wav, sr, text, ref_emb):
+                        _write_windowed_line(
+                            windowed_fh,
+                            group=group_name,
+                            idx=idx,
+                            sentence_hash=shash,
+                            seed=seed,
+                            config=config_name,
+                            **w,
+                        )
 
             if save_wav:
                 safe = config_name.replace(" ", "_").replace("/", "_")
@@ -1050,6 +1204,14 @@ def benchmark_qwen3tts(args):
 
     results_fh, results_path = _open_results_file("benchmark_qwen3tts")
     trial_fh, trial_path = _open_csv_file(trial_tag, TRIAL_COLUMNS)
+
+    # Optional windowed-metrics sidecar (CER(t)/SpkSim(t) on long audio), shard-named
+    # to match the trials so analyze --windowed reassembles one launch's shards.
+    windowed_fh = None
+    if getattr(args, "windowed_metrics", False):
+        win_tag = trial_tag.replace("qwen_trials", "qwen_windowed", 1)
+        windowed_fh, windowed_path = _open_csv_file(win_tag, WINDOWED_COLUMNS)
+
     gpu_csv = start_nvidia_smi_monitor("benchmark_qwen3tts")
 
     header = [
@@ -1125,6 +1287,10 @@ def benchmark_qwen3tts(args):
     active_groups = getattr(args, "active_groups", available_groups())
     max_per_group = getattr(args, "max_per_group", None)
 
+    global _PBAR
+    if _tqdm is not None:
+        _PBAR = _tqdm(desc="cells", unit="cell", dynamic_ncols=True)
+
     for arm in arms:
         summary = _sweep_arm(
             model,
@@ -1146,10 +1312,19 @@ def benchmark_qwen3tts(args):
             voice_mode=getattr(args, "voice_mode", "auto"),
             default_ref_audio=getattr(args, "default_ref_audio", None),
             default_ref_text=getattr(args, "default_ref_text", None),
+            windowed_fh=windowed_fh,
+            windowed_groups=WINDOWED_GROUPS,
         )
         _print_arm_summaries(results_fh, metrics, arm, active_groups, summary)
 
+    if _PBAR is not None:
+        _PBAR.close()
+        _PBAR = None
+
     trial_fh.close()
+    if windowed_fh is not None:
+        windowed_fh.close()
+        _tee(results_fh, f"Windowed metrics CSV: {windowed_path}")
     _tee(results_fh, f"\nOutput audio saved to: {output_dir}/")
     _tee(results_fh, f"Per-trial CSV (source of truth): {trial_path}")
 
@@ -1687,6 +1862,21 @@ def main():
         help="Skip the deterministic intrinsic-distortion probe (KV reconstruction).",
     )
     parser.add_argument(
+        "--residual-window",
+        type=int,
+        default=128,
+        help="Most-recent tokens kept fp16-exact; older tokens are quantized. "
+        "rw=0 is paper-faithful TurboQuant (quantize every token, incl. streaming) "
+        "and makes compression bite on short sentences too. Default 128.",
+    )
+    parser.add_argument(
+        "--windowed-metrics",
+        action="store_true",
+        help="Also emit per-window CER(t)/SpkSim(t) series for long groups "
+        "(libritts_long/long) to a windowed sidecar CSV — locates WHERE compression "
+        "starts failing. Adds Whisper+WavLM passes per window; long-audio only.",
+    )
+    parser.add_argument(
         "--track-only-off",
         action="store_true",
         help="Apply REAL compression during generation (track_only=False) instead "
@@ -1695,6 +1885,12 @@ def main():
         "identical audio. Decode is substantially slower (legacy on-path compression).",
     )
     args = parser.parse_args()
+
+    # Rebuild the sweep at the requested residual window before any consumer runs.
+    if args.residual_window < 0:
+        parser.error(f"--residual-window must be >= 0, got {args.residual_window}")
+    global TURBOQUANT_CONFIGS
+    TURBOQUANT_CONFIGS = build_turboquant_configs(args.residual_window)
 
     # Propagate track_only=False into every TurboQuantConfig if requested, so the
     # generated audio actually reflects compression (not just analytical metrics).

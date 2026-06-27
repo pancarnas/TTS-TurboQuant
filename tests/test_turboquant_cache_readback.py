@@ -116,6 +116,57 @@ def test_more_aggressive_compression_is_more_lossy() -> None:
     assert _prefix_key_mse(4, 2) < _prefix_key_mse(2, 2)
 
 
+def _config_rw0(track_only):
+    """rw=0 — paper-faithful TurboQuant: every token quantized, no fp16 tail."""
+    return TurboQuantConfig(
+        key_bits=2,
+        value_bits=2,
+        residual_window=0,
+        protected_layers=0,
+        protected_bits=8,
+        track_only=track_only,
+    )
+
+
+def test_rw0_quantizes_every_token() -> None:
+    """At rw=0 the WHOLE sequence is lossy (no exact residual tail) — this is the
+    behavior the thesis experiment depends on, so short sentences compress too."""
+    cache = TurboQuantKVCache(_config_rw0(track_only=False), n_layers=1)
+    in_k, in_v, full_k, full_v = _feed(cache, steps=6, step_len=8)
+
+    assert full_k.shape == in_k.shape
+    assert full_v.shape == in_v.shape
+    # Even the most recent token must differ from its fp16 original — nothing is
+    # kept exact at rw=0 (contrast the rw=16 test, which preserves the tail).
+    assert not torch.allclose(full_k, in_k, atol=1e-3), (
+        "rw=0 read-back equals the original — compression is not reaching "
+        "generation; short sentences would be byte-identical to baseline."
+    )
+
+
+def test_rw0_track_only_true_still_measurement_only() -> None:
+    """rw=0 must not corrupt the measurement-only path: track_only=True still
+    returns untouched fp16 (the buffer stays pristine)."""
+    cache = TurboQuantKVCache(_config_rw0(track_only=True), n_layers=1)
+    in_k, in_v, full_k, full_v = _feed(cache, steps=6, step_len=8)
+    assert torch.allclose(full_k, in_k, atol=0, rtol=0)
+    assert torch.allclose(full_v, in_v, atol=0, rtol=0)
+
+
+def test_rw0_single_token_prefill_edge() -> None:
+    """S=1 prefill at rw=0 (empty residual slice) must not break — the
+    compressor handles a one-token sequence and the read-back stays shaped."""
+    cache = TurboQuantKVCache(_config_rw0(track_only=False), n_layers=1)
+    in_k, in_v, full_k, full_v = _feed(cache, steps=1, step_len=1)
+    assert full_k.shape == in_k.shape == (1, 4, 1, 64)
+    # One step further (decode token) must also work without error.
+    g = torch.Generator().manual_seed(1)
+    k = torch.randn(1, 4, 1, 64, generator=g)
+    v = torch.randn(1, 4, 1, 64, generator=g)
+    fk, fv = cache.update(k, v, layer_idx=0)
+    assert fk.shape == (1, 4, 2, 64)
+
+
 def test_decompress_is_called_once_per_chunk_not_per_step() -> None:
     """Guards the O(seq) write-back path: each compressed span is decompressed
     exactly once (at compression time), NOT re-decompressed on every read. A

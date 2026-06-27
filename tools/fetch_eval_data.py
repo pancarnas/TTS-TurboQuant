@@ -177,6 +177,80 @@ def fetch_seedtts(data_dir: str, limit: Optional[int] = None, workers: int = 4) 
         return sum(1 for line in fh if line.strip())
 
 
+LIBRISPEECH_PC_REPO = "mrfakename/E2-F5-TTS"  # HF Space holding the F5-TTS eval list
+LIBRISPEECH_PC_LST = "data/librispeech_pc_test_clean_cross_sentence.lst"
+LIBRISPEECH_TESTCLEAN_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
+LIBRITTS_R_REPO = "mythicinfinity/libritts_r"  # HF dataset (test-clean subset)
+
+
+def fetch_librispeech_pc(data_dir: str) -> int:
+    """Fetch the F5-TTS LibriSpeech-PC list + LibriSpeech test-clean audio.
+
+    The cross-sentence ``.lst`` (1,127 pairs) is pulled from the F5-TTS HF Space;
+    the audio is the OpenSLR ``test-clean`` tarball unpacked under
+    ``<data_dir>/librispeech_pc/LibriSpeech/test-clean`` (≈346 MB). Returns the
+    line count of the fetched list. Network + large download — run on the box.
+    """
+    import shutil
+    import tarfile
+    import urllib.request
+
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    from huggingface_hub import hf_hub_download
+
+    root = os.path.join(data_dir, "librispeech_pc")
+    os.makedirs(root, exist_ok=True)
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+    # 1) the eval list (tiny) from the Space
+    src = hf_hub_download(
+        repo_id=LIBRISPEECH_PC_REPO,
+        repo_type="space",
+        filename=LIBRISPEECH_PC_LST,
+        token=token,
+    )
+    dst = os.path.join(root, os.path.basename(LIBRISPEECH_PC_LST))
+    shutil.copyfile(src, dst)
+
+    # 2) the audio (OpenSLR test-clean tarball) — skip if already unpacked
+    libri_root = os.path.join(root, "LibriSpeech", "test-clean")
+    if not os.path.isdir(libri_root):
+        tar_path = os.path.join(root, "test-clean.tar.gz")
+        if not os.path.exists(tar_path):
+            print(f"  downloading LibriSpeech test-clean (~346 MB) → {tar_path}")
+            urllib.request.urlretrieve(LIBRISPEECH_TESTCLEAN_URL, tar_path)
+        print("  extracting test-clean.tar.gz ...")
+        with tarfile.open(tar_path) as tf:
+            tf.extractall(root)  # creates <root>/LibriSpeech/test-clean/...
+    with open(dst, encoding="utf-8") as fh:
+        return sum(1 for line in fh if line.strip())
+
+
+def fetch_libritts_r(data_dir: str, workers: int = 4) -> int:
+    """Snapshot LibriTTS-R test-clean for the long-context concatenation builder.
+
+    Downloads into ``<data_dir>/libritts_r``; ``tools/build_libritts_long.py`` then
+    stitches consecutive same-chapter utterances into graduated-length passages.
+    Returns 0 (count is produced by the build step). Large download — box-only.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    from huggingface_hub import snapshot_download
+
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    out = os.path.join(data_dir, "libritts_r")
+    os.makedirs(out, exist_ok=True)
+    snapshot_download(
+        repo_id=LIBRITTS_R_REPO,
+        repo_type="dataset",
+        local_dir=out,
+        allow_patterns=["*test*clean*", "*test-clean*", "test.clean/**"],
+        token=token,
+        max_workers=workers,
+    )
+    print(f"  LibriTTS-R test-clean → {out} (run build_libritts_long.py next)")
+    return 0
+
+
 def write_ellav_hard(data_dir: str, overwrite: bool = False) -> int:
     """Write the vendored ELLA-V-style hard set; return sentence count."""
     path = os.path.join(data_dir, "ellav_hard.txt")
@@ -221,6 +295,16 @@ def main() -> None:
         default=4,
         help="Parallel download workers (default 4). Raise with an HF token set.",
     )
+    parser.add_argument(
+        "--fetch-librispeech",
+        action="store_true",
+        help="Also fetch the F5-TTS LibriSpeech-PC list + test-clean audio (~346 MB).",
+    )
+    parser.add_argument(
+        "--fetch-libritts",
+        action="store_true",
+        help="Also snapshot LibriTTS-R test-clean for the long-context builder.",
+    )
     args = parser.parse_args()
     os.makedirs(args.data_dir, exist_ok=True)
 
@@ -233,9 +317,13 @@ def main() -> None:
         )
     ellav_n = write_ellav_hard(args.data_dir, overwrite=args.overwrite_ellav)
     print(f"ellav_hard: {ellav_n} sentences  (source: vendored reconstruction)")
-    print(
-        "Done. Pass --data-dir to the benchmarks to use seedtts_en / ellav_hard groups."
-    )
+    if args.fetch_librispeech:
+        n = fetch_librispeech_pc(args.data_dir)
+        print(f"librispeech_pc: {n} cross-sentence pairs  (source: F5-TTS + OpenSLR)")
+    if args.fetch_libritts:
+        fetch_libritts_r(args.data_dir, workers=args.workers)
+        print("libritts_r: snapshot fetched — run tools/build_libritts_long.py next")
+    print("Done. Pass --data-dir to the benchmarks to use the eval groups.")
 
 
 if __name__ == "__main__":

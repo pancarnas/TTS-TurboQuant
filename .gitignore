@@ -53,6 +53,14 @@ excalidraw.file.txt
 !requirements.txt
 !LICENSE
 
+# Eval data (fetched standard sets + generated curated set) — rebuild with
+# `make fetch-eval-data` / `build_*`; not tracked.
+data/
+
+# Analysis output + result CSVs (large; reproduce via the run + analyze commands).
+analysis26june/
+results_new/
+
 # Attention maps
 attentionMap/
 

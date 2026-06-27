@@ -38,6 +38,8 @@ try:
 except ImportError:  # scipy is a hard dep of turboquant, but degrade gracefully
     wilcoxon = None
 
+from turboquant.bench_common import degradation_onset  # noqa: E402  (used in §windowed)
+
 
 BASELINE_HINT = "baseline"
 
@@ -441,6 +443,246 @@ def section_length_trend(df: pd.DataFrame, n_boot: int, lines: list[str]) -> Non
         _emit(lines, row)
 
 
+_LENGTHS = ("short", "medium", "long")
+_DIFFS = ("easy", "medium", "hard")
+
+
+def _parse_cell(group: str) -> tuple[Optional[str], Optional[str]]:
+    """Split a grid-cell group ``"<length>_<difficulty>"`` → (length, difficulty).
+
+    Returns (None, None) for non-grid groups (smoke/long/seedtts_en/…), so the
+    section silently skips them.
+    """
+    parts = str(group).split("_", 1)
+    if len(parts) == 2 and parts[0] in _LENGTHS and parts[1] in _DIFFS:
+        return parts[0], parts[1]
+    return None, None
+
+
+def attach_ref_quality(df: pd.DataFrame, path: Optional[str]) -> pd.DataFrame:
+    """Left-join the ref_quality sidecar (sentence_hash → clean/ref_cer/ref_snr).
+
+    No-op (returns df unchanged) when no path/file or no sentence_hash column, so
+    the analysis still runs on CSVs produced before reference tagging existed.
+    """
+    if not path or not os.path.exists(path) or "sentence_hash" not in df.columns:
+        return df
+    rq = pd.read_csv(path)[["sentence_hash", "clean", "ref_cer", "ref_snr_db"]]
+    rq = rq.drop_duplicates("sentence_hash")
+    return df.merge(rq, on="sentence_hash", how="left")
+
+
+def section_length_difficulty(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
+    """The 3×3 experiment grid: CER-vs-length curve + per-config length×difficulty.
+
+    Emitted only when the run uses the ``<length>_<difficulty>`` grid cells. The
+    headline (difficulty pooled) is the rw=0 degradation curve — short→long at a
+    fixed bit-width — which the length-gated Exp-1 could not produce.
+    """
+    cells = df["group"].dropna().map(lambda g: _parse_cell(g)[0] is not None)
+    grid = df[cells.reindex(df.index, fill_value=False)].copy()
+    if grid.empty:
+        return
+    grid["length"] = grid["group"].map(lambda g: _parse_cell(g)[0])
+    grid["difficulty"] = grid["group"].map(lambda g: _parse_cell(g)[1])
+    lengths = [le for le in _LENGTHS if le in set(grid["length"])]
+    diffs = [d for d in _DIFFS if d in set(grid["difficulty"])]
+    configs = list(grid["config"].dropna().unique())
+
+    _emit(lines, "\n## 8. Length × difficulty grid (CER)\n")
+    _emit(lines, "  Headline: CER vs length per config (difficulty pooled) — the")
+    _emit(lines, "  degradation curve. Gap to baseline should widen short→long.\n")
+    header = f"{'config':<22}" + "".join(f"{le:>20}" for le in lengths)
+    _emit(lines, header)
+    for config in configs:
+        row = f"{config:<22}"
+        for le in lengths:
+            cell = grid[(grid["config"] == config) & (grid["length"] == le)]
+            cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
+            row += (
+                f"{f'{cm:.3f}[{clo:.3f},{chi:.3f}]':>20}"
+                if not np.isnan(cm)
+                else f"{'---':>20}"
+            )
+        _emit(lines, row)
+
+    _emit(lines, "\n  Per-config CER by length (rows) × difficulty (cols):")
+    for config in configs:
+        _emit(lines, f"\n### {config}")
+        _emit(lines, f"{'length':<8}" + "".join(f"{d:>10}" for d in diffs))
+        for le in lengths:
+            row = f"{le:<8}"
+            for d in diffs:
+                cell = grid[
+                    (grid["config"] == config)
+                    & (grid["length"] == le)
+                    & (grid["difficulty"] == d)
+                ]
+                cm, _, _ = bootstrap_ci(cell["cer"], n_boot)
+                row += f"{'---':>10}" if np.isnan(cm) else f"{cm:>10.3f}"
+            _emit(lines, row)
+
+
+def section_clean_subset(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
+    """Clone-fidelity SpkSimRef per config on the clean-reference subset vs all.
+
+    Needs the ref_quality join (a ``clean`` column). Noisy references depress
+    absolute SpkSimRef, so reporting the clean subset alongside all-rows shows the
+    compression drift uncontaminated by reference quality.
+    """
+    if "clean" not in df.columns or "spk_sim_ref" not in df.columns:
+        return
+    clean = df[df["clean"] == 1]
+    if clean.empty:
+        return
+    _emit(lines, "\n## 9. SpkSimRef: clean-reference subset vs all\n")
+    n_clean = (
+        clean["sentence_hash"].nunique() if "sentence_hash" in clean else len(clean)
+    )
+    n_all = df["sentence_hash"].nunique() if "sentence_hash" in df else len(df)
+    _emit(lines, f"  clean refs: {n_clean} sentences (of {n_all}).\n")
+    _emit(lines, f"{'config':<22} {'SpkSimRef(all)':>16} {'SpkSimRef(clean)':>18}")
+    for config in df["config"].dropna().unique():
+        a, _, _ = bootstrap_ci(_col(df[df["config"] == config], "spk_sim_ref"), n_boot)
+        c, _, _ = bootstrap_ci(
+            _col(clean[clean["config"] == config], "spk_sim_ref"), n_boot
+        )
+        a_str = "---" if np.isnan(a) else f"{a:.4f}"
+        c_str = "---" if np.isnan(c) else f"{c:.4f}"
+        _emit(lines, f"{config:<22} {a_str:>16} {c_str:>18}")
+
+
+_LENGTH_EDGES = [(0, 128), (128, 512), (512, 1024), (1024, 2048), (2048, None)]
+
+
+def _length_bucket(tok: float):
+    for lo, hi in _LENGTH_EDGES:
+        if tok >= lo and (hi is None or tok < hi):
+            return (lo, hi)
+    return None
+
+
+def _bucket_label(b: tuple) -> str:
+    lo, hi = b
+    return f"{lo}-{hi}tok" if hi is not None else f"{lo}+tok"
+
+
+def section_length_sweep_fixed(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
+    """Headline degradation curve: CER + SpkSim vs FIXED decode-length buckets.
+
+    Unlike the rank-tercile ``section_length_trend``, the buckets are absolute
+    talker-token ranges (≤128 / 128–512 / 512–1024 / 1024–2048 / 2048+), so the
+    curve reads directly as 'quality vs sequence length' across the standard sets.
+    """
+    if "n_ar_tokens" not in df.columns:
+        return
+    tok = pd.to_numeric(df["n_ar_tokens"], errors="coerce")
+    work = df.assign(_tok=tok).dropna(subset=["_tok"])
+    if work.empty:
+        return
+    work = work.assign(_b=work["_tok"].map(_length_bucket))
+    buckets = [b for b in _LENGTH_EDGES if (work["_b"] == b).any()]
+    if len(buckets) < 2:
+        return
+
+    _emit(lines, "\n## Length sweep — CER & SpkSim vs fixed decode-length bucket\n")
+    for metric, title in (("cer", "CER"), ("spk_sim", "SpkSim")):
+        if metric not in work.columns:
+            continue
+        _emit(lines, f"### {title}")
+        header = f"{'config':<22}" + "".join(f"{_bucket_label(b):>20}" for b in buckets)
+        _emit(lines, header)
+        for config in work["config"].dropna().unique():
+            row = f"{config:<22}"
+            for b in buckets:
+                cell = work[(work["config"] == config) & (work["_b"] == b)]
+                m, lo, hi = bootstrap_ci(cell[metric], n_boot)
+                row += (
+                    f"{f'{m:.3f}[{lo:.3f},{hi:.3f}]':>20}"
+                    if not np.isnan(m)
+                    else f"{'---':>20}"
+                )
+            _emit(lines, row)
+        _emit(lines)
+
+
+def _windowed_baseline(configs: list[str]) -> Optional[str]:
+    for c in configs:
+        if BASELINE_HINT in str(c).lower():
+            return c
+    return None
+
+
+def section_windowed(windowed_glob: Optional[str], lines: list[str]) -> None:
+    """CER(t)/SpkSim(t) degradation curves vs baseline + degradation-onset.
+
+    Reads the windowed sidecar (one row per trial×window), averages each metric
+    over items/seeds per (config, window_idx), then locates the first window where
+    a compressed config peels away from baseline (SpkSim drop / CER rise).
+    """
+    if not windowed_glob:
+        return
+    paths = sorted(glob.glob(windowed_glob))
+    if not paths:
+        return
+    w = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+    if w.empty:
+        return
+    configs = list(w["config"].dropna().unique())
+    base = _windowed_baseline(configs)
+    if base is None:
+        _emit(lines, "\n## Windowed degradation — (no baseline config found)\n")
+        return
+
+    sim = w.groupby(["config", "window_idx"])["spk_sim_win"].mean().unstack(0)
+    cer = w.groupby(["config", "window_idx"])["cer_win"].mean().unstack(0)
+    t_by_win = w.groupby("window_idx")["t_start"].mean()
+
+    _emit(
+        lines, "\n## Windowed temporal degradation (long audio) — onset vs baseline\n"
+    )
+    _emit(lines, "  First window where a config peels from baseline: SpkSim drop")
+    _emit(lines, "  > 0.10 or CER rise > 0.20. '~t' is that window's mean start (s).\n")
+    _emit(
+        lines,
+        f"{'config':<22} {'SIM onset':>10} {'~t(s)':>7} {'CER onset':>10} {'~t(s)':>7}",
+    )
+    for cfg in configs:
+        if cfg == base:
+            continue
+        sim_on = (
+            degradation_onset(sim[base].tolist(), sim[cfg].tolist(), True, 0.10)
+            if cfg in sim
+            else None
+        )
+        cer_on = (
+            degradation_onset(cer[base].tolist(), cer[cfg].tolist(), False, 0.20)
+            if cfg in cer
+            else None
+        )
+
+        def _fmt(on):
+            if on is None:
+                return "none", "--"
+            return f"win{on}", f"{t_by_win.get(on, float('nan')):.1f}"
+
+        s_on, s_t = _fmt(sim_on)
+        c_on, c_t = _fmt(cer_on)
+        _emit(lines, f"{cfg:<22} {s_on:>10} {s_t:>7} {c_on:>10} {c_t:>7}")
+
+    # Compact SpkSim(t) curve (capped to ~12 windows) so the shape is visible.
+    idxs = sorted(sim.index)[:12]
+    _emit(lines, "\n  SpkSim(t) by window (mean over items/seeds):")
+    _emit(lines, f"{'config':<22}" + "".join(f"w{i:>4}" for i in idxs))
+    for cfg in configs:
+        if cfg not in sim:
+            continue
+        row = f"{cfg:<22}" + "".join(
+            f"{sim[cfg].get(i, float('nan')):>5.2f}" for i in idxs
+        )
+        _emit(lines, row)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -466,6 +708,18 @@ def main() -> None:
         "--kv-recon", default=None, help="Explicit KV-reconstruction CSV path."
     )
     parser.add_argument(
+        "--ref-quality",
+        default=None,
+        help="ref_quality.csv from validate_eval_set.py (sentence_hash → clean / "
+        "ref_cer / ref_snr). Enables the clean-reference-subset SpkSimRef section.",
+    )
+    parser.add_argument(
+        "--windowed",
+        default=None,
+        help="Glob of windowed-metrics sidecar CSVs (qwen_windowed_shard*_<tag>.csv). "
+        "Enables the CER(t)/SpkSim(t) degradation-curve + onset section.",
+    )
+    parser.add_argument(
         "--out-md", default=None, help="Also write the report to this markdown file."
     )
     parser.add_argument(
@@ -484,14 +738,20 @@ def main() -> None:
     if trials_df is not None:
         _emit(lines, f"Per-trial CSV(s): {', '.join(trials_used)}")
         df = _normalize_temperature(trials_df)
+        df = attach_ref_quality(df, args.ref_quality)
         section_means(df, args.n_boot, lines)
         section_paired_tests(df, lines)
         section_variance(df, lines)
         section_arm_contrast(df, lines)
         section_temperature_trend(df, args.n_boot, lines)
         section_length_trend(df, args.n_boot, lines)
+        section_length_sweep_fixed(df, args.n_boot, lines)
+        section_length_difficulty(df, args.n_boot, lines)
+        section_clean_subset(df, args.n_boot, lines)
     else:
         _emit(lines, "No per-trial CSV found — skipping downstream sections.")
+
+    section_windowed(args.windowed, lines)
 
     if kv_path and os.path.exists(kv_path):
         _emit(lines, f"\nKV-reconstruction CSV: {kv_path}")

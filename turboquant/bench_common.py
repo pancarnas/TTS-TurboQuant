@@ -194,3 +194,83 @@ def format_trial_row(values: dict[str, Any]) -> str:
         else:
             row.append(str(v))
     return ",".join(row)
+
+
+# ---------------------------------------------------------------------------
+# Windowed temporal metrics — locate WHERE compression starts failing on long
+# audio. Pure helpers (no torch/audio deps) so they unit-test on CPU; the
+# model-driven windowing lives in the benchmark's QualityMetrics.windowed_metrics.
+# ---------------------------------------------------------------------------
+
+# Sidecar CSV schema: one row per (trial, window). Kept separate from
+# TRIAL_COLUMNS so the per-trial CSV stays one-row-per-trial.
+WINDOWED_COLUMNS = [
+    "group",
+    "idx",
+    "sentence_hash",
+    "seed",
+    "config",
+    "window_idx",
+    "t_start",
+    "spk_sim_win",
+    "cer_win",
+]
+
+
+def plan_windows(
+    duration_s: float, window_s: float = 3.0, hop_s: float = 1.5
+) -> list[tuple[float, float]]:
+    """Sliding-window boundaries (start, end) in seconds covering ``duration_s``.
+
+    The last window is clamped to the clip end (so the tail is always covered).
+    A clip shorter than one window yields a single [0, duration] window.
+    """
+    if duration_s <= 0:
+        return []
+    if duration_s <= window_s:
+        return [(0.0, duration_s)]
+    out: list[tuple[float, float]] = []
+    t = 0.0
+    while t < duration_s:
+        end = min(t + window_s, duration_s)
+        out.append((t, end))
+        if end >= duration_s:
+            break
+        t += hop_s
+    return out
+
+
+def proportional_text_span(text: str, frac0: float, frac1: float) -> str:
+    """Word-aligned slice of ``text`` between fractions ``[frac0, frac1)``.
+
+    TTS reads the target text in order, so time-fraction ≈ position-fraction:
+    this gives the reference span expected to be spoken within a time window
+    (an approximation used for per-window CER). Slices on word boundaries.
+    """
+    words = text.split()
+    if not words:
+        return ""
+    lo = max(0, min(len(words), round(frac0 * len(words))))
+    hi = max(lo, min(len(words), round(frac1 * len(words))))
+    return " ".join(words[lo:hi])
+
+
+def degradation_onset(
+    base: list[float],
+    comp: list[float],
+    higher_is_better: bool,
+    abs_threshold: float,
+) -> Optional[int]:
+    """First window index where ``comp`` deviates from ``base`` beyond a threshold.
+
+    For SpkSim (``higher_is_better=True``) the onset is where baseline−compressed
+    > threshold (voice drifted); for CER (``higher_is_better=False``) where
+    compressed−baseline > threshold (intelligibility dropped). Returns None if the
+    compressed series never crosses the threshold. Compares index-aligned windows.
+    """
+    n = min(len(base), len(comp))
+    for i in range(n):
+        delta = (base[i] - comp[i]) if higher_is_better else (comp[i] - base[i])
+        if delta > abs_threshold:
+            return i
+    return None

@@ -55,7 +55,12 @@ install-cuda:
 # pull + HF 429); match it to the seedtts_en --max-per-group you plan to run.
 fetch-eval-data:
 	python tools/fetch_eval_data.py --data-dir $(DATA_DIR) \
-		$(if $(LIMIT),--limit $(LIMIT),) $(if $(FETCH_WORKERS),--workers $(FETCH_WORKERS),)
+		$(if $(LIMIT),--limit $(LIMIT),) $(if $(FETCH_WORKERS),--workers $(FETCH_WORKERS),) \
+		$(if $(FETCH_LIBRISPEECH),--fetch-librispeech,) $(if $(FETCH_LIBRITTS),--fetch-libritts,)
+
+# Build the long-context set by concatenating LibriTTS-R (after FETCH_LIBRITTS=1).
+build-libritts-long:
+	python tools/build_libritts_long.py --data-dir $(DATA_DIR) $(if $(MAX_PER_BUCKET),--max-per-bucket $(MAX_PER_BUCKET),)
 
 # Validate the eval text BEFORE the big run: baseline-only CER per sentence
 # (flags floor / un-synthesizable), token-length histogram, reference-clip ASR check.
@@ -63,7 +68,7 @@ fetch-eval-data:
 validate-eval:
 	@mkdir -p results
 	python tools/validate_eval_set.py --device $(DEVICE) \
-		--metrics-device $(METRICS_DEVICE) --data-dir $(DATA_DIR) $(_GROUPS_ARG) $(_MPG_ARG) \
+		--metrics-device $(METRICS_DEVICE) --data-dir $(DATA_DIR) $(_GROUPS_ARG) $(_MPG_ARG) $(_MODEL_ARG) \
 		--out-md results/eval_set_report.md 2>&1 \
 		| tee results/validate_eval_$(shell date +%Y%m%d_%H%M%S).log
 
@@ -142,6 +147,13 @@ _DATA_ARG = $(if $(DATA_DIR),--data-dir $(DATA_DIR),)
 # LIMIT you fetched, e.g. MAX_PER_GROUP=100. Smaller groups (ellav_hard=20, long=4)
 # are unaffected by a larger cap.
 _MPG_ARG = $(if $(MAX_PER_GROUP),--max-per-group $(MAX_PER_GROUP),)
+# Residual window: most-recent tokens kept fp16-exact. RW=0 is paper-faithful
+# TurboQuant (quantize every token) — makes short/medium sentences compress too.
+# Unset → benchmark default (128, the length-gated Exp-1 behavior).
+_RW_ARG = $(if $(RW),--residual-window $(RW),)
+# WINDOWED=1 emits per-window CER(t)/SpkSim(t) series for long groups (where it
+# starts failing) into a windowed sidecar CSV.
+_WINDOWED_ARG = $(if $(WINDOWED),--windowed-metrics,)
 # Voice strategy (Qwen). MODEL switches checkpoint; VOICE={auto,preset,clone}.
 # Preset run (default CustomVoice): leave VOICE unset (auto → preset).
 # Clone run: MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base VOICE=clone DEFAULT_REF=<wav> DEFAULT_REF_TEXT="..."
@@ -154,13 +166,13 @@ eval-qwen:
 	@mkdir -p results
 	python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 		--metrics-device $(METRICS_DEVICE) --track-only-off \
-		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
+		--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_QWEN_VOICE_ARGS) 2>&1 \
 		| tee results/eval_qwen_$(shell date +%Y%m%d_%H%M%S).log
 
 eval-vallex:
 	@mkdir -p results
 	python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-		--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) 2>&1 \
+		--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) 2>&1 \
 		| tee results/eval_vallex_$(shell date +%Y%m%d_%H%M%S).log
 
 # Parallel quality sweep: launch WORKERS shards on the single GPU (AR decode is
@@ -174,7 +186,7 @@ eval-qwen-parallel:
 	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
 		python models/Qwen3-TTS/benchmarks/benchmark_qwen3tts_real.py --device $(DEVICE) \
 			--metrics-device $(METRICS_DEVICE) --track-only-off \
-			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_QWEN_VOICE_ARGS) \
+			--seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) $(_WINDOWED_ARG) $(_QWEN_VOICE_ARGS) \
 			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
 			> results/eval_qwen_shard$${i}_$(RUN_TAG).log 2>&1 & \
 	done; \
@@ -188,7 +200,7 @@ eval-vallex-parallel:
 	@echo "Launching $(WORKERS) VALL-E shards on $(DEVICE), run-tag=$(RUN_TAG)"
 	@for i in $$(seq 0 $$(( $(WORKERS) - 1 ))); do \
 		python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device $(DEVICE) \
-			--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) \
+			--track-only-off --seeds $(SEEDS) --decode $(DECODE) $(_TEMPS_ARG) $(_GROUPS_ARG) $(_DATA_ARG) $(_MPG_ARG) $(_RW_ARG) \
 			--num-shards $(WORKERS) --shard-id $$i --run-tag $(RUN_TAG) \
 			> results/eval_vallex_shard$${i}_$(RUN_TAG).log 2>&1 & \
 	done; \

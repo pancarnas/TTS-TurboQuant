@@ -177,13 +177,36 @@ def vallex_decode_params(arm: str, temperature: Optional[float] = None) -> dict:
     raise ValueError(f"unknown decode arm: {arm!r}")
 
 
-TURBOQUANT_CONFIGS = [
-    ("baseline (no TQ)", None),
-    ("K4/V2 rw=128", TurboQuantConfig(key_bits=4, value_bits=2, residual_window=128)),
-    ("K3/V3 rw=128", TurboQuantConfig(key_bits=3, value_bits=3, residual_window=128)),
-    ("K3/V2 rw=128", TurboQuantConfig(key_bits=3, value_bits=2, residual_window=128)),
-    ("K2/V2 rw=128", TurboQuantConfig(key_bits=2, value_bits=2, residual_window=128)),
-]
+def build_turboquant_configs(residual_window: int = 128) -> list:
+    """The 5-config sweep at a given residual window (see Qwen benchmark twin).
+
+    ``residual_window`` = most-recent tokens kept fp16-exact; ``rw=0`` is
+    paper-faithful TurboQuant (quantize every token). Labels embed the window.
+    """
+    rw = residual_window
+    return [
+        ("baseline (no TQ)", None),
+        (
+            f"K4/V2 rw={rw}",
+            TurboQuantConfig(key_bits=4, value_bits=2, residual_window=rw),
+        ),
+        (
+            f"K3/V3 rw={rw}",
+            TurboQuantConfig(key_bits=3, value_bits=3, residual_window=rw),
+        ),
+        (
+            f"K3/V2 rw={rw}",
+            TurboQuantConfig(key_bits=3, value_bits=2, residual_window=rw),
+        ),
+        (
+            f"K2/V2 rw={rw}",
+            TurboQuantConfig(key_bits=2, value_bits=2, residual_window=rw),
+        ),
+    ]
+
+
+# Default sweep (rw=128); main() rebuilds from --residual-window before consumers.
+TURBOQUANT_CONFIGS = build_turboquant_configs(128)
 
 
 # ---------------------------------------------------------------------------
@@ -1550,6 +1573,13 @@ def main():
         "shards group into one run for analyze --trials-glob.",
     )
     parser.add_argument(
+        "--residual-window",
+        type=int,
+        default=128,
+        help="Most-recent tokens kept fp16-exact; older tokens are quantized. "
+        "rw=0 is paper-faithful TurboQuant (quantize every token). Default 128.",
+    )
+    parser.add_argument(
         "--track-only-off",
         action="store_true",
         help="Disable the Phase-1 fast path and run the legacy compression "
@@ -1582,6 +1612,12 @@ def main():
         help="Request deterministic CUDA kernels (slower; run in a fresh process).",
     )
     args = parser.parse_args()
+
+    # Rebuild the sweep at the requested residual window before any consumer runs.
+    if args.residual_window < 0:
+        parser.error(f"--residual-window must be >= 0, got {args.residual_window}")
+    global TURBOQUANT_CONFIGS
+    TURBOQUANT_CONFIGS = build_turboquant_configs(args.residual_window)
 
     # Propagate track_only=False into every TurboQuantConfig if requested.
     if args.track_only_off:
