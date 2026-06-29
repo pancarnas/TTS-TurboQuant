@@ -55,6 +55,10 @@ COLUMNS = [
     "pos",
     "rw",
     "attn_js",
+    "attn_tv",
+    "attn_top1",
+    "attn_dentropy",
+    "out_cos",
     "cos_k",
     "cos_v",
     "relmse_k",
@@ -70,6 +74,33 @@ def js_divergence(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> float:
     kl_pm = (p * (p / m).log2()).sum(-1)
     kl_qm = (q * (q / m).log2()).sum(-1)
     return float((0.5 * kl_pm + 0.5 * kl_qm).mean().item())
+
+
+def total_variation(p: torch.Tensor, q: torch.Tensor) -> float:
+    """Mean total-variation distance (fraction of attention mass moved, in [0, 1])."""
+    return float((0.5 * (p.float() - q.float()).abs().sum(-1)).mean().item())
+
+
+def top1_agreement(p: torch.Tensor, q: torch.Tensor) -> float:
+    """Fraction of queries whose most-attended key position is unchanged."""
+    return float((p.argmax(-1) == q.argmax(-1)).float().mean().item())
+
+
+def entropy_delta(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> float:
+    """Mean H(q) - H(p) (base-2): positive => compression smears attention wider."""
+
+    def _h(x):
+        x = x.float().clamp_min(eps)
+        return -(x * x.log2()).sum(-1)
+
+    return float((_h(q) - _h(p)).mean().item())
+
+
+def output_cosine(o_fp16: torch.Tensor, o_comp: torch.Tensor) -> float:
+    """Mean cosine between the attention-output vectors (what feeds the next layer)."""
+    a = o_fp16.reshape(-1, o_fp16.shape[-1]).float()
+    b = o_comp.reshape(-1, o_comp.shape[-1]).float()
+    return float(torch.nn.functional.cosine_similarity(a, b, dim=-1).mean().item())
 
 
 def compressed_attention(query, rk, num_kv_groups, attention_mask, scaling):
@@ -136,6 +167,9 @@ class DivergenceRecorder:
             ac = compressed_attention(
                 query, rk, module.num_key_value_groups, attention_mask, scaling
             )
+            groups = module.num_key_value_groups
+            o_fp16 = torch.matmul(af, modeling.repeat_kv(value, groups).float())
+            o_comp = torch.matmul(ac, modeling.repeat_kv(rv, groups).float())
             cos_k, relmse_k = _kv_recon_errors(key, rk, head_dim)
             cos_v, relmse_v = _kv_recon_errors(value, rv, head_dim)
             self.rows.append(
@@ -146,6 +180,10 @@ class DivergenceRecorder:
                     pos,
                     rw,
                     js_divergence(af, ac),
+                    total_variation(af, ac),
+                    top1_agreement(af, ac),
+                    entropy_delta(af, ac),
+                    output_cosine(o_fp16, o_comp),
                     cos_k,
                     cos_v,
                     relmse_k,
@@ -179,7 +217,17 @@ def force_eager(model) -> None:
 
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["attn_js", "cos_k", "cos_v", "relmse_k", "relmse_v"]
+    cols = [
+        "attn_js",
+        "attn_tv",
+        "attn_top1",
+        "attn_dentropy",
+        "out_cos",
+        "cos_k",
+        "cos_v",
+        "relmse_k",
+        "relmse_v",
+    ]
     agg = df.groupby("rw")[cols].mean().sort_index(ascending=False)
     if 0 in agg.index and len(agg.index) > 1:
         other = max(w for w in agg.index if w != 0)

@@ -88,12 +88,50 @@ def test_js_divergence_symmetric_and_bounded():
     assert 0.0 <= js(p, q) <= 1.0
 
 
+def test_total_variation_bounds():
+    tv = _single_func("total_variation", {"torch": torch})
+    p = torch.tensor([[0.2, 0.3, 0.5]])
+    assert tv(p, p.clone()) < 1e-6
+    a = torch.tensor([[1.0, 0.0]])
+    b = torch.tensor([[0.0, 1.0]])
+    assert abs(tv(a, b) - 1.0) < 1e-6  # disjoint -> all mass moved
+
+
+def test_top1_agreement():
+    top1 = _single_func("top1_agreement", {"torch": torch})
+    p = torch.tensor([[0.1, 0.7, 0.2], [0.6, 0.3, 0.1]])
+    same = torch.tensor([[0.2, 0.6, 0.2], [0.5, 0.4, 0.1]])  # same argmaxes
+    flip = torch.tensor([[0.7, 0.1, 0.2], [0.1, 0.1, 0.8]])  # both argmaxes differ
+    assert top1(p, same) == 1.0
+    assert top1(p, flip) == 0.0
+
+
+def test_entropy_delta_sign():
+    de = _single_func("entropy_delta", {"torch": torch})
+    peaked = torch.tensor([[0.97, 0.01, 0.01, 0.01]])
+    uniform = torch.tensor([[0.25, 0.25, 0.25, 0.25]])
+    # q wider than p -> positive; q narrower -> negative
+    assert de(peaked, uniform) > 0
+    assert de(uniform, peaked) < 0
+
+
+def test_output_cosine():
+    oc = _single_func("output_cosine", {"torch": torch})
+    v = torch.randn(1, 2, 1, 8)
+    assert abs(oc(v, v.clone()) - 1.0) < 1e-6
+    assert abs(oc(v, -v) + 1.0) < 1e-6  # opposite -> -1
+
+
 def test_summarize_diff_row_and_order():
     summarize = _single_func("summarize", {"pd": pd})
     df = pd.DataFrame(
         {
             "rw": [24, 24, 0, 0],
             "attn_js": [0.01, 0.03, 0.20, 0.30],
+            "attn_tv": [0.01, 0.03, 0.20, 0.30],
+            "attn_top1": [0.99, 0.99, 0.80, 0.80],
+            "attn_dentropy": [0.01, 0.01, 0.10, 0.10],
+            "out_cos": [0.99, 0.99, 0.90, 0.90],
             "cos_k": [0.99, 0.99, 0.90, 0.90],
             "cos_v": [0.99, 0.99, 0.92, 0.92],
             "relmse_k": [0.01, 0.01, 0.10, 0.10],
@@ -143,17 +181,38 @@ def test_recorder_logs_one_row_per_rw_with_sane_values():
 
     assert rec.errors == 0
     assert len(rec.rows) == 2  # one per rw
-    by_rw = {r[4]: r for r in rec.rows}  # rw is column index 4
-    for r in rec.rows:
-        _, _, _, pos, rw, js, cos_k, cos_v, rmk, rmv = r
-        assert pos == 64
-        assert 0.0 <= js <= 1.0 + 1e-6
-        assert cos_k <= 1.0 + 1e-6 and cos_v <= 1.0 + 1e-6
-        assert rmk >= 0.0 and rmv >= 0.0
+    # map row by name (record() appends in this column order)
+    cols = [
+        "group",
+        "idx",
+        "layer",
+        "pos",
+        "rw",
+        "attn_js",
+        "attn_tv",
+        "attn_top1",
+        "attn_dentropy",
+        "out_cos",
+        "cos_k",
+        "cos_v",
+        "relmse_k",
+        "relmse_v",
+    ]
+    by_rw = {dict(zip(cols, r))["rw"]: dict(zip(cols, r)) for r in rec.rows}
+    for d in by_rw.values():
+        assert d["pos"] == 64
+        assert 0.0 <= d["attn_js"] <= 1.0 + 1e-6
+        assert 0.0 <= d["attn_tv"] <= 1.0 + 1e-6
+        assert 0.0 <= d["attn_top1"] <= 1.0 + 1e-6
+        assert d["cos_k"] <= 1.0 + 1e-6 and d["out_cos"] <= 1.0 + 1e-6
+        assert d["relmse_k"] >= 0.0 and d["relmse_v"] >= 0.0
     # rw=0 quantizes ALL tokens; rw=16 keeps the last 16 exact -> rw=0 distorts more
-    assert by_rw[0][8] >= by_rw[16][8]  # relmse_k
-    assert by_rw[0][5] >= by_rw[16][5]  # attn_js
-    assert by_rw[0][6] <= by_rw[16][6]  # cos_k (lower = worse)
+    assert by_rw[0]["relmse_k"] >= by_rw[16]["relmse_k"]
+    assert by_rw[0]["attn_js"] >= by_rw[16]["attn_js"]
+    assert by_rw[0]["attn_tv"] >= by_rw[16]["attn_tv"]
+    assert by_rw[0]["cos_k"] <= by_rw[16]["cos_k"]  # lower = worse
+    assert by_rw[0]["out_cos"] <= by_rw[16]["out_cos"]  # output drifts more
+    assert by_rw[0]["attn_top1"] <= by_rw[16]["attn_top1"]  # more argmax flips
 
 
 def test_recorder_step_stride_skips_unrecorded_positions():
