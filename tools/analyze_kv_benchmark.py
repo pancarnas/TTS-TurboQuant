@@ -176,6 +176,39 @@ def _emit(lines: list[str], text: str = "") -> None:
     lines.append(text)
 
 
+def _emit_table(
+    lines: list[str],
+    headers: list[str],
+    rows: list[tuple],
+    aligns: Optional[list[str]] = None,
+) -> None:
+    """Emit a GitHub-markdown table, cells padded so it also aligns in the console.
+
+    ``aligns`` is per-column "<" (left) or ">" (right); default = first column
+    left, the rest right. Each cell is pre-formatted by the caller (this only lays
+    out the grid), so numeric precision is unchanged from the plain-text version.
+    """
+    cells = [[str(c) for c in headers]] + [[str(c) for c in r] for r in rows]
+    widths = [max(len(row[i]) for row in cells) for i in range(len(headers))]
+    aligns = aligns or (["<"] + [">"] * (len(headers) - 1))
+
+    def _fmt(row: list[str]) -> str:
+        out = [
+            c.ljust(w) if a == "<" else c.rjust(w)
+            for c, w, a in zip(row, widths, aligns)
+        ]
+        return "| " + " | ".join(out) + " |"
+
+    sep = [
+        (":" + "-" * max(1, w - 1)) if a == "<" else ("-" * max(1, w - 1) + ":")
+        for w, a in zip(widths, aligns)
+    ]
+    _emit(lines, _fmt(cells[0]))
+    _emit(lines, "| " + " | ".join(sep) + " |")
+    for row in cells[1:]:
+        _emit(lines, _fmt(row))
+
+
 def _col(df: pd.DataFrame, name: str) -> pd.Series:
     """Column ``name`` if present, else an empty float series (CSV back-compat)."""
     if name in df.columns:
@@ -210,11 +243,7 @@ def section_means(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
     for arm in sorted(df["arm"].dropna().unique()):
         _emit(lines, f"### arm: {arm}")
         sub = df[df["arm"] == arm]
-        _emit(
-            lines,
-            f"{'group':<10} {'temp':>7} {'config':<22} {'n':>4}  "
-            f"{'CER mean':>9} {'[95% CI]':>20}   {'SpkSim':>8} {'SpkSimRef':>10}",
-        )
+        rows = []
         for group in sorted(sub["group"].dropna().unique()):
             for temp in sorted(sub[sub["group"] == group]["temperature"].unique()):
                 cells = sub[(sub["group"] == group) & (sub["temperature"] == temp)]
@@ -223,14 +252,34 @@ def section_means(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
                     cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
                     sm, _, _ = bootstrap_ci(cell["spk_sim"], n_boot)
                     smr, _, _ = bootstrap_ci(_col(cell, "spk_sim_ref"), n_boot)
-                    ci = f"[{clo:.4f}, {chi:.4f}]"
                     sm_str = "---" if np.isnan(sm) else f"{sm:.4f}"
                     smr_str = "---" if np.isnan(smr) else f"{smr:.4f}"
-                    _emit(
-                        lines,
-                        f"{group:<10} {str(temp):>7} {config:<22} {len(cell):>4}  "
-                        f"{cm:>9.4f} {ci:>20}   {sm_str:>8} {smr_str:>10}",
+                    rows.append(
+                        (
+                            group,
+                            str(temp),
+                            config,
+                            len(cell),
+                            f"{cm:.4f}",
+                            f"[{clo:.4f}, {chi:.4f}]",
+                            sm_str,
+                            smr_str,
+                        )
                     )
+        _emit_table(
+            lines,
+            [
+                "group",
+                "temp",
+                "config",
+                "n",
+                "CER mean",
+                "[95% CI]",
+                "SpkSim",
+                "SpkSimRef",
+            ],
+            rows,
+        )
         _emit(lines)
 
 
@@ -279,18 +328,16 @@ def section_paired_tests(df: pd.DataFrame, lines: list[str]) -> None:
         adj = holm_correct(pvals)
 
         _emit(lines, f"### arm: {arm}  (baseline = {base})")
-        _emit(
-            lines,
-            f"{'config':<22} {'n_pairs':>7} {'median ΔCER':>12} "
-            f"{'p_raw':>9} {'p_holm':>9}  sig",
-        )
+        table = []
         for (c, n, md, p), pa in zip(rows, adj):
             md_str = "n/a" if np.isnan(md) else f"{md:+.4f}"
             p_str = "n/a" if np.isnan(p) else f"{p:.4f}"
-            _emit(
-                lines,
-                f"{c:<22} {n:>7} {md_str:>12} {p_str:>9} {pa:>9.4f}  {sig_marker(pa)}",
-            )
+            table.append((c, n, md_str, p_str, f"{pa:.4f}", sig_marker(pa)))
+        _emit_table(
+            lines,
+            ["config", "n_pairs", "median ΔCER", "p_raw", "p_holm", "sig"],
+            table,
+        )
         _emit(lines)
 
 
@@ -332,17 +379,23 @@ def section_intrinsic(kv: pd.DataFrame, lines: list[str]) -> None:
         )
         .reset_index()
     )
-    _emit(
-        lines,
-        f"{'config':<14} {'variant':<11} {'cos_k':>8} {'cos_v':>8} "
-        f"{'relmse_k':>10} {'relmse_v':>10}",
-    )
-    for _, r in g.iterrows():
-        _emit(
-            lines,
-            f"{r['config']:<14} {r['variant']:<11} {r['cos_k']:>8.4f} "
-            f"{r['cos_v']:>8.4f} {r['relmse_k']:>10.4g} {r['relmse_v']:>10.4g}",
+    rows = [
+        (
+            r["config"],
+            r["variant"],
+            f"{r['cos_k']:.4f}",
+            f"{r['cos_v']:.4f}",
+            f"{r['relmse_k']:.4g}",
+            f"{r['relmse_v']:.4g}",
         )
+        for _, r in g.iterrows()
+    ]
+    _emit_table(
+        lines,
+        ["config", "variant", "cos_k", "cos_v", "relmse_k", "relmse_v"],
+        rows,
+        aligns=["<", "<", ">", ">", ">", ">"],
+    )
     _emit(lines)
 
 
@@ -352,12 +405,12 @@ def section_arm_contrast(df: pd.DataFrame, lines: list[str]) -> None:
         return
     _emit(lines, "\n## 5. Greedy vs sampling contrast (mean CER by config)\n")
     pivot = df.pivot_table(index="config", columns="arm", values="cer", aggfunc="mean")
-    _emit(lines, f"{'config':<22} {'greedy':>9} {'sampling':>9} {'Δ(samp-greedy)':>15}")
+    rows = []
     for config, row in pivot.iterrows():
         gd = row.get("greedy", np.nan)
         sp = row.get("sampling", np.nan)
-        d = sp - gd
-        _emit(lines, f"{config:<22} {gd:>9.4f} {sp:>9.4f} {d:>15.4f}")
+        rows.append((config, f"{gd:.4f}", f"{sp:.4f}", f"{sp - gd:.4f}"))
+    _emit_table(lines, ["config", "greedy", "sampling", "Δ(samp-greedy)"], rows)
     _emit(lines, "\n  Greedy isolates compression (deterministic decode); a large")
     _emit(lines, "  sampling-minus-greedy gap is sampling noise, not compression.")
 
@@ -384,19 +437,15 @@ def section_temperature_trend(df: pd.DataFrame, n_boot: int, lines: list[str]) -
         lines, "  Higher temperature flattens sampling; compression-induced divergence"
     )
     _emit(lines, "  should grow with temperature if compression is actually applied.\n")
-    header = f"{'config':<22}" + "".join(f"{('T=' + t):>14}" for t in temps)
-    _emit(lines, header)
+    rows = []
     for config in samp["config"].unique():
-        row = f"{config:<22}"
+        cells = [config]
         for t in temps:
             cell = samp[(samp["config"] == config) & (samp["temperature"] == t)]
             cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
-            row += (
-                f"{f'{cm:.3f}[{clo:.3f},{chi:.3f}]':>14}"
-                if not np.isnan(cm)
-                else f"{'---':>14}"
-            )
-        _emit(lines, row)
+            cells.append("---" if np.isnan(cm) else f"{cm:.3f}[{clo:.3f},{chi:.3f}]")
+        rows.append(tuple(cells))
+    _emit_table(lines, ["config", *(f"T={t}" for t in temps)], rows)
 
 
 def section_length_trend(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
@@ -428,19 +477,15 @@ def section_length_trend(df: pd.DataFrame, n_boot: int, lines: list[str]) -> Non
     labels = {
         b: f"{int(edges.loc[b, 'min'])}-{int(edges.loc[b, 'max'])}tok" for b in order
     }
-    header = f"{'config':<22}" + "".join(f"{labels[b]:>20}" for b in order)
-    _emit(lines, header)
+    rows = []
     for config in work["config"].dropna().unique():
-        row = f"{config:<22}"
+        cells = [config]
         for b in order:
             cell = work[(work["config"] == config) & (work["_bucket"] == b)]
             cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
-            row += (
-                f"{f'{cm:.3f}[{clo:.3f},{chi:.3f}]':>20}"
-                if not np.isnan(cm)
-                else f"{'---':>20}"
-            )
-        _emit(lines, row)
+            cells.append("---" if np.isnan(cm) else f"{cm:.3f}[{clo:.3f},{chi:.3f}]")
+        rows.append(tuple(cells))
+    _emit_table(lines, ["config", *(labels[b] for b in order)], rows)
 
 
 _LENGTHS = ("short", "medium", "long")
@@ -492,26 +537,22 @@ def section_length_difficulty(df: pd.DataFrame, n_boot: int, lines: list[str]) -
     _emit(lines, "\n## 8. Length × difficulty grid (CER)\n")
     _emit(lines, "  Headline: CER vs length per config (difficulty pooled) — the")
     _emit(lines, "  degradation curve. Gap to baseline should widen short→long.\n")
-    header = f"{'config':<22}" + "".join(f"{le:>20}" for le in lengths)
-    _emit(lines, header)
+    curve = []
     for config in configs:
-        row = f"{config:<22}"
+        cells = [config]
         for le in lengths:
             cell = grid[(grid["config"] == config) & (grid["length"] == le)]
             cm, clo, chi = bootstrap_ci(cell["cer"], n_boot)
-            row += (
-                f"{f'{cm:.3f}[{clo:.3f},{chi:.3f}]':>20}"
-                if not np.isnan(cm)
-                else f"{'---':>20}"
-            )
-        _emit(lines, row)
+            cells.append("---" if np.isnan(cm) else f"{cm:.3f}[{clo:.3f},{chi:.3f}]")
+        curve.append(tuple(cells))
+    _emit_table(lines, ["config", *lengths], curve)
 
     _emit(lines, "\n  Per-config CER by length (rows) × difficulty (cols):")
     for config in configs:
         _emit(lines, f"\n### {config}")
-        _emit(lines, f"{'length':<8}" + "".join(f"{d:>10}" for d in diffs))
+        rows = []
         for le in lengths:
-            row = f"{le:<8}"
+            cells = [le]
             for d in diffs:
                 cell = grid[
                     (grid["config"] == config)
@@ -519,8 +560,9 @@ def section_length_difficulty(df: pd.DataFrame, n_boot: int, lines: list[str]) -
                     & (grid["difficulty"] == d)
                 ]
                 cm, _, _ = bootstrap_ci(cell["cer"], n_boot)
-                row += f"{'---':>10}" if np.isnan(cm) else f"{cm:>10.3f}"
-            _emit(lines, row)
+                cells.append("---" if np.isnan(cm) else f"{cm:.3f}")
+            rows.append(tuple(cells))
+        _emit_table(lines, ["length", *diffs], rows)
 
 
 def section_clean_subset(df: pd.DataFrame, n_boot: int, lines: list[str]) -> None:
@@ -541,7 +583,7 @@ def section_clean_subset(df: pd.DataFrame, n_boot: int, lines: list[str]) -> Non
     )
     n_all = df["sentence_hash"].nunique() if "sentence_hash" in df else len(df)
     _emit(lines, f"  clean refs: {n_clean} sentences (of {n_all}).\n")
-    _emit(lines, f"{'config':<22} {'SpkSimRef(all)':>16} {'SpkSimRef(clean)':>18}")
+    rows = []
     for config in df["config"].dropna().unique():
         a, _, _ = bootstrap_ci(_col(df[df["config"] == config], "spk_sim_ref"), n_boot)
         c, _, _ = bootstrap_ci(
@@ -549,7 +591,8 @@ def section_clean_subset(df: pd.DataFrame, n_boot: int, lines: list[str]) -> Non
         )
         a_str = "---" if np.isnan(a) else f"{a:.4f}"
         c_str = "---" if np.isnan(c) else f"{c:.4f}"
-        _emit(lines, f"{config:<22} {a_str:>16} {c_str:>18}")
+        rows.append((config, a_str, c_str))
+    _emit_table(lines, ["config", "SpkSimRef(all)", "SpkSimRef(clean)"], rows)
 
 
 _LENGTH_EDGES = [(0, 128), (128, 512), (512, 1024), (1024, 2048), (2048, None)]
@@ -590,19 +633,15 @@ def section_length_sweep_fixed(df: pd.DataFrame, n_boot: int, lines: list[str]) 
         if metric not in work.columns:
             continue
         _emit(lines, f"### {title}")
-        header = f"{'config':<22}" + "".join(f"{_bucket_label(b):>20}" for b in buckets)
-        _emit(lines, header)
+        rows = []
         for config in work["config"].dropna().unique():
-            row = f"{config:<22}"
+            cells = [config]
             for b in buckets:
                 cell = work[(work["config"] == config) & (work["_b"] == b)]
                 m, lo, hi = bootstrap_ci(cell[metric], n_boot)
-                row += (
-                    f"{f'{m:.3f}[{lo:.3f},{hi:.3f}]':>20}"
-                    if not np.isnan(m)
-                    else f"{'---':>20}"
-                )
-            _emit(lines, row)
+                cells.append("---" if np.isnan(m) else f"{m:.3f}[{lo:.3f},{hi:.3f}]")
+            rows.append(tuple(cells))
+        _emit_table(lines, ["config", *(_bucket_label(b) for b in buckets)], rows)
         _emit(lines)
 
 
@@ -643,10 +682,7 @@ def section_windowed(windowed_glob: Optional[str], lines: list[str]) -> None:
     )
     _emit(lines, "  First window where a config peels from baseline: SpkSim drop")
     _emit(lines, "  > 0.10 or CER rise > 0.20. '~t' is that window's mean start (s).\n")
-    _emit(
-        lines,
-        f"{'config':<22} {'SIM onset':>10} {'~t(s)':>7} {'CER onset':>10} {'~t(s)':>7}",
-    )
+    onset_rows = []
     for cfg in configs:
         if cfg == base:
             continue
@@ -668,7 +704,12 @@ def section_windowed(windowed_glob: Optional[str], lines: list[str]) -> None:
 
         s_on, s_t = _fmt(sim_on)
         c_on, c_t = _fmt(cer_on)
-        _emit(lines, f"{cfg:<22} {s_on:>10} {s_t:>7} {c_on:>10} {c_t:>7}")
+        onset_rows.append((cfg, s_on, s_t, c_on, c_t))
+    _emit_table(
+        lines,
+        ["config", "SIM onset", "~t(s)", "CER onset", "~t(s)"],
+        onset_rows,
+    )
 
     # SpkSim(t) & CER(t) vs ABSOLUTE TIME, binned across the whole duration so the
     # decline over audio length is visible regardless of how many windows each clip
@@ -688,17 +729,16 @@ def section_windowed(windowed_glob: Optional[str], lines: list[str]) -> None:
         if not present:
             continue
         _emit(lines, f"\n  {title} vs audio time (mean over items), bins in seconds:")
-        _emit(
-            lines, f"{'config':<22}" + "".join(f"{centers[b]:>6.0f}s" for b in present)
-        )
+        rows = []
         for cfg in configs:
             if cfg not in piv.columns:
                 continue
-            row = f"{cfg:<22}"
+            cells = [cfg]
             for b in present:
                 v = piv.loc[b, cfg] if b in piv.index else float("nan")
-                row += ("   ---" if (v != v) else f"{v:>6.2f}") + " "
-            _emit(lines, row.rstrip())
+                cells.append("---" if (v != v) else f"{v:.2f}")
+            rows.append(tuple(cells))
+        _emit_table(lines, ["config", *(f"{centers[b]:.0f}s" for b in present)], rows)
 
 
 # ---------------------------------------------------------------------------
