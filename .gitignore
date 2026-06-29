@@ -61,6 +61,12 @@ data/
 analysis26june/
 results_new/
 
+# Result folders pulled off remote boxes for local analysis (raw run + audio).
+rw24t09/
+
+# One-off / scratch tool scripts (underscore-prefixed; experiment-specific).
+tools/_*.py
+
 # Attention maps
 attentionMap/
 
