@@ -210,10 +210,20 @@ def make_patch(original, recorder: DivergenceRecorder):
 
 
 def force_eager(model) -> None:
-    for m in model.modules():
-        cfg = getattr(m, "config", None)
-        if cfg is not None and hasattr(cfg, "_attn_implementation"):
-            cfg._attn_implementation = "eager"
+    """Set every attention config to eager so the patched path is used.
+
+    ``Qwen3TTSModel`` is a wrapper, not an ``nn.Module`` — the talker lives at
+    ``model.model`` — so walk the real sub-modules rather than ``model`` itself.
+    """
+    candidates = [model, getattr(model, "model", None)]
+    candidates += [v for v in vars(model).values() if isinstance(v, torch.nn.Module)]
+    for mod in candidates:
+        if not isinstance(mod, torch.nn.Module):
+            continue
+        for m in mod.modules():
+            cfg = getattr(m, "config", None)
+            if cfg is not None and hasattr(cfg, "_attn_implementation"):
+                cfg._attn_implementation = "eager"
 
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:

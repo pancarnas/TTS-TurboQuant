@@ -122,6 +122,29 @@ def test_output_cosine():
     assert abs(oc(v, -v) + 1.0) < 1e-6  # opposite -> -1
 
 
+def test_force_eager_walks_wrapped_model():
+    # Qwen3TTSModel is a plain wrapper (no .modules()); the talker is at .model.
+    force_eager = _single_func("force_eager", {"torch": torch})
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+    class Talker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+
+    class Wrapper:  # NOT an nn.Module, like Qwen3TTSModel
+        def __init__(self):
+            self.model = Talker()
+
+    w = Wrapper()
+    force_eager(w)  # must not raise, and must reach the nested attention config
+    assert w.model.attn.config._attn_implementation == "eager"
+
+
 def test_summarize_diff_row_and_order():
     summarize = _single_func("summarize", {"pd": pd})
     df = pd.DataFrame(
