@@ -1,15 +1,20 @@
-"""GPU-free tests for kv_attn_divergence_experiment pure functions.
+"""Tests for kv_attn_divergence_experiment.
 
-js_divergence (torch) and summarize (pandas) are exec-extracted from the source so
-the heavy model imports (qwen_tts, Qwen3TTSModel) are never triggered.
+The pure helpers (js_divergence, summarize) and the measurement core
+(compressed_attention, DivergenceRecorder, make_patch) are exec-extracted from the
+source with their dependencies injected, so the heavy model imports (qwen_tts,
+Qwen3TTSModel) are never triggered and everything runs on CPU.
 """
 
 from __future__ import annotations
 
 import os
+import types
 
 import pandas as pd
 import torch
+
+from turboquant.compressors_v3 import TurboQuantV3
 
 _PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -18,44 +23,77 @@ _PATH = os.path.join(
     "benchmarks",
     "kv_attn_divergence_experiment.py",
 )
+_SRC = open(_PATH, encoding="utf-8").read()
 
 
-def _extract(func_name: str, namespace: dict):
-    src = open(_PATH, encoding="utf-8").read()
-    start = src.index(f"def {func_name}(")
-    end = src.index("\ndef ", start + 1)
-    exec(compile(src[start:end], _PATH, "exec"), namespace)
-    return namespace[func_name]
+def _repeat_kv(hidden_states, n_rep):
+    b, nkv, slen, hd = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hs = hidden_states[:, :, None, :, :].expand(b, nkv, n_rep, slen, hd)
+    return hs.reshape(b, nkv * n_rep, slen, hd)
+
+
+def _kv_recon_errors(orig, recon, head_dim):
+    a = orig.reshape(-1, head_dim).float()
+    b = recon.reshape(-1, head_dim).float()
+    cos = torch.nn.functional.cosine_similarity(a, b, dim=-1).mean().item()
+    relmse = (((a - b) ** 2).sum() / (a**2).sum().clamp_min(1e-12)).item()
+    return cos, relmse
+
+
+def _block():
+    """Exec js_divergence..make_patch with deps injected; return the namespace."""
+    start = _SRC.index("def js_divergence(")
+    end = _SRC.index("\ndef force_eager(")
+    ns = {
+        "torch": torch,
+        "modeling": types.SimpleNamespace(repeat_kv=_repeat_kv),
+        "TurboQuantV3": TurboQuantV3,
+        "_kv_recon_errors": _kv_recon_errors,
+    }
+    exec(compile(_SRC[start:end], _PATH, "exec"), ns)
+    return ns
+
+
+def _single_func(name, ns_extra):
+    start = _SRC.index(f"def {name}(")
+    end = _SRC.index("\ndef ", start + 1)
+    ns = dict(ns_extra)
+    exec(compile(_SRC[start:end], _PATH, "exec"), ns)
+    return ns[name]
+
+
+# --- pure helpers ---------------------------------------------------------
 
 
 def test_js_divergence_identical_is_zero():
-    js = _extract("js_divergence", {"torch": torch})
+    js = _single_func("js_divergence", {"torch": torch})
     p = torch.tensor([[0.2, 0.3, 0.5]])
     assert js(p, p.clone()) < 1e-6
 
 
 def test_js_divergence_disjoint_is_one():
-    js = _extract("js_divergence", {"torch": torch})
+    js = _single_func("js_divergence", {"torch": torch})
     p = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     q = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
-    assert abs(js(p, q) - 1.0) < 1e-3  # base-2 JS of disjoint dists -> 1
+    assert abs(js(p, q) - 1.0) < 1e-3
 
 
 def test_js_divergence_symmetric_and_bounded():
-    js = _extract("js_divergence", {"torch": torch})
+    js = _single_func("js_divergence", {"torch": torch})
     p = torch.tensor([[0.7, 0.2, 0.1]])
     q = torch.tensor([[0.1, 0.3, 0.6]])
-    a, b = js(p, q), js(q, p)
-    assert abs(a - b) < 1e-6
-    assert 0.0 <= a <= 1.0
+    assert abs(js(p, q) - js(q, p)) < 1e-6
+    assert 0.0 <= js(p, q) <= 1.0
 
 
-def test_summarize_adds_diff_row_high_to_low():
-    summarize = _extract("summarize", {"pd": pd})
+def test_summarize_diff_row_and_order():
+    summarize = _single_func("summarize", {"pd": pd})
     df = pd.DataFrame(
         {
             "rw": [24, 24, 0, 0],
-            "attn_js": [0.01, 0.03, 0.20, 0.30],  # rw24 mean .02, rw0 mean .25
+            "attn_js": [0.01, 0.03, 0.20, 0.30],
             "cos_k": [0.99, 0.99, 0.90, 0.90],
             "cos_v": [0.99, 0.99, 0.92, 0.92],
             "relmse_k": [0.01, 0.01, 0.10, 0.10],
@@ -63,24 +101,123 @@ def test_summarize_adds_diff_row_high_to_low():
         }
     )
     out = summarize(df)
-    assert list(out.index)[:2] == [24, 0]  # high -> low
+    assert list(out.index)[:2] == [24, 0]
     assert abs(out.loc[24, "attn_js"] - 0.02) < 1e-9
     assert abs(out.loc[0, "attn_js"] - 0.25) < 1e-9
-    # rw0 moves attention more -> positive diff
-    assert abs(out.loc["diff(0-24)", "attn_js"] - (0.25 - 0.02)) < 1e-9
+    assert abs(out.loc["diff(0-24)", "attn_js"] - 0.23) < 1e-9
 
 
-def test_summarize_no_diff_single_window():
-    summarize = _extract("summarize", {"pd": pd})
-    df = pd.DataFrame(
-        {
-            "rw": [24],
-            "attn_js": [0.02],
-            "cos_k": [0.99],
-            "cos_v": [0.99],
-            "relmse_k": [0.01],
-            "relmse_v": [0.01],
-        }
+# --- measurement core (CPU, real TurboQuantV3) ----------------------------
+
+
+def _attn_inputs(seq, head_dim=64, nkv=2, groups=2):
+    torch.manual_seed(0)
+    q = torch.randn(1, nkv * groups, 1, head_dim)
+    key = torch.randn(1, nkv, seq, head_dim)
+    value = torch.randn(1, nkv, seq, head_dim)
+    return q, key, value, head_dim, groups
+
+
+def _module(groups, layer_idx=0):
+    return types.SimpleNamespace(layer_idx=layer_idx, num_key_value_groups=groups)
+
+
+def test_compressed_attention_is_a_distribution():
+    ns = _block()
+    q, key, _, hd, groups = _attn_inputs(32)
+    aw = ns["compressed_attention"](q, key, groups, None, hd**-0.5)
+    assert aw.shape == (1, nkv_x_groups := groups * 2, 1, 32)
+    assert torch.allclose(aw.sum(-1), torch.ones_like(aw.sum(-1)), atol=1e-4)
+
+
+def test_recorder_logs_one_row_per_rw_with_sane_values():
+    ns = _block()
+    q, key, value, hd, groups = _attn_inputs(64)
+    scaling = hd**-0.5
+    rec = ns["DivergenceRecorder"](
+        rws=[16, 0], kb=4, vb=4, n_layers=4, prot_layers=0, prot_bits=8, stride=1
     )
-    out = summarize(df)
-    assert list(out.index) == [24]
+    rec.group, rec.idx = "g", 0
+    af = ns["compressed_attention"](q, key, groups, None, scaling)  # fp16 attention
+    rec.record(_module(groups), q, key, value, None, scaling, af)
+
+    assert rec.errors == 0
+    assert len(rec.rows) == 2  # one per rw
+    by_rw = {r[4]: r for r in rec.rows}  # rw is column index 4
+    for r in rec.rows:
+        _, _, _, pos, rw, js, cos_k, cos_v, rmk, rmv = r
+        assert pos == 64
+        assert 0.0 <= js <= 1.0 + 1e-6
+        assert cos_k <= 1.0 + 1e-6 and cos_v <= 1.0 + 1e-6
+        assert rmk >= 0.0 and rmv >= 0.0
+    # rw=0 quantizes ALL tokens; rw=16 keeps the last 16 exact -> rw=0 distorts more
+    assert by_rw[0][8] >= by_rw[16][8]  # relmse_k
+    assert by_rw[0][5] >= by_rw[16][5]  # attn_js
+    assert by_rw[0][6] <= by_rw[16][6]  # cos_k (lower = worse)
+
+
+def test_recorder_step_stride_skips_unrecorded_positions():
+    ns = _block()
+    rec = ns["DivergenceRecorder"](
+        rws=[0], kb=4, vb=4, n_layers=4, prot_layers=0, prot_bits=8, stride=4
+    )
+    rec.group, rec.idx = "g", 0
+    scaling = 64**-0.5
+    # seq=63 -> pos 63 not divisible by 4 -> skipped
+    q, key, value, hd, groups = _attn_inputs(63)
+    af = ns["compressed_attention"](q, key, groups, None, scaling)
+    rec.record(_module(groups), q, key, value, None, scaling, af)
+    assert rec.rows == []
+    # seq=64 -> pos 64 divisible by 4 -> recorded
+    q, key, value, hd, groups = _attn_inputs(64)
+    af = ns["compressed_attention"](q, key, groups, None, scaling)
+    rec.record(_module(groups), q, key, value, None, scaling, af)
+    assert len(rec.rows) == 1
+
+
+def test_recorder_reuses_compressors_across_calls():
+    ns = _block()
+    rec = ns["DivergenceRecorder"](
+        rws=[16, 0], kb=4, vb=4, n_layers=4, prot_layers=0, prot_bits=8, stride=1
+    )
+    rec.group, rec.idx = "g", 0
+    scaling = 64**-0.5
+    for _ in range(3):
+        q, key, value, hd, groups = _attn_inputs(64)
+        af = ns["compressed_attention"](q, key, groups, None, scaling)
+        rec.record(_module(groups), q, key, value, None, scaling, af)
+    assert len(rec._cache) == 2  # one TurboQuantV3 per (layer, rw), reused
+
+
+def test_make_patch_records_only_when_active_and_counts_errors():
+    ns = _block()
+
+    class _Rec:
+        def __init__(self):
+            self.active = False
+            self.errors = 0
+            self.calls = 0
+
+        def record(self, *a):
+            self.calls += 1
+            if self.boom:
+                raise RuntimeError("boom")
+
+        boom = False
+
+    def original(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
+        return "OUT", "ATTN"
+
+    rec = _Rec()
+    patched = ns["make_patch"](original, rec)
+    # inactive: passes through, no record
+    assert patched(None, 1, 2, 3, None, 1.0) == ("OUT", "ATTN")
+    assert rec.calls == 0
+    # active: records
+    rec.active = True
+    patched(None, 1, 2, 3, None, 1.0)
+    assert rec.calls == 1 and rec.errors == 0
+    # record raises -> error counted, output still returned
+    rec.boom = True
+    assert patched(None, 1, 2, 3, None, 1.0) == ("OUT", "ATTN")
+    assert rec.errors == 1
