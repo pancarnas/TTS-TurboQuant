@@ -1,4 +1,4 @@
-.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda fetch-eval-data validate-eval run run-vallex smoke-vallex profile-vallex profile-vallex-full smoke-qwen profile-qwen profile-qwen-full evaluate evaluate-vallex eval-qwen eval-vallex eval-qwen-parallel eval-vallex-parallel eval-smoke analyze test clean
+.PHONY: install install-qwen install-vallex install-vallex-all install-all install-metrics install-sox install-cuda fetch-eval-data validate-eval run run-vallex smoke-vallex profile-vallex profile-vallex-full smoke-qwen profile-qwen profile-qwen-full evaluate evaluate-vallex eval-qwen eval-vallex eval-qwen-parallel eval-vallex-parallel eval-smoke analyze test clean eddie-setup eddie-submit
 
 # Compression-evaluation tunables (see the eval-* targets below).
 SEEDS ?= 0,1,2,3,4
@@ -234,6 +234,22 @@ analyze:
 
 test:
 	python -m pytest models/Qwen3-TTS/tests/ -v
+
+# --- Eddie (ECDF / Grid Engine) ---
+# Submit jobs to the Eddie cluster using the shared conda env. See docs/EDDIE.md.
+# Runtime/name overrides for eddie-submit (qsub flags override the #$ defaults):
+EDDIE_RT ?= 6:00:00
+EDDIE_NAME ?= tq_run
+
+# One-time setup on a login node (installs missing deps into a repo-local user-site).
+eddie-setup:
+	bash scripts/eddie/setup_eddie.sh
+
+# Submit any command as a single 1-GPU job, e.g.
+#   make eddie-submit CMD="make eval-qwen DEVICE=cuda" EDDIE_NAME=qwen_eval EDDIE_RT=8:00:00
+eddie-submit:
+	@test -n "$(CMD)" || { echo "ERROR: set CMD=\"...\" (e.g. CMD=\"make eval-qwen DEVICE=cuda\")"; exit 1; }
+	qsub -N $(EDDIE_NAME) -l h_rt=$(EDDIE_RT) scripts/eddie/eddie_run.sh $(CMD)
 
 # --- Cleanup ---
 

@@ -107,6 +107,9 @@ make profile-vallex   # torch.profiler on VALL-E-X (Perfetto traces)
 make profile-qwen     # torch.profiler on Qwen3-TTS
 ```
 
+Running on the Eddie cluster (Grid Engine + shared conda env): see
+[`docs/EDDIE.md`](docs/EDDIE.md).
+
 ### Individual install targets (if you only want part of the stack)
 
 ```bash
