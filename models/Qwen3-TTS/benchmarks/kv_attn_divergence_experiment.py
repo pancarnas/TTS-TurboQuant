@@ -113,9 +113,16 @@ def compressed_attention(query, rk, num_kv_groups, attention_mask, scaling):
 
 
 def k4v4_config(rw: int):
-    """The exact K4/V4 config (incl. protected-layer settings) at a residual window."""
+    """K4/V4 config at a residual window, with REAL on-path compression.
+
+    ``build_turboquant_configs`` leaves ``track_only`` at its default (True), which
+    makes the attention layer read pristine fp16 KV — so generation IGNORES
+    compression and every config (and every rw) yields byte-identical audio. Force
+    ``track_only=False`` so the saved audio actually reflects K4/V4 at this window.
+    """
     for name, cfg in build_turboquant_configs(rw):
         if cfg is not None and cfg.key_bits == 4 and cfg.value_bits == 4:
+            cfg.track_only = False
             return name, cfg
     raise SystemExit("no K4/V4 config in build_turboquant_configs")
 

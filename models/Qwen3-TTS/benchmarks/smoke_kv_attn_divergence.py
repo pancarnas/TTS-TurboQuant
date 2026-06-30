@@ -81,6 +81,14 @@ def main() -> None:
 
     print("\n=== smoke checks ===")
     results: list[bool] = []
+    # real compression: track_only must be False or the audio ignores compression
+    # (every config -> identical audio). Deterministic guard against that bug.
+    _, _cfg = exp.k4v4_config(24)
+    _check(
+        results,
+        "audio uses REAL compression (track_only=False)",
+        getattr(_cfg, "track_only", True) is False,
+    )
     _check(results, "patch fired (rows recorded)", len(df) > 0, f"{len(df)} rows")
     _check(results, "no measurement errors", rec.errors == 0, f"errors={rec.errors}")
     present = set(df["rw"].unique()) if len(df) else set()
