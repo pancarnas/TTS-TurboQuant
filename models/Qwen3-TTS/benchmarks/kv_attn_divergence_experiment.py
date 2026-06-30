@@ -265,7 +265,9 @@ def run_experiment(model, speaker, recorder, args) -> pd.DataFrame:
         tqdm = None
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     rws = recorder.rws
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    out_dir = getattr(args, "audio_out_dir", None) or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "outputs"
+    )
     os.makedirs(out_dir, exist_ok=True)
     items = [
         (g, i, it)
@@ -301,6 +303,8 @@ def run_experiment(model, speaker, recorder, args) -> pd.DataFrame:
                 wavs[0],
                 sr,
             )
+        if getattr(args, "no_divergence", False):
+            continue  # audio-only mode: skip the expensive fp16 recording pass
         recorder.group, recorder.idx = group, idx  # fp16 pass (recorder on)
         recorder.active = True
         set_global_seed(args.seed, deterministic=False)
@@ -338,6 +342,17 @@ def main() -> None:
     parser.add_argument("--voice-mode", default="clone")
     parser.add_argument("--default-ref", default=None)
     parser.add_argument("--out", default="results/kv_attn_k4v4_rw24_vs_rw0.csv")
+    parser.add_argument(
+        "--no-divergence",
+        action="store_true",
+        help="Audio-only: generate the compressed wavs, skip the fp16 recording pass.",
+    )
+    parser.add_argument(
+        "--audio-out-dir",
+        default=None,
+        help="Directory for the wavs (default: benchmarks/outputs). Use a separate "
+        "dir to run in parallel with another job without filename collisions.",
+    )
     args = parser.parse_args()
 
     dtype = {
@@ -349,7 +364,6 @@ def main() -> None:
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=args.device, dtype=dtype
     )
-    force_eager(model)
     speakers = model.get_supported_speakers()
     speaker = speakers[0] if speakers else "Ryan"
 
@@ -366,6 +380,13 @@ def main() -> None:
         args.step_stride,
     )
 
+    if args.no_divergence:  # audio-only: no eager-forcing, no patch, no recording
+        print("audio-only mode (--no-divergence): generating compressed wavs only")
+        run_experiment(model, speaker, recorder, args)
+        print("\ndone — wavs in models/Qwen3-TTS/benchmarks/outputs/")
+        return
+
+    force_eager(model)
     original = modeling.eager_attention_forward
     modeling.eager_attention_forward = make_patch(original, recorder)
     try:
