@@ -1,25 +1,26 @@
-"""KV + attention-map divergence experiment: K4/V4 at residual_window 24 vs 0.
+"""KV + attention-map divergence experiment across a set of (bits, rw) configs.
 
 Phase 1 (counterfactual, deterministic). Per sentence it (1) generates and saves
-the compressed audio under K4/V4 at each residual window, and (2) runs ONE fp16
-pass during which it measures, per layer/decode-position, how much compression
+the compressed audio under each requested config, and (2) runs ONE fp16 pass
+during which it measures, per layer/decode-position/config, how much compression
 moves the talker's attention map and KV vectors:
 
   * attention: Jensen-Shannon divergence between softmax(q.Kfp16) and
     softmax(q.Kcompressed) on the SAME fp16 query (base-2, bounded [0, 1]);
+    plus total-variation, top-1 agreement, entropy delta, attention-output cosine;
   * KV: per-vector cosine + relative MSE of compressed-vs-fp16 keys/values.
 
-No Whisper/ASR and no WavLM — run the whisper pipeline separately on the saved
-wavs. The fp16 trajectory (where divergence is measured) is consistent with but
-not identical to the compressed trajectory that produced the audio; Phase 2
-(on-path dual-cache) closes that gap.
+Configs are given as ``--configs "K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0"``
+(K<key_bits>V<value_bits>@<residual_window>). No Whisper/ASR, no WavLM — run the
+whisper pipeline separately on the saved wavs. Divergence rows STREAM to the CSV
+per sentence (bounded RAM, crash-safe at sentence granularity).
 
 Run from the repo root (same env as the benchmark; GPU recommended):
   python models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py \
       --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --data-dir data \
       --groups seedtts_en,librispeech_pc,libritts_long,ellav_hard \
-      --max-per-group 100 --residual-windows 24,0 --step-stride 4 \
-      --out results/kv_attn_k4v4_rw24_vs_rw0.csv
+      --max-per-group 100 --configs "K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0" \
+      --step-stride 1 --out results/kv_attn.csv
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 
 import pandas as pd
@@ -41,12 +43,12 @@ from benchmark_qwen3tts_real import (  # noqa: E402 - needs sys.path tweak above
     Qwen3TTSModel,
     _kv_recon_errors,
     _resolve_voice,
-    build_turboquant_configs,
     run_generation,
 )
 
 from turboquant.bench_common import decode_overrides, set_global_seed  # noqa: E402
 from turboquant.compressors_v3 import TurboQuantV3  # noqa: E402
+from turboquant.config import TurboQuantConfig  # noqa: E402
 from turboquant.eval_sentences import iter_eval_items  # noqa: E402
 
 COLUMNS = [
@@ -54,6 +56,8 @@ COLUMNS = [
     "idx",
     "layer",
     "pos",
+    "key_bits",
+    "value_bits",
     "rw",
     "attn_js",
     "attn_tv",
@@ -65,6 +69,38 @@ COLUMNS = [
     "relmse_k",
     "relmse_v",
 ]
+_METRICS = COLUMNS[7:]
+
+_CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
+
+
+def parse_configs(spec: str) -> list[tuple[int, int, int]]:
+    """'K4V4@24,K4V4@0' -> [(4,4,24), (4,4,0)]  (key_bits, value_bits, rw)."""
+    out = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = _CFG_RE.match(tok)
+        if not m:
+            raise SystemExit(f"bad config {tok!r}; expected e.g. K4V4@24")
+        out.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+    return out
+
+
+def config_label(kb: int, vb: int, rw: int) -> str:
+    return f"K{kb}V{vb}@{rw}"
+
+
+def make_config(kb: int, vb: int, rw: int) -> TurboQuantConfig:
+    """A config with REAL on-path compression (track_only=False).
+
+    Default track_only=True makes attention read pristine fp16 KV — generation
+    then ignores compression and every config yields identical audio. Force False.
+    """
+    return TurboQuantConfig(
+        key_bits=kb, value_bits=vb, residual_window=rw, track_only=False
+    )
 
 
 def js_divergence(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> float:
@@ -113,26 +149,11 @@ def compressed_attention(query, rk, num_kv_groups, attention_mask, scaling):
     return torch.nn.functional.softmax(aw, dim=-1, dtype=torch.float32)
 
 
-def k4v4_config(rw: int):
-    """K4/V4 config at a residual window, with REAL on-path compression.
-
-    ``build_turboquant_configs`` leaves ``track_only`` at its default (True), which
-    makes the attention layer read pristine fp16 KV — so generation IGNORES
-    compression and every config (and every rw) yields byte-identical audio. Force
-    ``track_only=False`` so the saved audio actually reflects K4/V4 at this window.
-    """
-    for name, cfg in build_turboquant_configs(rw):
-        if cfg is not None and cfg.key_bits == 4 and cfg.value_bits == 4:
-            cfg.track_only = False
-            return name, cfg
-    raise SystemExit("no K4/V4 config in build_turboquant_configs")
-
-
 class DivergenceRecorder:
-    """Accumulates per-(layer, pos, rw) attention-JS + KV errors during an fp16 pass."""
+    """Per-(layer, pos, config) attention + KV divergence during one fp16 pass."""
 
-    def __init__(self, rws, kb, vb, n_layers, prot_layers, prot_bits, stride):
-        self.rws, self.kb, self.vb = rws, kb, vb
+    def __init__(self, specs, n_layers, prot_layers, prot_bits, stride):
+        self.specs = specs  # list of (key_bits, value_bits, rw)
         self.n_layers, self.pl, self.pb, self.stride = (
             n_layers,
             prot_layers,
@@ -145,13 +166,13 @@ class DivergenceRecorder:
         self.group = self.idx = None
         self._cache: dict = {}
 
-    def _comp(self, layer, rw, head_dim, device):
-        key = (layer, rw)
+    def _comp(self, layer, kb, vb, rw, head_dim, device):
+        key = (layer, kb, vb, rw)
         if key not in self._cache:
             self._cache[key] = TurboQuantV3(
                 head_dim=head_dim,
-                key_bits=self.kb,
-                value_bits=self.vb,
+                key_bits=kb,
+                value_bits=vb,
                 residual_window=rw,
                 layer_idx=layer,
                 n_layers=self.n_layers,
@@ -168,14 +189,12 @@ class DivergenceRecorder:
             return
         head_dim = key.shape[-1]
         af = attn_fp16.float()
-        for rw in self.rws:
-            comp = self._comp(module.layer_idx, rw, head_dim, key.device)
+        groups = module.num_key_value_groups
+        for kb, vb, rw in self.specs:
+            comp = self._comp(module.layer_idx, kb, vb, rw, head_dim, key.device)
             ck, cv = comp.compress_kv(key, value)
             rk, rv = comp.decompress_kv(ck, cv)
-            ac = compressed_attention(
-                query, rk, module.num_key_value_groups, attention_mask, scaling
-            )
-            groups = module.num_key_value_groups
+            ac = compressed_attention(query, rk, groups, attention_mask, scaling)
             o_fp16 = torch.matmul(af, modeling.repeat_kv(value, groups).float())
             o_comp = torch.matmul(ac, modeling.repeat_kv(rv, groups).float())
             cos_k, relmse_k = _kv_recon_errors(key, rk, head_dim)
@@ -186,6 +205,8 @@ class DivergenceRecorder:
                     self.idx,
                     module.layer_idx,
                     pos,
+                    kb,
+                    vb,
                     rw,
                     js_divergence(af, ac),
                     total_variation(af, ac),
@@ -234,71 +255,58 @@ def force_eager(model) -> None:
                 cfg._attn_implementation = "eager"
 
 
-def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [
-        "attn_js",
-        "attn_tv",
-        "attn_top1",
-        "attn_dentropy",
-        "out_cos",
-        "cos_k",
-        "cos_v",
-        "relmse_k",
-        "relmse_v",
-    ]
-    agg = df.groupby("rw")[cols].mean().sort_index(ascending=False)
-    if 0 in agg.index and len(agg.index) > 1:
-        other = max(w for w in agg.index if w != 0)
-        agg.loc[f"diff(0-{other})"] = agg.loc[0] - agg.loc[other]
-    return agg
-
-
-def _wav_path(out_dir, group, idx, seed, temp, rw):
-    return os.path.join(
-        out_dir, f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_K4_V4_rw={rw}.wav"
-    )
-
-
-_METRICS = COLUMNS[5:]  # attn_js, attn_tv, ... relmse_v
-
-
 def accumulate_running(running: dict, rows: list) -> None:
-    """Fold streamed rows into per-rw running sums (bounded memory, no full retain)."""
+    """Fold streamed rows into per-config running sums (bounded memory)."""
     for r in rows:
-        rw = r[4]
-        d = running.setdefault(rw, dict({"_n": 0}, **{m: 0.0 for m in _METRICS}))
+        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw)
+        d = running.setdefault(cfg, dict({"_n": 0}, **{m: 0.0 for m in _METRICS}))
         d["_n"] += 1
-        for m, v in zip(_METRICS, r[5:]):
+        for m, v in zip(_METRICS, r[7:]):
             d[m] += float(v)
 
 
 def running_frame(running: dict) -> pd.DataFrame:
-    """Per-rw means from running sums + a diff(0-N) row (mirrors summarize)."""
+    """Per-config means + Δ(0-24) rows for any bits present at both rw 0 and 24."""
     means = {
-        rw: {m: d[m] / d["_n"] for m in _METRICS}
-        for rw, d in running.items()
+        config_label(*cfg): {m: d[m] / d["_n"] for m in _METRICS}
+        for cfg, d in running.items()
         if d["_n"]
     }
-    agg = pd.DataFrame(means).T.sort_index(ascending=False)
-    if 0 in agg.index and len(agg.index) > 1:
-        other = max(w for w in agg.index if w != 0)
-        agg.loc[f"diff(0-{other})"] = agg.loc[0] - agg.loc[other]
+    agg = pd.DataFrame(means).T.sort_index()
+    bits_rws: dict = {}
+    for kb, vb, rw in running:
+        bits_rws.setdefault((kb, vb), set()).add(rw)
+    for (kb, vb), rws in bits_rws.items():
+        if {0, 24} <= rws:
+            lo, hi = config_label(kb, vb, 0), config_label(kb, vb, 24)
+            agg.loc[f"K{kb}V{vb} d(0-24)"] = agg.loc[lo] - agg.loc[hi]
     return agg
+
+
+def summarize(df: pd.DataFrame) -> pd.DataFrame:
+    """Offline: per-config means from a streamed CSV."""
+    return df.groupby(["key_bits", "value_bits", "rw"])[_METRICS].mean().sort_index()
+
+
+def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw):
+    return os.path.join(
+        out_dir,
+        f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_K{kb}_V{vb}_rw={rw}.wav",
+    )
 
 
 def run_experiment(model, speaker, recorder, args) -> dict:
     """Generate audio + (unless --no-divergence) stream divergence rows to args.out.
 
     Rows are written and freed per sentence (bounded RAM, crash-safe at sentence
-    granularity) rather than accumulated for one giant end-of-run write. Returns
-    the per-rw running aggregate for the summary.
+    granularity). Returns the per-config running aggregate for the summary.
     """
     try:
         from tqdm import tqdm
     except ImportError:
         tqdm = None
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
-    rws = recorder.rws
+    specs = recorder.specs
     out_dir = getattr(args, "audio_out_dir", None) or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "outputs"
     )
@@ -326,16 +334,15 @@ def run_experiment(model, speaker, recorder, args) -> dict:
             )
             if args.voice_mode == "clone" and not ref_audio:
                 continue
-            for rw in rws:  # compressed audio (recorder off)
+            for kb, vb, rw in specs:  # compressed audio (recorder off)
                 recorder.active = False
-                _, cfg = k4v4_config(rw)
                 set_global_seed(args.seed, deterministic=False)
                 wavs, sr, *_ = run_generation(
                     model,
                     item.text,
                     "English",
                     speaker,
-                    cfg,
+                    make_config(kb, vb, rw),
                     seed=args.seed,
                     gen_overrides=decode_overrides(
                         "sampling", temperature=args.temperature
@@ -344,7 +351,9 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     ref_text=ref_text,
                 )
                 sf.write(
-                    _wav_path(out_dir, group, idx, args.seed, args.temperature, rw),
+                    _wav_path(
+                        out_dir, group, idx, args.seed, args.temperature, kb, vb, rw
+                    ),
                     wavs[0],
                     sr,
                 )
@@ -365,8 +374,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                 ref_text=ref_text,
             )
             recorder.active = False
-            # Stream this sentence's rows to disk, aggregate, then FREE them.
-            if writer and recorder.rows:
+            if writer and recorder.rows:  # stream + free per sentence
                 writer.writerows(recorder.rows)
                 accumulate_running(running, recorder.rows)
                 recorder.rows.clear()
@@ -387,15 +395,19 @@ def main() -> None:
         "--groups", default="seedtts_en,librispeech_pc,libritts_long,ellav_hard"
     )
     parser.add_argument("--max-per-group", type=int, default=100)
-    parser.add_argument("--residual-windows", default="24,0")
-    parser.add_argument("--step-stride", type=int, default=4)
+    parser.add_argument(
+        "--configs",
+        default="K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0",
+        help="Comma list of K<kb>V<vb>@<rw> (e.g. K4V4@24,K4V4@0).",
+    )
+    parser.add_argument("--step-stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--voice-mode", default="clone")
     parser.add_argument("--default-ref", default=None)
-    parser.add_argument("--out", default="results/kv_attn_k4v4_rw24_vs_rw0.csv")
+    parser.add_argument("--out", default="results/kv_attn.csv")
     parser.add_argument(
         "--no-divergence",
         action="store_true",
@@ -409,35 +421,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    specs = parse_configs(args.configs)
     dtype = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
     }.get(args.dtype, torch.bfloat16)
     print(f"loading {args.model} on {args.device} ({args.dtype})")
+    print(f"configs: {[config_label(*s) for s in specs]}")
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=args.device, dtype=dtype
     )
     speakers = model.get_supported_speakers()
     speaker = speakers[0] if speakers else "Ryan"
 
-    rws = [int(w) for w in args.residual_windows.split(",") if w.strip()]
-    _, cfg = k4v4_config(rws[0])
     n_layers = getattr(model.model.config, "num_hidden_layers", 0)
+    d = TurboQuantConfig()  # protected-layer defaults (2 / 8-bit)
     recorder = DivergenceRecorder(
-        rws,
-        cfg.key_bits,
-        cfg.value_bits,
-        n_layers,
-        getattr(cfg, "protected_layers", 2),
-        getattr(cfg, "protected_bits", 8),
-        args.step_stride,
+        specs, n_layers, d.protected_layers, d.protected_bits, args.step_stride
     )
 
     if args.no_divergence:  # audio-only: no eager-forcing, no patch, no recording
         print("audio-only mode (--no-divergence): generating compressed wavs only")
         run_experiment(model, speaker, recorder, args)
-        print("\ndone — wavs in models/Qwen3-TTS/benchmarks/outputs/")
+        print("\ndone — wavs written")
         return
 
     force_eager(model)
@@ -448,8 +455,8 @@ def main() -> None:
     finally:
         modeling.eager_attention_forward = original
 
-    print(f"\nstreamed per-(layer,pos,rw) rows -> {args.out}")
-    print(f"\n== mean divergence by residual window (K{recorder.kb}/V{recorder.vb}) ==")
+    print(f"\nstreamed per-(layer,pos,config) rows -> {args.out}")
+    print("\n== mean divergence by config ==")
     print(running_frame(running).to_string(float_format=lambda x: f"{x:.6f}"))
 
 
