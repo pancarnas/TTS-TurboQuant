@@ -25,6 +25,7 @@ Run from the repo root (same env as the benchmark; GPU recommended):
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 
@@ -258,7 +259,40 @@ def _wav_path(out_dir, group, idx, seed, temp, rw):
     )
 
 
-def run_experiment(model, speaker, recorder, args) -> pd.DataFrame:
+_METRICS = COLUMNS[5:]  # attn_js, attn_tv, ... relmse_v
+
+
+def accumulate_running(running: dict, rows: list) -> None:
+    """Fold streamed rows into per-rw running sums (bounded memory, no full retain)."""
+    for r in rows:
+        rw = r[4]
+        d = running.setdefault(rw, dict({"_n": 0}, **{m: 0.0 for m in _METRICS}))
+        d["_n"] += 1
+        for m, v in zip(_METRICS, r[5:]):
+            d[m] += float(v)
+
+
+def running_frame(running: dict) -> pd.DataFrame:
+    """Per-rw means from running sums + a diff(0-N) row (mirrors summarize)."""
+    means = {
+        rw: {m: d[m] / d["_n"] for m in _METRICS}
+        for rw, d in running.items()
+        if d["_n"]
+    }
+    agg = pd.DataFrame(means).T.sort_index(ascending=False)
+    if 0 in agg.index and len(agg.index) > 1:
+        other = max(w for w in agg.index if w != 0)
+        agg.loc[f"diff(0-{other})"] = agg.loc[0] - agg.loc[other]
+    return agg
+
+
+def run_experiment(model, speaker, recorder, args) -> dict:
+    """Generate audio + (unless --no-divergence) stream divergence rows to args.out.
+
+    Rows are written and freed per sentence (bounded RAM, crash-safe at sentence
+    granularity) rather than accumulated for one giant end-of-run write. Returns
+    the per-rw running aggregate for the summary.
+    """
     try:
         from tqdm import tqdm
     except ImportError:
@@ -274,55 +308,75 @@ def run_experiment(model, speaker, recorder, args) -> pd.DataFrame:
         for g in groups
         for i, it in enumerate(iter_eval_items([g], args.max_per_group, args.data_dir))
     ]
+
+    no_div = getattr(args, "no_divergence", False)
+    fh = writer = None
+    running: dict = {}
+    if not no_div:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        fh = open(args.out, "w", newline="", encoding="utf-8")
+        writer = csv.writer(fh)
+        writer.writerow(COLUMNS)
+
     it = tqdm(items, desc="kv-attn", unit="sent") if tqdm else items
-    for group, idx, item in it:
-        ref_audio, ref_text = _resolve_voice(
-            item, args.voice_mode, args.default_ref, None
-        )
-        if args.voice_mode == "clone" and not ref_audio:
-            continue
-        for rw in rws:  # compressed audio (recorder off)
-            recorder.active = False
-            _, cfg = k4v4_config(rw)
+    try:
+        for group, idx, item in it:
+            ref_audio, ref_text = _resolve_voice(
+                item, args.voice_mode, args.default_ref, None
+            )
+            if args.voice_mode == "clone" and not ref_audio:
+                continue
+            for rw in rws:  # compressed audio (recorder off)
+                recorder.active = False
+                _, cfg = k4v4_config(rw)
+                set_global_seed(args.seed, deterministic=False)
+                wavs, sr, *_ = run_generation(
+                    model,
+                    item.text,
+                    "English",
+                    speaker,
+                    cfg,
+                    seed=args.seed,
+                    gen_overrides=decode_overrides(
+                        "sampling", temperature=args.temperature
+                    ),
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
+                sf.write(
+                    _wav_path(out_dir, group, idx, args.seed, args.temperature, rw),
+                    wavs[0],
+                    sr,
+                )
+            if no_div:
+                continue  # audio-only: skip the expensive fp16 recording pass
+            recorder.group, recorder.idx = group, idx  # fp16 pass (recorder on)
+            recorder.active = True
             set_global_seed(args.seed, deterministic=False)
-            wavs, sr, *_ = run_generation(
+            run_generation(
                 model,
                 item.text,
                 "English",
                 speaker,
-                cfg,
+                None,
                 seed=args.seed,
-                gen_overrides=decode_overrides(
-                    "sampling", temperature=args.temperature
-                ),
+                gen_overrides=decode_overrides("greedy"),
                 ref_audio=ref_audio,
                 ref_text=ref_text,
             )
-            sf.write(
-                _wav_path(out_dir, group, idx, args.seed, args.temperature, rw),
-                wavs[0],
-                sr,
-            )
-        if getattr(args, "no_divergence", False):
-            continue  # audio-only mode: skip the expensive fp16 recording pass
-        recorder.group, recorder.idx = group, idx  # fp16 pass (recorder on)
-        recorder.active = True
-        set_global_seed(args.seed, deterministic=False)
-        run_generation(
-            model,
-            item.text,
-            "English",
-            speaker,
-            None,
-            seed=args.seed,
-            gen_overrides=decode_overrides("greedy"),
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-        )
-        recorder.active = False
+            recorder.active = False
+            # Stream this sentence's rows to disk, aggregate, then FREE them.
+            if writer and recorder.rows:
+                writer.writerows(recorder.rows)
+                accumulate_running(running, recorder.rows)
+                recorder.rows.clear()
+                fh.flush()
+    finally:
+        if fh:
+            fh.close()
     if recorder.errors:
         print(f"  WARNING: {recorder.errors} measurement errors (skipped)")
-    return pd.DataFrame(recorder.rows, columns=COLUMNS)
+    return running
 
 
 def main() -> None:
@@ -390,15 +444,13 @@ def main() -> None:
     original = modeling.eager_attention_forward
     modeling.eager_attention_forward = make_patch(original, recorder)
     try:
-        df = run_experiment(model, speaker, recorder, args)
+        running = run_experiment(model, speaker, recorder, args)  # streams to args.out
     finally:
         modeling.eager_attention_forward = original
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    df.to_csv(args.out, index=False)
-    print(f"\nwrote {len(df)} per-(layer,pos,rw) rows -> {args.out}")
+    print(f"\nstreamed per-(layer,pos,rw) rows -> {args.out}")
     print(f"\n== mean divergence by residual window (K{recorder.kb}/V{recorder.vb}) ==")
-    print(summarize(df).to_string(float_format=lambda x: f"{x:.6f}"))
+    print(running_frame(running).to_string(float_format=lambda x: f"{x:.6f}"))
 
 
 if __name__ == "__main__":

@@ -145,6 +145,38 @@ def test_force_eager_walks_wrapped_model():
     assert w.model.attn.config._attn_implementation == "eager"
 
 
+_METRIC_NAMES = [
+    "attn_js",
+    "attn_tv",
+    "attn_top1",
+    "attn_dentropy",
+    "out_cos",
+    "cos_k",
+    "cos_v",
+    "relmse_k",
+    "relmse_v",
+]
+
+
+def test_streaming_aggregate_matches_means_and_diff():
+    acc = _single_func("accumulate_running", {"_METRICS": _METRIC_NAMES})
+    frame = _single_func("running_frame", {"_METRICS": _METRIC_NAMES, "pd": pd})
+
+    def _row(rw, v):  # (group, idx, layer, pos, rw, *9 metrics)
+        return ("g", 0, 0, 10, rw) + tuple([v] * 9)
+
+    running: dict = {}
+    # stream in two batches (simulating per-sentence flushes) then aggregate
+    acc(running, [_row(24, 0.01), _row(0, 0.20)])
+    acc(running, [_row(24, 0.03), _row(0, 0.30)])
+    assert running[24]["_n"] == 2 and running[0]["_n"] == 2
+    out = frame(running)
+    assert list(out.index)[:2] == [24, 0]  # high -> low
+    assert abs(out.loc[24, "attn_js"] - 0.02) < 1e-9
+    assert abs(out.loc[0, "attn_js"] - 0.25) < 1e-9
+    assert abs(out.loc["diff(0-24)", "attn_js"] - 0.23) < 1e-9
+
+
 def test_summarize_diff_row_and_order():
     summarize = _single_func("summarize", {"pd": pd})
     df = pd.DataFrame(
