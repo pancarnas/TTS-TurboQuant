@@ -238,6 +238,33 @@ def make_patch(original, recorder: DivergenceRecorder):
     return patched
 
 
+def resolve_n_layers(model) -> int:
+    """Talker layer count for the protected-layer logic — fail loudly if unresolved.
+
+    The cache uses ``config.talker_config.num_hidden_layers``. The TOP config has
+    no bare ``num_hidden_layers``, so ``getattr(model.model.config,
+    'num_hidden_layers', 0)`` returned 0 -> TurboQuantV3 marked EVERY layer as
+    protected (8-bit) -> key/value bits were silently ignored (all configs
+    identical). Resolve the talker count and refuse to run on 0.
+    """
+    for getter in (
+        lambda: model.model.config.talker_config.num_hidden_layers,
+        lambda: model.config.talker_config.num_hidden_layers,
+        lambda: model.model.config.num_hidden_layers,
+    ):
+        try:
+            n = int(getter())
+        except (AttributeError, TypeError):
+            continue
+        if n > 0:
+            return n
+    raise SystemExit(
+        "could not resolve talker num_hidden_layers (>0); refusing to run — the "
+        "protected-layer logic would force every layer to 8-bit and ignore the "
+        "requested key/value bits"
+    )
+
+
 def force_eager(model) -> None:
     """Set every attention config to eager so the patched path is used.
 
@@ -435,7 +462,8 @@ def main() -> None:
     speakers = model.get_supported_speakers()
     speaker = speakers[0] if speakers else "Ryan"
 
-    n_layers = getattr(model.model.config, "num_hidden_layers", 0)
+    n_layers = resolve_n_layers(model)
+    print(f"talker n_layers = {n_layers}")
     d = TurboQuantConfig()  # protected-layer defaults (2 / 8-bit)
     recorder = DivergenceRecorder(
         specs, n_layers, d.protected_layers, d.protected_bits, args.step_stride

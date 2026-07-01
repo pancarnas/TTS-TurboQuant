@@ -45,7 +45,8 @@ def main() -> None:
     p.add_argument("--out", default="results/kv_attn_smoke.csv")
     args_cli = p.parse_args()
 
-    specs = exp.parse_configs("K4V4@24,K4V4@0")
+    # K4V2 included so we can verify bits actually matter (not just rw).
+    specs = exp.parse_configs("K4V4@24,K4V2@24,K4V4@0")
     print(f"loading {args_cli.model} on {args_cli.device} ...")
     model = exp.Qwen3TTSModel.from_pretrained(
         args_cli.model, device_map=args_cli.device, dtype=torch.bfloat16
@@ -54,7 +55,8 @@ def main() -> None:
     speakers = model.get_supported_speakers()
     speaker = speakers[0] if speakers else "Ryan"
 
-    n_layers = getattr(model.model.config, "num_hidden_layers", 0)
+    n_layers = exp.resolve_n_layers(model)  # fails loudly if 0 (the ignored-bits bug)
+    print(f"talker n_layers = {n_layers}")
     d = exp.TurboQuantConfig()
     rec = exp.DivergenceRecorder(
         specs, n_layers, d.protected_layers, d.protected_bits, args_cli.step_stride
@@ -127,6 +129,20 @@ def main() -> None:
             results, "SANITY relmse_k(rw0) > relmse_k(rw24)", d_rm > 0, f"d={d_rm:.4g}"
         )
         _check(results, "SANITY cos_k(rw24) > cos_k(rw0)", d_cos > 0, f"d={d_cos:.4g}")
+
+    # BITS must matter: K4V2@24 must distort values MORE than K4V4@24. If these are
+    # equal, the protected-layer logic is ignoring bits (the n_layers=0 bug).
+    if len(df) and {(4, 4, 24), (4, 2, 24)} <= set(
+        map(tuple, df[["key_bits", "value_bits", "rw"]].drop_duplicates().values)
+    ):
+        v = df.groupby(["key_bits", "value_bits", "rw"])["relmse_v"].mean()
+        d_bits = v.loc[(4, 2, 24)] - v.loc[(4, 4, 24)]
+        _check(
+            results,
+            "SANITY relmse_v(K4V2@24) > relmse_v(K4V4@24)",
+            d_bits > 0,
+            f"d={d_bits:.4g}",
+        )
 
     passed = all(results)
     print(

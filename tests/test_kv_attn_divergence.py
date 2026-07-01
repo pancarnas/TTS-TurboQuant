@@ -12,6 +12,7 @@ import re
 import types
 
 import pandas as pd
+import pytest
 import torch
 
 from turboquant.compressors_v3 import TurboQuantV3
@@ -289,6 +290,68 @@ def test_recorder_reuses_compressors_per_config():
         af = ns["compressed_attention"](q, key, groups, None, scaling)
         rec.record(_module(groups), q, key, value, None, scaling, af)
     assert len(rec._cache) == 2  # one TurboQuantV3 per (layer, kb, vb, rw)
+
+
+def test_resolve_n_layers_reads_talker_config_and_fails_on_missing():
+    fn = _single_func("resolve_n_layers", {})
+
+    class Good:
+        class model:
+            class config:
+                class talker_config:
+                    num_hidden_layers = 20
+
+    assert fn(Good) == 20  # reads talker_config, not the (absent) top-level attr
+
+    class Bad:  # no resolvable layer count -> must refuse, not silently return 0
+        class model:
+            class config:
+                pass
+
+    with pytest.raises(SystemExit):
+        fn(Bad)
+
+
+def test_recorder_bits_matter_on_unprotected_layer():
+    # THE regression for the n_layers=0 bug: with a real layer count, K4V2 must
+    # distort values MORE than K4V4 on a non-protected layer. If every layer were
+    # forced to 8-bit (the bug), these would be byte-identical.
+    ns = _block()
+    q, key, value, hd, groups = _attn_inputs(64)
+    scaling = hd**-0.5
+    rec = ns["DivergenceRecorder"](
+        specs=[(4, 4, 24), (4, 2, 24)],
+        n_layers=20,
+        prot_layers=2,
+        prot_bits=8,
+        stride=1,
+    )
+    rec.group, rec.idx = "g", 0
+    af = ns["compressed_attention"](q, key, groups, None, scaling)
+    rec.record(_module(groups, layer_idx=10), q, key, value, None, scaling, af)
+    by = {(r[4], r[5], r[6]): dict(zip(COLS, r)) for r in rec.rows}
+    assert by[(4, 2, 24)]["relmse_v"] > by[(4, 4, 24)]["relmse_v"]
+
+
+def test_recorder_protected_layer_forces_same_bits():
+    # On a protected edge layer both configs use protected_bits -> identical.
+    ns = _block()
+    q, key, value, hd, groups = _attn_inputs(64)
+    scaling = hd**-0.5
+    rec = ns["DivergenceRecorder"](
+        specs=[(4, 4, 24), (4, 2, 24)],
+        n_layers=20,
+        prot_layers=2,
+        prot_bits=8,
+        stride=1,
+    )
+    rec.group, rec.idx = "g", 0
+    af = ns["compressed_attention"](q, key, groups, None, scaling)
+    rec.record(
+        _module(groups, layer_idx=0), q, key, value, None, scaling, af
+    )  # layer 0 protected
+    by = {(r[4], r[5], r[6]): dict(zip(COLS, r)) for r in rec.rows}
+    assert by[(4, 2, 24)]["relmse_v"] == by[(4, 4, 24)]["relmse_v"]
 
 
 def test_make_patch_records_only_when_active_and_counts_errors():
