@@ -7,8 +7,15 @@ moves the talker's attention map and KV vectors:
 
   * attention: Jensen-Shannon divergence between softmax(q.Kfp16) and
     softmax(q.Kcompressed) on the SAME fp16 query (base-2, bounded [0, 1]);
-    plus total-variation, top-1 agreement, entropy delta, attention-output cosine;
-  * KV: per-vector cosine + relative MSE of compressed-vs-fp16 keys/values.
+    plus total-variation, top-1 agreement, entropy delta, attention-output cosine.
+    Both maps are recomputed in fp32 through the same code path, so identical
+    inputs give exactly 0 divergence (no bf16-rounding noise floor);
+  * KV: per-vector cosine + relative MSE of compressed-vs-fp16 keys/values,
+    computed on the COMPRESSED PREFIX only (the exact fp16 residual tail is
+    excluded, so rw comparisons measure per-token error, not window coverage).
+
+Rows carry a ``protected_layers`` column and wavs a ``_pl=<n>`` name segment, so
+runs with different ``--protected-layers`` never conflate (also keys --resume).
 
 Configs are given as ``--configs "K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0"``
 (K<key_bits>V<value_bits>@<residual_window>). No Whisper/ASR, no WavLM — run the
@@ -30,6 +37,7 @@ import csv
 import os
 import re
 import sys
+import traceback
 
 import pandas as pd
 import soundfile as sf
@@ -59,6 +67,7 @@ COLUMNS = [
     "key_bits",
     "value_bits",
     "rw",
+    "protected_layers",
     "attn_js",
     "attn_tv",
     "attn_top1",
@@ -69,7 +78,7 @@ COLUMNS = [
     "relmse_k",
     "relmse_v",
 ]
-_METRICS = COLUMNS[7:]
+_METRICS = COLUMNS[8:]
 
 _CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
 
@@ -92,14 +101,21 @@ def config_label(kb: int, vb: int, rw: int) -> str:
     return f"K{kb}V{vb}@{rw}"
 
 
-def make_config(kb: int, vb: int, rw: int) -> TurboQuantConfig:
+def make_config(kb: int, vb: int, rw: int, protected_layers: int = 2) -> TurboQuantConfig:
     """A config with REAL on-path compression (track_only=False).
 
     Default track_only=True makes attention read pristine fp16 KV — generation
     then ignores compression and every config yields identical audio. Force False.
+
+    ``protected_layers`` = first/last N layers kept at protected_bits; 0 disables
+    layer-adaptive protection (uniform bits everywhere, matching the reference impl).
     """
     return TurboQuantConfig(
-        key_bits=kb, value_bits=vb, residual_window=rw, track_only=False
+        key_bits=kb,
+        value_bits=vb,
+        residual_window=rw,
+        protected_layers=protected_layers,
+        track_only=False,
     )
 
 
@@ -163,6 +179,7 @@ class DivergenceRecorder:
         self.active = False
         self.rows: list[tuple] = []
         self.errors = 0
+        self.first_error: str | None = None
         self.group = self.idx = None
         self._cache: dict = {}
 
@@ -183,13 +200,16 @@ class DivergenceRecorder:
             )
         return self._cache[key]
 
-    def record(self, module, query, key, value, attention_mask, scaling, attn_fp16):
+    def record(self, module, query, key, value, attention_mask, scaling):
         pos = key.shape[2]
         if self.stride > 1 and (pos % self.stride) != 0:
             return
         head_dim = key.shape[-1]
-        af = attn_fp16.float()
         groups = module.num_key_value_groups
+        # fp16 reference through the SAME fp32 code path as the compressed map:
+        # identical K then gives exactly 0 divergence (the eager output is cast
+        # to bf16 after softmax, which would floor JS/TV at rounding noise).
+        af = compressed_attention(query, key, groups, attention_mask, scaling)
         for kb, vb, rw in self.specs:
             comp = self._comp(module.layer_idx, kb, vb, rw, head_dim, key.device)
             ck, cv = comp.compress_kv(key, value)
@@ -197,8 +217,19 @@ class DivergenceRecorder:
             ac = compressed_attention(query, rk, groups, attention_mask, scaling)
             o_fp16 = torch.matmul(af, modeling.repeat_kv(value, groups).float())
             o_comp = torch.matmul(ac, modeling.repeat_kv(rv, groups).float())
-            cos_k, relmse_k = _kv_recon_errors(key, rk, head_dim)
-            cos_v, relmse_v = _kv_recon_errors(value, rv, head_dim)
+            # KV recon on the compressed prefix only — the last rw tokens are
+            # bit-exact fp16 and would dilute the error as S grows past rw.
+            split_at = max(pos - rw, 0)
+            if split_at == 0:  # nothing compressed at this position
+                cos_k = cos_v = 1.0
+                relmse_k = relmse_v = 0.0
+            else:
+                cos_k, relmse_k = _kv_recon_errors(
+                    key[:, :, :split_at], rk[:, :, :split_at], head_dim
+                )
+                cos_v, relmse_v = _kv_recon_errors(
+                    value[:, :, :split_at], rv[:, :, :split_at], head_dim
+                )
             self.rows.append(
                 (
                     self.group,
@@ -208,6 +239,7 @@ class DivergenceRecorder:
                     kb,
                     vb,
                     rw,
+                    self.pl,
                     js_divergence(af, ac),
                     total_variation(af, ac),
                     top1_agreement(af, ac),
@@ -228,11 +260,11 @@ def make_patch(original, recorder: DivergenceRecorder):
         )
         if recorder.active:
             try:
-                recorder.record(
-                    module, query, key, value, attention_mask, scaling, attn
-                )
+                recorder.record(module, query, key, value, attention_mask, scaling)
             except Exception:  # noqa: BLE001 - a measurement error must not kill the run
                 recorder.errors += 1
+                if recorder.first_error is None:
+                    recorder.first_error = traceback.format_exc()
         return out, attn
 
     return patched
@@ -285,10 +317,10 @@ def force_eager(model) -> None:
 def accumulate_running(running: dict, rows: list) -> None:
     """Fold streamed rows into per-config running sums (bounded memory)."""
     for r in rows:
-        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw)
+        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw); r[7] = protected_layers
         d = running.setdefault(cfg, dict({"_n": 0}, **{m: 0.0 for m in _METRICS}))
         d["_n"] += 1
-        for m, v in zip(_METRICS, r[7:]):
+        for m, v in zip(_METRICS, r[8:]):
             d[m] += float(v)
 
 
@@ -312,25 +344,38 @@ def running_frame(running: dict) -> pd.DataFrame:
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     """Offline: per-config means from a streamed CSV."""
-    return df.groupby(["key_bits", "value_bits", "rw"])[_METRICS].mean().sort_index()
-
-
-def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw):
-    return os.path.join(
-        out_dir,
-        f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_K{kb}_V{vb}_rw={rw}.wav",
+    return (
+        df.groupby(["key_bits", "value_bits", "rw", "protected_layers"])[_METRICS]
+        .mean()
+        .sort_index()
     )
 
 
-def load_done(out_path: str) -> set:
+def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl):
+    return os.path.join(
+        out_dir,
+        f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_K{kb}_V{vb}_rw={rw}_pl={pl}.wav",
+    )
+
+
+def load_done(out_path: str, protected_layers: int) -> set:
     """(group, idx) pairs already recorded in a divergence CSV (for --resume).
 
-    Reads only the two id columns, so it stays cheap even on multi-GB CSVs. A
-    missing/empty file (or one with only a header) yields an empty set.
+    Only rows recorded under the SAME ``protected_layers`` count as done — a CSV
+    can hold runs at different protection settings without --resume skipping the
+    wrong ones. Reads only the id columns, so it stays cheap even on multi-GB
+    CSVs. A missing/empty file (or one with only a header) yields an empty set.
     """
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         return set()
-    df = pd.read_csv(out_path, usecols=["group", "idx"])
+    try:
+        df = pd.read_csv(out_path, usecols=["group", "idx", "protected_layers"])
+    except ValueError as exc:
+        raise SystemExit(
+            f"{out_path} has no protected_layers column (pre-fix CSV) — cannot "
+            "--resume into it; start a fresh --out"
+        ) from exc
+    df = df[df["protected_layers"] == protected_layers]
     return set(zip(df["group"].astype(str), df["idx"].astype(int)))
 
 
@@ -339,10 +384,10 @@ def pending_items(items: list, done: set) -> list:
     return [t for t in items if (str(t[0]), int(t[1])) not in done]
 
 
-def audio_done(out_dir, group, idx, seed, temp, specs) -> bool:
+def audio_done(out_dir, group, idx, seed, temp, specs, pl) -> bool:
     """True iff every config's wav for this sentence already exists (audio resume)."""
     return all(
-        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw))
+        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl))
         for kb, vb, rw in specs
     )
 
@@ -378,11 +423,19 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                 t
                 for t in items
                 if not audio_done(
-                    out_dir, t[0], t[1], args.seed, args.temperature, specs
+                    out_dir,
+                    t[0],
+                    t[1],
+                    args.seed,
+                    args.temperature,
+                    specs,
+                    args.protected_layers,
                 )
             ]
         else:
-            items = pending_items(items, load_done(args.out))
+            items = pending_items(
+                items, load_done(args.out, args.protected_layers)
+            )
         print(f"resume: skipping {n0 - len(items)} done, running {len(items)}")
 
     fh = writer = None
@@ -411,7 +464,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     item.text,
                     "English",
                     speaker,
-                    make_config(kb, vb, rw),
+                    make_config(kb, vb, rw, args.protected_layers),
                     seed=args.seed,
                     gen_overrides=decode_overrides(
                         "sampling", temperature=args.temperature
@@ -421,7 +474,15 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                 )
                 sf.write(
                     _wav_path(
-                        out_dir, group, idx, args.seed, args.temperature, kb, vb, rw
+                        out_dir,
+                        group,
+                        idx,
+                        args.seed,
+                        args.temperature,
+                        kb,
+                        vb,
+                        rw,
+                        args.protected_layers,
                     ),
                     wavs[0],
                     sr,
@@ -453,6 +514,8 @@ def run_experiment(model, speaker, recorder, args) -> dict:
             fh.close()
     if recorder.errors:
         print(f"  WARNING: {recorder.errors} measurement errors (skipped)")
+        if recorder.first_error:
+            print(f"  first error:\n{recorder.first_error}")
     return running
 
 
@@ -474,6 +537,14 @@ def main() -> None:
         action="store_true",
         help="Skip sentences already in --out (or, with --no-divergence, whose wavs "
         "exist) and append instead of overwriting. Use only on CSVs from this fix.",
+    )
+    parser.add_argument(
+        "--protected-layers",
+        type=int,
+        default=TurboQuantConfig().protected_layers,
+        help="First/last N layers kept at protected_bits (8-bit). 0 = no layer-adaptive "
+        "protection: uniform key/value bits on every layer, matching the reference "
+        "implementation. Default keeps the current behavior.",
     )
     parser.add_argument("--step-stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -504,6 +575,10 @@ def main() -> None:
     }.get(args.dtype, torch.bfloat16)
     print(f"loading {args.model} on {args.device} ({args.dtype})")
     print(f"configs: {[config_label(*s) for s in specs]}")
+    print(
+        f"protected_layers: {args.protected_layers}"
+        + (" (no layer-adaptive protection)" if args.protected_layers == 0 else "")
+    )
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=args.device, dtype=dtype
     )
@@ -512,9 +587,9 @@ def main() -> None:
 
     n_layers = resolve_n_layers(model)
     print(f"talker n_layers = {n_layers}")
-    d = TurboQuantConfig()  # protected-layer defaults (2 / 8-bit)
+    d = TurboQuantConfig()  # for protected_bits (8-bit); protected_layers from CLI
     recorder = DivergenceRecorder(
-        specs, n_layers, d.protected_layers, d.protected_bits, args.step_stride
+        specs, n_layers, args.protected_layers, d.protected_bits, args.step_stride
     )
 
     if args.no_divergence:  # audio-only: no eager-forcing, no patch, no recording

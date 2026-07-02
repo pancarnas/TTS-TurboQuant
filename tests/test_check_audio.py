@@ -13,6 +13,18 @@ def test_parse_wav_name_handles_underscored_groups():
     assert d2["group"] == "libritts_long" and d2["config"] == "K4V4@0"
 
 
+def test_parse_wav_name_optional_protected_layers_segment():
+    # old names (no _pl=) keep parsing with pl=None and an unchanged config label
+    d = parse_wav_name("qwen_seedtts_en_7_sampling_s0_t0.9_K4_V2_rw=24.wav")
+    assert d["pl"] is None and d["config"] == "K4V2@24"
+    # new names carry pl and it distinguishes the config
+    d2 = parse_wav_name("qwen_seedtts_en_7_sampling_s0_t0.9_K4_V2_rw=24_pl=0.wav")
+    assert d2["pl"] == 0 and d2["config"] == "K4V2@24 pl0"
+    assert (d2["kb"], d2["vb"], d2["rw"]) == (4, 2, 24)
+    d3 = parse_wav_name("qwen_libritts_long_12_sampling_s0_t0.9_K4_V4_rw=0_pl=2.wav")
+    assert d3["group"] == "libritts_long" and d3["pl"] == 2
+
+
 def test_parse_wav_name_rejects_nonmatching():
     assert parse_wav_name("something_else.wav") is None
     assert parse_wav_name("qwen_x_1_greedy.wav") is None

@@ -1,7 +1,8 @@
 """Verify generated compressed audio: are configs actually different, and is
 inference/saving correct? GPU-free — reads only the saved wavs.
 
-Filenames are ``qwen_<group>_<idx>_sampling_s<seed>_t<temp>_K<kb>_V<vb>_rw=<rw>.wav``.
+Filenames are ``qwen_<group>_<idx>_sampling_s<seed>_t<temp>_K<kb>_V<vb>_rw=<rw>.wav``
+with an optional trailing ``_pl=<protected_layers>`` segment (newer runs).
 For each (group, idx) it compares the wavs across configs by content hash + basic
 stats (duration, RMS, peak), then reports:
 
@@ -30,7 +31,7 @@ import soundfile as sf
 
 _NAME_RE = re.compile(
     r"qwen_(?P<group>.+)_(?P<idx>\d+)_sampling_s(?P<seed>\d+)_t(?P<temp>[\d.]+)"
-    r"_K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)\.wav$"
+    r"_K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)(?:_pl=(?P<pl>\d+))?\.wav$"
 )
 
 
@@ -40,13 +41,18 @@ def parse_wav_name(name: str) -> dict | None:
     if not m:
         return None
     d = m.groupdict()
+    pl = int(d["pl"]) if d["pl"] is not None else None
+    # pl joins the config label so runs at different protection settings in the
+    # same dir never compare as "the same config".
+    config = f"K{d['kb']}V{d['vb']}@{d['rw']}" + (f" pl{pl}" if pl is not None else "")
     return {
         "group": d["group"],
         "idx": int(d["idx"]),
-        "config": f"K{d['kb']}V{d['vb']}@{d['rw']}",
+        "config": config,
         "kb": int(d["kb"]),
         "vb": int(d["vb"]),
         "rw": int(d["rw"]),
+        "pl": pl,
     }
 
 

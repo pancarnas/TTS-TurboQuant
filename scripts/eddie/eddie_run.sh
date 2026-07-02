@@ -43,8 +43,11 @@ export PYTHONPATH="$PWD:$PWD/models/Qwen3-TTS:$PWD/models/VALL-E-X:${PYTHONPATH:
 export HF_HOME="${HF_HOME:-$PWD/.hf_cache}"
 
 echo "=== node: $(hostname)  date: $(date) ==="
+echo "assigned GPU: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}  SGE_HGR_gpu=${SGE_HGR_gpu:-unset}"
+# nvidia-smi lists ALL GPUs on the (shared) node; the one torch sees as index 0 is
+# the one the scheduler actually assigned this job.
 nvidia-smi || true
-python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())"
+python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available()); print('assigned device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
 
 if [ "$#" -eq 0 ]; then
     echo "ERROR: no command given. Example:" >&2

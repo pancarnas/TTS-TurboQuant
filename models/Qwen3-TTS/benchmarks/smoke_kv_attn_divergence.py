@@ -72,6 +72,7 @@ def main() -> None:
         out=args_cli.out,
         no_divergence=False,
         audio_out_dir=None,
+        protected_layers=d.protected_layers,
     )
 
     original = exp.modeling.eager_attention_forward
@@ -106,7 +107,9 @@ def main() -> None:
     out_dir = os.path.join(os.path.dirname(exp.__file__), "outputs")
     wav_ok = (
         all(
-            os.path.exists(exp._wav_path(out_dir, g, int(i), 0, 0.9, 4, 4, rw))
+            os.path.exists(
+                exp._wav_path(out_dir, g, int(i), 0, 0.9, 4, 4, rw, d.protected_layers)
+            )
             for (g, i) in (
                 {(r.group, r.idx) for r in df.itertuples()} if len(df) else set()
             )
