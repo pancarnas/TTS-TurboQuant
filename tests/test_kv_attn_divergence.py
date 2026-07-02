@@ -354,6 +354,40 @@ def test_recorder_protected_layer_forces_same_bits():
     assert by[(4, 2, 24)]["relmse_v"] == by[(4, 4, 24)]["relmse_v"]
 
 
+def test_load_done_reads_group_idx_pairs(tmp_path):
+    load_done = _single_func("load_done", {"pd": pd, "os": os})
+    p = tmp_path / "k.csv"
+    assert load_done(str(p)) == set()  # missing -> empty
+    rows = [
+        ("g", 0, 0, 10, 4, 4, 24) + tuple([0.1] * 9),
+        ("g", 0, 1, 10, 4, 2, 24) + tuple([0.2] * 9),  # same sentence, other config
+        ("g", 1, 0, 10, 4, 4, 24) + tuple([0.3] * 9),
+    ]
+    pd.DataFrame(rows, columns=COLS).to_csv(p, index=False)
+    assert load_done(str(p)) == {("g", 0), ("g", 1)}
+
+
+def test_pending_items_drops_done():
+    pending = _single_func("pending_items", {})
+    items = [("g", 0, "x"), ("g", 1, "x"), ("g", 2, "x")]
+    assert pending(items, {("g", 0), ("g", 2)}) == [("g", 1, "x")]
+
+
+def test_audio_done_checks_every_config(tmp_path):
+    ns = {"os": os, "_wav_path": None}
+    # inject the real _wav_path (pure) so audio_done builds correct names
+    ns["_wav_path"] = _single_func("_wav_path", {"os": os})
+    audio_done = _single_func("audio_done", ns)
+    specs = [(4, 4, 24), (4, 2, 24)]
+    for kb, vb, rw in specs:
+        (tmp_path / f"qwen_g_0_sampling_s0_t0.9_K{kb}_V{vb}_rw={rw}.wav").write_bytes(
+            b"x"
+        )
+    assert audio_done(str(tmp_path), "g", 0, 0, 0.9, specs) is True
+    (tmp_path / "qwen_g_0_sampling_s0_t0.9_K4_V2_rw=24.wav").unlink()
+    assert audio_done(str(tmp_path), "g", 0, 0, 0.9, specs) is False
+
+
 def test_make_patch_records_only_when_active_and_counts_errors():
     ns = _block()
 

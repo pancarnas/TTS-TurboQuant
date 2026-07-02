@@ -322,6 +322,31 @@ def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw):
     )
 
 
+def load_done(out_path: str) -> set:
+    """(group, idx) pairs already recorded in a divergence CSV (for --resume).
+
+    Reads only the two id columns, so it stays cheap even on multi-GB CSVs. A
+    missing/empty file (or one with only a header) yields an empty set.
+    """
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        return set()
+    df = pd.read_csv(out_path, usecols=["group", "idx"])
+    return set(zip(df["group"].astype(str), df["idx"].astype(int)))
+
+
+def pending_items(items: list, done: set) -> list:
+    """Drop (group, idx, item) tuples whose (group, idx) is already done."""
+    return [t for t in items if (str(t[0]), int(t[1])) not in done]
+
+
+def audio_done(out_dir, group, idx, seed, temp, specs) -> bool:
+    """True iff every config's wav for this sentence already exists (audio resume)."""
+    return all(
+        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw))
+        for kb, vb, rw in specs
+    )
+
+
 def run_experiment(model, speaker, recorder, args) -> dict:
     """Generate audio + (unless --no-divergence) stream divergence rows to args.out.
 
@@ -345,13 +370,30 @@ def run_experiment(model, speaker, recorder, args) -> dict:
     ]
 
     no_div = getattr(args, "no_divergence", False)
+    resume = getattr(args, "resume", False)
+    if resume:  # drop sentences already finished (skip audio + divergence)
+        n0 = len(items)
+        if no_div:
+            items = [
+                t
+                for t in items
+                if not audio_done(
+                    out_dir, t[0], t[1], args.seed, args.temperature, specs
+                )
+            ]
+        else:
+            items = pending_items(items, load_done(args.out))
+        print(f"resume: skipping {n0 - len(items)} done, running {len(items)}")
+
     fh = writer = None
     running: dict = {}
     if not no_div:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        fh = open(args.out, "w", newline="", encoding="utf-8")
+        append = resume and os.path.exists(args.out) and os.path.getsize(args.out) > 0
+        fh = open(args.out, "a" if append else "w", newline="", encoding="utf-8")
         writer = csv.writer(fh)
-        writer.writerow(COLUMNS)
+        if not append:  # fresh file gets a header; append continues an existing one
+            writer.writerow(COLUMNS)
 
     it = tqdm(items, desc="kv-attn", unit="sent") if tqdm else items
     try:
@@ -426,6 +468,12 @@ def main() -> None:
         "--configs",
         default="K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0",
         help="Comma list of K<kb>V<vb>@<rw> (e.g. K4V4@24,K4V4@0).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip sentences already in --out (or, with --no-divergence, whose wavs "
+        "exist) and append instead of overwriting. Use only on CSVs from this fix.",
     )
     parser.add_argument("--step-stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
