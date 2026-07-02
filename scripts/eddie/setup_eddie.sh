@@ -28,7 +28,7 @@ python -m pip install --user --upgrade pip
 # that package with `--no-deps`.
 python -m pip install --user \
     "transformers==4.57.3" "accelerate==1.12.0" \
-    librosa soundfile onnxruntime einops "scipy>=1.10.0" \
+    librosa soundfile sox onnxruntime einops "scipy>=1.10.0" \
     openai-whisper jiwer pandas \
     encodec vocos tokenizers unidecode inflect eng_to_ipa jieba cn2an wget tqdm
 
