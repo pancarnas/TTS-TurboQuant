@@ -100,7 +100,11 @@ def _single_func(name, ns_extra):
 def test_parse_configs():
     parse = _single_func(
         "parse_configs",
-        {"re": re, "_CFG_RE": re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")},
+        {
+            "re": re,
+            "_CFG_RE": re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$"),
+            "FP16_SPEC": (None, None, None),
+        },
     )
     assert parse("K4V4@24,K4V3@24,K3V3@24,K4V4@0") == [
         (4, 4, 24),
@@ -108,6 +112,9 @@ def test_parse_configs():
         (3, 3, 24),
         (4, 4, 0),
     ]
+    # 'fp16' (any case) is the uncompressed-baseline sentinel
+    assert parse("K4V4@24,fp16") == [(4, 4, 24), (None, None, None)]
+    assert parse("FP16") == [(None, None, None)]
 
 
 # --- pure metric helpers --------------------------------------------------
@@ -260,6 +267,22 @@ def test_recorder_logs_one_row_per_config_with_sane_values():
     assert by_rw[0]["attn_js"] >= by_rw[16]["attn_js"]
     assert by_rw[0]["cos_k"] <= by_rw[16]["cos_k"]
     assert by_rw[0]["out_cos"] <= by_rw[16]["out_cos"]
+
+
+def test_recorder_skips_fp16_spec():
+    ns = _block()
+    q, key, value, hd, groups = _attn_inputs(64)
+    rec = ns["DivergenceRecorder"](
+        specs=[(None, None, None), (4, 4, 0)],  # fp16 baseline + one real config
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+    )
+    rec.group, rec.idx = "g", 0
+    rec.record(_module(groups), q, key, value, None, hd**-0.5)
+    assert rec.errors == 0 and len(rec.rows) == 1  # fp16 contributes no rows
+    assert dict(zip(COLS, rec.rows[0]))["key_bits"] == 4
 
 
 def test_recorder_step_stride_skips_unrecorded_positions():
@@ -490,6 +513,24 @@ def test_wav_path_encodes_protected_layers(tmp_path):
     p2 = wav_path(str(tmp_path), "g", 0, 0, 0.9, 4, 4, 24, 2)
     p0 = wav_path(str(tmp_path), "g", 0, 0, 0.9, 4, 4, 24, 0)
     assert p2.endswith("_pl=2.wav") and p0.endswith("_pl=0.wav") and p2 != p0
+
+
+def test_wav_path_fp16_shared_across_protected_layers(tmp_path):
+    wav_path = _single_func("_wav_path", {"os": os})
+    p0 = wav_path(str(tmp_path), "g", 0, 0, 0.9, None, None, None, 0)
+    p2 = wav_path(str(tmp_path), "g", 0, 0, 0.9, None, None, None, 2)
+    assert p0.endswith("_fp16.wav") and "pl=" not in os.path.basename(p0)
+    assert p0 == p2  # protection doesn't apply to fp16 -> one shared baseline wav
+
+
+def test_audio_done_with_fp16_spec(tmp_path):
+    wav_path = _single_func("_wav_path", {"os": os})
+    audio_done = _single_func("audio_done", {"os": os, "_wav_path": wav_path})
+    specs = [(None, None, None), (4, 4, 24)]
+    (tmp_path / "qwen_g_0_sampling_s0_t0.9_K4_V4_rw=24_pl=0.wav").write_bytes(b"x")
+    assert audio_done(str(tmp_path), "g", 0, 0, 0.9, specs, 0) is False
+    (tmp_path / "qwen_g_0_sampling_s0_t0.9_fp16.wav").write_bytes(b"x")
+    assert audio_done(str(tmp_path), "g", 0, 0, 0.9, specs, 0) is True
 
 
 def test_make_patch_records_only_when_active_and_counts_errors():

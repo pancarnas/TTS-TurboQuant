@@ -18,7 +18,11 @@ Rows carry a ``protected_layers`` column and wavs a ``_pl=<n>`` name segment, so
 runs with different ``--protected-layers`` never conflate (also keys --resume).
 
 Configs are given as ``--configs "K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0"``
-(K<key_bits>V<value_bits>@<residual_window>). No Whisper/ASR, no WavLM — run the
+(K<key_bits>V<value_bits>@<residual_window>). The special token ``fp16`` is
+uncompressed inference (config=None, no TQ hooks): its wav is the quality
+baseline for offline CER/speaker-sim scoring, it contributes no divergence rows
+(fp16 vs fp16 is zero by construction), and its filename carries no _pl segment
+since protection doesn't apply. No Whisper/ASR, no WavLM — run the
 whisper pipeline separately on the saved wavs. Divergence rows STREAM to the CSV
 per sentence (bounded RAM, crash-safe at sentence granularity).
 
@@ -82,23 +86,29 @@ _METRICS = COLUMNS[8:]
 
 _CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
 
+# --configs token "fp16": uncompressed generation (config=None), audio baseline.
+FP16_SPEC = (None, None, None)
 
-def parse_configs(spec: str) -> list[tuple[int, int, int]]:
-    """'K4V4@24,K4V4@0' -> [(4,4,24), (4,4,0)]  (key_bits, value_bits, rw)."""
+
+def parse_configs(spec: str) -> list[tuple]:
+    """'K4V4@24,fp16' -> [(4,4,24), FP16_SPEC]  ((key_bits, value_bits, rw))."""
     out = []
     for tok in spec.split(","):
         tok = tok.strip()
         if not tok:
             continue
+        if tok.lower() == "fp16":
+            out.append(FP16_SPEC)
+            continue
         m = _CFG_RE.match(tok)
         if not m:
-            raise SystemExit(f"bad config {tok!r}; expected e.g. K4V4@24")
+            raise SystemExit(f"bad config {tok!r}; expected e.g. K4V4@24 or fp16")
         out.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
     return out
 
 
-def config_label(kb: int, vb: int, rw: int) -> str:
-    return f"K{kb}V{vb}@{rw}"
+def config_label(kb, vb, rw) -> str:
+    return "fp16" if kb is None else f"K{kb}V{vb}@{rw}"
 
 
 def make_config(kb: int, vb: int, rw: int, protected_layers: int = 2) -> TurboQuantConfig:
@@ -211,6 +221,8 @@ class DivergenceRecorder:
         # to bf16 after softmax, which would floor JS/TV at rounding noise).
         af = compressed_attention(query, key, groups, attention_mask, scaling)
         for kb, vb, rw in self.specs:
+            if kb is None:  # fp16 baseline: audio-only, zero divergence by construction
+                continue
             comp = self._comp(module.layer_idx, kb, vb, rw, head_dim, key.device)
             ck, cv = comp.compress_kv(key, value)
             rk, rv = comp.decompress_kv(ck, cv)
@@ -352,10 +364,10 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl):
-    return os.path.join(
-        out_dir,
-        f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_K{kb}_V{vb}_rw={rw}_pl={pl}.wav",
-    )
+    # fp16 carries no _pl segment: protection doesn't apply to uncompressed
+    # generation, so runs at different --protected-layers share one baseline wav.
+    cfg = "fp16" if kb is None else f"K{kb}_V{vb}_rw={rw}_pl={pl}"
+    return os.path.join(out_dir, f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_{cfg}.wav")
 
 
 def load_done(out_path: str, protected_layers: int) -> set:
@@ -456,7 +468,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
             )
             if args.voice_mode == "clone" and not ref_audio:
                 continue
-            for kb, vb, rw in specs:  # compressed audio (recorder off)
+            for kb, vb, rw in specs:  # per-config audio (recorder off); fp16 -> no TQ
                 recorder.active = False
                 set_global_seed(args.seed, deterministic=False)
                 wavs, sr, *_ = run_generation(
@@ -464,7 +476,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     item.text,
                     "English",
                     speaker,
-                    make_config(kb, vb, rw, args.protected_layers),
+                    None if kb is None else make_config(kb, vb, rw, args.protected_layers),
                     seed=args.seed,
                     gen_overrides=decode_overrides(
                         "sampling", temperature=args.temperature
@@ -530,7 +542,8 @@ def main() -> None:
     parser.add_argument(
         "--configs",
         default="K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0",
-        help="Comma list of K<kb>V<vb>@<rw> (e.g. K4V4@24,K4V4@0).",
+        help="Comma list of K<kb>V<vb>@<rw> (e.g. K4V4@24,K4V4@0). The token 'fp16' "
+        "adds an uncompressed baseline: audio only, no divergence rows.",
     )
     parser.add_argument(
         "--resume",
