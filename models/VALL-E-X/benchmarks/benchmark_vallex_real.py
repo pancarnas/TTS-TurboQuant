@@ -106,6 +106,7 @@ Phase 4 design sketch — realizing REAL memory savings (eff_ratio > 1):
 
 import sys
 import os
+import re
 import time
 import argparse
 import atexit
@@ -204,6 +205,43 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
 
 # Default sweep (rw=128); main() rebuilds from --residual-window before consumers.
 TURBOQUANT_CONFIGS = build_turboquant_configs(128)
+
+
+# Same token grammar as the Qwen divergence experiment: K<kb>V<vb>@<rw> or fp16.
+_CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
+
+
+def parse_configs_arg(spec: str, protected_layers: int) -> list:
+    """'fp16,K4V4@0,K3V3@64' -> [(label, TurboQuantConfig|None), ...].
+
+    Explicit-config runs are quality experiments by definition, so every TQ
+    config is built with track_only=False (the lossy write-back path). The
+    analytic fast path would make all arms bit-identical audio.
+    """
+    out = []
+    for tok in (t.strip() for t in spec.split(",")):
+        if not tok:
+            continue
+        if tok.lower() in ("fp16", "baseline"):
+            out.append(("fp16", None))
+            continue
+        m = _CFG_RE.match(tok)
+        if m is None:
+            raise SystemExit(
+                f"bad config token {tok!r}; expected e.g. K4V4@64 or fp16"
+            )
+        kb, vb, rw = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        cfg = TurboQuantConfig(
+            key_bits=kb,
+            value_bits=vb,
+            residual_window=rw,
+            protected_layers=protected_layers,
+            track_only=False,
+        )
+        out.append((f"K{kb}V{vb}@{rw}", cfg))
+    if not out:
+        raise SystemExit("--configs given but no valid tokens parsed")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1574,7 +1612,25 @@ def main():
         type=int,
         default=128,
         help="Most-recent tokens kept fp16-exact; older tokens are quantized. "
-        "rw=0 is paper-faithful TurboQuant (quantize every token). Default 128.",
+        "rw=0 is paper-faithful TurboQuant (quantize every token). Default 128. "
+        "Ignored when --configs is given (each token carries its own rw).",
+    )
+    parser.add_argument(
+        "--configs",
+        default="",
+        help="Explicit per-config sweep, e.g. 'fp16,K4V4@0,K4V4@64,K3V3@128' "
+        "(K<key_bits>V<value_bits>@<residual_window>; 'fp16' = no-TQ baseline). "
+        "Same grammar as the Qwen divergence experiment. Overrides the default "
+        "sweep and --residual-window, and FORCES track_only=False (lossy "
+        "write-back path) on every TQ config so quality differences are real.",
+    )
+    parser.add_argument(
+        "--protected-layers",
+        type=int,
+        default=2,
+        help="First N and last N decoder layers keep 8-bit K/V (TurboQuantConfig "
+        "default 2 -> layers 0,1,10,11 of VALL-E-X's 12). Applied to every TQ "
+        "config in the sweep. Use 0 for a no-protection run.",
     )
     parser.add_argument(
         "--track-only-off",
@@ -1610,11 +1666,25 @@ def main():
     )
     args = parser.parse_args()
 
-    # Rebuild the sweep at the requested residual window before any consumer runs.
+    # Rebuild the sweep before any consumer runs: either the explicit
+    # --configs list (per-config rw, lossy path forced) or the legacy default
+    # sweep at the shared --residual-window.
     if args.residual_window < 0:
         parser.error(f"--residual-window must be >= 0, got {args.residual_window}")
+    if args.protected_layers < 0:
+        parser.error(f"--protected-layers must be >= 0, got {args.protected_layers}")
     global TURBOQUANT_CONFIGS
-    TURBOQUANT_CONFIGS = build_turboquant_configs(args.residual_window)
+    if args.configs:
+        TURBOQUANT_CONFIGS = parse_configs_arg(args.configs, args.protected_layers)
+        print(
+            f"[configs] explicit sweep: {[n for n, _ in TURBOQUANT_CONFIGS]} "
+            f"(protected_layers={args.protected_layers}, track_only=False forced)"
+        )
+    else:
+        TURBOQUANT_CONFIGS = build_turboquant_configs(args.residual_window)
+        for _, cfg in TURBOQUANT_CONFIGS:
+            if cfg is not None:
+                cfg.protected_layers = args.protected_layers
 
     # Propagate track_only=False into every TurboQuantConfig if requested.
     if args.track_only_off:

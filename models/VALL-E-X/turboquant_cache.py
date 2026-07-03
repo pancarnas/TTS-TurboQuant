@@ -12,12 +12,13 @@ regression observed vs baseline.
 Two modes:
   - config.track_only=True (default) — fp16 buffers only, compression metrics
     are computed analytically from cur_len + config. Fast path for inference.
-  - config.track_only=False — legacy path that actually compresses old tokens
-    via TurboQuantV3. Only useful for reconstruction-quality A/B tests, because
-    VALL-E-X's standard softmax attention always reads full fp16 K/V and so
-    CANNOT realize the theoretical memory savings regardless. In this mode the
-    cache still runs at fp16 for the attention path but additionally holds
-    compressed chunks for the memory report.
+  - config.track_only=False — LOSSY quality-experiment path: tokens that age
+    out of the residual window are compressed once via TurboQuantV3 and the
+    quantize->dequantize reconstruction is written back into the fp16 buffer,
+    so attention reads exactly what a deployed compressed cache would serve.
+    The compressed blobs are also retained for the memory report. Storage
+    stays fp16-realized (VALL-E-X's softmax attention reads fp16 K/V), so the
+    memory savings remain theoretical — but the QUALITY effect is real.
 """
 
 import math
@@ -127,9 +128,12 @@ class TurboQuantValleCache:
     def _legacy_compress_overflow(self, layer_idx: int, new_total_len: int,
                                   new_key: torch.Tensor,
                                   new_value: torch.Tensor) -> None:
-        """When track_only=False, actually compress tokens that fall out of the
-        residual window and keep the compressed blobs around for memory_report.
-        The fp16 buffer still holds the full sequence for attention to read.
+        """When track_only=False, compress tokens that fall out of the residual
+        window, write the lossy reconstruction back into the fp16 buffer (so
+        attention reads quantized K/V, as deployment would), and keep the
+        compressed blobs around for memory_report. Each token is quantized
+        exactly once — at the step it ages out of the window — and the
+        reconstruction persists in the buffer from then on.
         """
         rw = self.config.residual_window
         if new_total_len <= rw:
@@ -154,6 +158,15 @@ class TurboQuantValleCache:
 
         comp = self._get_compressor(layer_idx, new_key.shape[-1], new_key.device)
         ck, cv = comp.compress_kv(overflow_k, overflow_v)
+
+        # Lossy write-back: attention must read what a deployed compressed
+        # cache would serve, so overwrite the aged-out span with the
+        # quantize->dequantize reconstruction. (The chunk compressor has
+        # residual_window=0, so decompress_kv returns exactly this span.)
+        rec_k, rec_v = comp.decompress_kv(ck, cv)
+        buf_dtype = self._buf_k[layer_idx].dtype
+        self._buf_k[layer_idx][:, :, start:end, :].copy_(rec_k.to(buf_dtype))
+        self._buf_v[layer_idx][:, :, start:end, :].copy_(rec_v.to(buf_dtype))
 
         self._compressed_chunks_k.setdefault(layer_idx, []).append(
             {"blob": ck, "span": end - start}
