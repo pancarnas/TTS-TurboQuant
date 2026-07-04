@@ -34,26 +34,55 @@ _NAME_RE = re.compile(
     r"_K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)(?:_pl=(?P<pl>\d+))?\.wav$"
 )
 
+# VALL-E-X benchmark naming (benchmark_vallex_real.py --configs runs):
+#   vallex_<group>_<idx>_<arm>_s<seed>[_t<temp>]_<config>.wav
+# where <config> is 'fp16' or a K<kb>V<vb>@<rw> label.
+_VALLEX_RE = re.compile(
+    r"vallex_(?P<group>.+)_(?P<idx>\d+)_(?P<arm>[a-z]+)_s(?P<seed>\d+)"
+    r"(?:_t(?P<temp>[\d.]+))?"
+    r"_(?:(?P<fp>fp16)|K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+))\.wav$"
+)
+
 
 def parse_wav_name(name: str) -> dict | None:
     """Parse a saved-wav filename into its (group, idx, config) fields, or None."""
-    m = _NAME_RE.search(os.path.basename(name))
-    if not m:
-        return None
-    d = m.groupdict()
-    pl = int(d["pl"]) if d["pl"] is not None else None
-    # pl joins the config label so runs at different protection settings in the
-    # same dir never compare as "the same config".
-    config = f"K{d['kb']}V{d['vb']}@{d['rw']}" + (f" pl{pl}" if pl is not None else "")
-    return {
-        "group": d["group"],
-        "idx": int(d["idx"]),
-        "config": config,
-        "kb": int(d["kb"]),
-        "vb": int(d["vb"]),
-        "rw": int(d["rw"]),
-        "pl": pl,
-    }
+    base = os.path.basename(name)
+    m = _NAME_RE.search(base)
+    if m:
+        d = m.groupdict()
+        pl = int(d["pl"]) if d["pl"] is not None else None
+        # pl joins the config label so runs at different protection settings in
+        # the same dir never compare as "the same config".
+        config = f"K{d['kb']}V{d['vb']}@{d['rw']}" + (
+            f" pl{pl}" if pl is not None else ""
+        )
+        return {
+            "group": d["group"],
+            "idx": int(d["idx"]),
+            "config": config,
+            "kb": int(d["kb"]),
+            "vb": int(d["vb"]),
+            "rw": int(d["rw"]),
+            "pl": pl,
+        }
+    m = _VALLEX_RE.search(base)
+    if m:
+        d = m.groupdict()
+        if d["fp"]:
+            config, kb, vb, rw = "fp16", None, None, None
+        else:
+            kb, vb, rw = int(d["kb"]), int(d["vb"]), int(d["rw"])
+            config = f"K{kb}V{vb}@{rw}"
+        return {
+            "group": d["group"],
+            "idx": int(d["idx"]),
+            "config": config,
+            "kb": kb,
+            "vb": vb,
+            "rw": rw,
+            "pl": None,
+        }
+    return None
 
 
 def wav_stats(path: str) -> dict:
@@ -182,6 +211,18 @@ def main() -> None:
                 f"  {mild} vs {aggr}: differ {d}/{h}"
                 + ("  (good)" if d else "  <-- identical, suspicious")
             )
+    # When an fp16 baseline is present (VALL-E-X naming), diff it against every
+    # quantized config — identical audio means the lossy path never ran.
+    if "fp16" in s["configs"]:
+        for cfg in s["configs"]:
+            if cfg == "fp16":
+                continue
+            d, h = _pair_diff_rate(sents, "fp16", cfg)
+            if h:
+                print(
+                    f"  fp16 vs {cfg}: differ {d}/{h}"
+                    + ("  (good)" if d else "  <-- identical, lossy path NOT live!")
+                )
 
     if args.verbose:
         print("\n-- per sentence --")
