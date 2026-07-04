@@ -107,6 +107,22 @@ class CERScorer:
         return float(cer(ref, hyp)) if ref else 0.0
 
 
+class WERScorer:
+    """Whisper EnglishTextNormalizer + jiwer WER, applied to ref and hyp alike."""
+
+    def __init__(self) -> None:
+        from whisper.normalizers import EnglishTextNormalizer
+
+        self._norm = EnglishTextNormalizer()
+
+    def __call__(self, target: str, hypothesis: str) -> float:
+        from jiwer import wer
+
+        ref = self._norm(target or "")
+        hyp = self._norm(hypothesis or "")
+        return float(wer(ref, hyp)) if ref else 0.0
+
+
 class WhisperTranscriber:
     """Loads a Whisper model once; transcribes a wav path at a forced language."""
 

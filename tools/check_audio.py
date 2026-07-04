@@ -36,11 +36,12 @@ _NAME_RE = re.compile(
 
 # VALL-E-X benchmark naming (benchmark_vallex_real.py --configs runs):
 #   vallex_<group>_<idx>_<arm>_s<seed>[_t<temp>]_<config>.wav
-# where <config> is 'fp16' or a K<kb>V<vb>@<rw> label.
+# where <config> is 'fp16' or a K<kb>V<vb>@<rw> label with an optional
+# '-nar' / '-both' stage suffix (which decoder stage was quantized).
 _VALLEX_RE = re.compile(
     r"vallex_(?P<group>.+)_(?P<idx>\d+)_(?P<arm>[a-z]+)_s(?P<seed>\d+)"
     r"(?:_t(?P<temp>[\d.]+))?"
-    r"_(?:(?P<fp>fp16)|K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+))\.wav$"
+    r"_(?:(?P<fp>fp16)|K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+)(?P<stage>-nar|-both)?)\.wav$"
 )
 
 
@@ -72,7 +73,7 @@ def parse_wav_name(name: str) -> dict | None:
             config, kb, vb, rw = "fp16", None, None, None
         else:
             kb, vb, rw = int(d["kb"]), int(d["vb"]), int(d["rw"])
-            config = f"K{kb}V{vb}@{rw}"
+            config = f"K{kb}V{vb}@{rw}" + (d["stage"] or "")
         return {
             "group": d["group"],
             "idx": int(d["idx"]),

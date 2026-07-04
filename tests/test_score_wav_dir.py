@@ -49,6 +49,60 @@ def test_parse_wav_name_rejects_foreign():
     assert parse_wav_name("notes.txt") is None
 
 
+def test_parse_wav_name_vallex_variants():
+    e = parse_wav_name("vallex_seedtts_en_7_sampling_s0_K4V4@64.wav")
+    assert e["group"] == "seedtts_en" and e["idx"] == 7 and e["arm"] == "sampling"
+    assert e["config"] == "K4V4@64" and e["key_bits"] == 4 and e["rw"] == 64
+    assert e["pl"] == FP16_PL and e["temperature"] == ""
+
+    nar = parse_wav_name("vallex_smoke_1_sampling_s0_K4V4@64-nar.wav")
+    assert nar["config"] == "K4V4@64-nar"
+
+    both = parse_wav_name("vallex_smoke_1_greedy_s2_t0.9_K3V3@128-both.wav")
+    assert both["config"] == "K3V3@128-both" and both["arm"] == "greedy"
+    assert both["seed"] == 2 and both["temperature"] == 0.9
+
+    fp = parse_wav_name("vallex_librispeech_pc_12_sampling_s0_fp16.wav")
+    assert fp["config"] == "fp16" and fp["group"] == "librispeech_pc"
+    assert fp["pl"] == FP16_PL
+
+
+def test_attach_baseline_vallex_is_arm_scoped(tmp_path):
+    _touch(
+        tmp_path,
+        [
+            "vallex_g_0_sampling_s0_fp16.wav",
+            "vallex_g_0_sampling_s0_K4V4@64-nar.wav",
+            "vallex_g_0_greedy_s0_K4V4@64.wav",  # no greedy fp16 -> missing
+        ],
+    )
+    entries, _ = collect_entries(str(tmp_path))
+    missing = attach_baseline(entries)
+    assert missing == 1
+    by = {(e.get("arm"), e["config"]): e for e in entries}
+    assert by[("sampling", "K4V4@64-nar")]["baseline_path"].endswith("_fp16.wav")
+    assert by[("greedy", "K4V4@64")]["baseline_path"] is None
+
+
+def test_score_entries_wer_column(tmp_path):
+    _touch(tmp_path, ["vallex_g_0_sampling_s0_fp16.wav"])
+    entries, _ = collect_entries(str(tmp_path))
+    attach_baseline(entries)
+    rows = []
+    score_entries(
+        entries,
+        text_lookup={("g", 0): "hello"},
+        transcribe=lambda p: "hello",
+        score=lambda r, h: 0.0,
+        embed=lambda p: (1.0, 0.0),
+        wav_duration=lambda p: 1.0,
+        emit=rows.append,
+        score_wer=lambda r, h: 0.5,
+    )
+    assert rows[0]["wer"] == 0.5 and rows[0]["cer"] == 0.0
+    assert rows[0]["arm"] == "sampling"
+
+
 def _touch(d, names):
     for n in names:
         (d / n).write_bytes(b"x")

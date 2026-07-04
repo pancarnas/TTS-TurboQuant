@@ -30,6 +30,19 @@ def test_parse_wav_name_rejects_nonmatching():
     assert parse_wav_name("qwen_x_1_greedy.wav") is None
 
 
+def test_parse_wav_name_vallex_naming():
+    d = parse_wav_name("vallex_smoke_0_sampling_s0_fp16.wav")
+    assert d["group"] == "smoke" and d["idx"] == 0 and d["config"] == "fp16"
+    d2 = parse_wav_name("vallex_seedtts_en_42_sampling_s0_K4V4@128.wav")
+    assert d2["group"] == "seedtts_en" and d2["config"] == "K4V4@128"
+    assert (d2["kb"], d2["vb"], d2["rw"]) == (4, 4, 128)
+    # stage suffixes distinguish AR-only vs NAR-only vs both arms
+    d3 = parse_wav_name("vallex_smoke_1_sampling_s0_K4V4@64-nar.wav")
+    assert d3["config"] == "K4V4@64-nar"
+    d4 = parse_wav_name("vallex_smoke_1_sampling_s0_t0.9_K3V3@128-both.wav")
+    assert d4["config"] == "K3V3@128-both" and d4["idx"] == 1
+
+
 def _st(md5, dur=2.0, rms=0.1, n=48000, ok=True):
     return {
         "ok": ok,
