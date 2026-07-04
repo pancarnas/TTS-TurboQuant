@@ -19,9 +19,15 @@ attention-divergence metrics as the Qwen experiment (attn_js, attn_top1,
 cos_k, ...), computed quantized-vs-exact inside the decoder via
 DivergenceRecorder — so tools/analyze_divergence.py reads this CSV too.
 
+Group requirements: items must carry ``ground_truth_audio``. That holds for
+``librispeech_pc`` (every item points at a real test-clean flac) but NOT for
+``seedtts_en``'s default meta.lst (4 fields, no ground-truth wav — only its
+cross-speaker list has one) nor ``ellav_hard`` (text-only). Items without
+ground truth are counted and skipped.
+
 Run from the repo root (PYTHONPATH per scripts/eddie/eddie_run.sh):
   python models/VALL-E-X/benchmarks/vallex_ppl_divergence.py \
-      --groups seedtts_en,librispeech_pc --max-per-group 50 \
+      --groups librispeech_pc --max-per-group 100 \
       --configs "K4V4@64,K4V3@64,K3V3@64,K3V3@128" --protected-layers 2 \
       --device cuda --out results/vallex_ppl.csv \
       --divergence-out results/vallex_attn_divergence.csv
@@ -142,7 +148,12 @@ def done_keys(out_path: str) -> set:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--groups", default="seedtts_en,librispeech_pc")
+    ap.add_argument(
+        "--groups",
+        default="librispeech_pc",
+        help="Only groups whose items carry ground-truth audio contribute "
+        "(librispeech_pc does; seedtts_en/ellav_hard do not).",
+    )
     ap.add_argument("--max-per-group", type=int, default=50)
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--configs", default="K4V4@64,K4V3@64,K3V3@64,K3V3@128")
