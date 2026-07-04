@@ -113,7 +113,7 @@ import atexit
 import datetime
 import shutil
 import subprocess
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # VALL-E-X uses bare module imports (e.g. `from models.vallex import VALLE`);
 # add its directory to sys.path so those resolve.
@@ -178,8 +178,25 @@ def vallex_decode_params(arm: str, temperature: Optional[float] = None) -> dict:
     raise ValueError(f"unknown decode arm: {arm!r}")
 
 
+class StageConfigs(NamedTuple):
+    """TurboQuant configs per decoder stage; None disables that stage.
+
+    The sweep entries are ``(label, StageConfigs | None)`` — None is the
+    fp16 baseline. ``ar`` drives the AR KV cache (TurboQuantValleCache),
+    ``nar`` the per-pass NAR K/V quantization (NARQuantizer).
+    """
+
+    ar: Optional[TurboQuantConfig] = None
+    nar: Optional[TurboQuantConfig] = None
+
+    @property
+    def primary(self) -> Optional[TurboQuantConfig]:
+        """The config whose bits/rw label this arm (for CSV columns)."""
+        return self.ar if self.ar is not None else self.nar
+
+
 def build_turboquant_configs(residual_window: int = 128) -> list:
-    """The 5-config sweep at a given residual window (see Qwen benchmark twin).
+    """The default AR-only sweep at a given residual window (Qwen twin).
 
     ``residual_window`` = most-recent tokens kept fp16-exact; ``rw=0`` is
     paper-faithful TurboQuant (quantize every token). Labels embed the window.
@@ -190,15 +207,15 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
         ("baseline (no TQ)", None),
         (
             f"K4/V4 rw={rw}",
-            TurboQuantConfig(key_bits=4, value_bits=4, residual_window=rw),
+            StageConfigs(ar=TurboQuantConfig(key_bits=4, value_bits=4, residual_window=rw)),
         ),
         (
             f"K4/V3 rw={rw}",
-            TurboQuantConfig(key_bits=4, value_bits=3, residual_window=rw),
+            StageConfigs(ar=TurboQuantConfig(key_bits=4, value_bits=3, residual_window=rw)),
         ),
         (
             f"K4/V2 rw={rw}",
-            TurboQuantConfig(key_bits=4, value_bits=2, residual_window=rw),
+            StageConfigs(ar=TurboQuantConfig(key_bits=4, value_bits=2, residual_window=rw)),
         ),
     ]
 
@@ -207,17 +224,33 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
 TURBOQUANT_CONFIGS = build_turboquant_configs(128)
 
 
-# Same token grammar as the Qwen divergence experiment: K<kb>V<vb>@<rw> or fp16.
-_CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
+# Same token grammar as the Qwen divergence experiment — K<kb>V<vb>@<rw> or
+# fp16 — plus an optional stage prefix: 'ar:' (default), 'nar:', or 'both:'.
+_CFG_RE = re.compile(r"(?:(ar|nar|both):)?[Kk](\d+)[Vv](\d+)@(\d+)$")
 
 
 def parse_configs_arg(spec: str, protected_layers: int) -> list:
-    """'fp16,K4V4@0,K3V3@64' -> [(label, TurboQuantConfig|None), ...].
+    """'fp16,K4V4@64,nar:K4V4@64,both:K4V4@64' -> [(label, StageConfigs|None)].
+
+    Stage prefix selects which decoder stage(s) get quantized K/V: 'ar:'
+    (default — the AR KV cache), 'nar:' (per-pass NAR quantization), or
+    'both:'. Labels carry a '-nar' / '-both' suffix so wav names and CSV
+    config columns stay distinct.
 
     Explicit-config runs are quality experiments by definition, so every TQ
     config is built with track_only=False (the lossy write-back path). The
     analytic fast path would make all arms bit-identical audio.
     """
+
+    def _make(kb, vb, rw):
+        return TurboQuantConfig(
+            key_bits=kb,
+            value_bits=vb,
+            residual_window=rw,
+            protected_layers=protected_layers,
+            track_only=False,
+        )
+
     out = []
     for tok in (t.strip() for t in spec.split(",")):
         if not tok:
@@ -228,17 +261,18 @@ def parse_configs_arg(spec: str, protected_layers: int) -> list:
         m = _CFG_RE.match(tok)
         if m is None:
             raise SystemExit(
-                f"bad config token {tok!r}; expected e.g. K4V4@64 or fp16"
+                f"bad config token {tok!r}; expected e.g. K4V4@64, "
+                "nar:K4V4@64, both:K4V4@64, or fp16"
             )
-        kb, vb, rw = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        cfg = TurboQuantConfig(
-            key_bits=kb,
-            value_bits=vb,
-            residual_window=rw,
-            protected_layers=protected_layers,
-            track_only=False,
+        stage = m.group(1) or "ar"
+        kb, vb, rw = int(m.group(2)), int(m.group(3)), int(m.group(4))
+        # Separate config instances per stage — never share a mutable config.
+        entry = StageConfigs(
+            ar=_make(kb, vb, rw) if stage in ("ar", "both") else None,
+            nar=_make(kb, vb, rw) if stage in ("nar", "both") else None,
         )
-        out.append((f"K{kb}V{vb}@{rw}", cfg))
+        suffix = "" if stage == "ar" else f"-{stage}"
+        out.append((f"K{kb}V{vb}@{rw}{suffix}", entry))
     if not out:
         raise SystemExit("--configs given but no valid tokens parsed")
     return out
@@ -264,11 +298,24 @@ class QualityMetrics:
 
             self._whisper = whisper.load_model("base", device=self._device)
 
-    def whisper_cer(
+    @staticmethod
+    def _normalize_for_wer(text: str) -> str:
+        """Lowercase, strip punctuation (keeping in-word apostrophes), collapse
+        whitespace — the standard TTS-eval WER protocol, so casing and
+        punctuation differences don't count as word errors."""
+        text = re.sub(r"[^\w\s']", " ", text.lower())
+        return " ".join(text.split())
+
+    def whisper_scores(
         self, wav: np.ndarray, sr: int, reference_text: str
-    ) -> tuple[float, str]:
+    ) -> tuple[float, float, str]:
+        """One Whisper pass -> (CER, WER, transcript).
+
+        CER is computed on the raw strings (backward compatible with all prior
+        runs); WER on normalized text (see _normalize_for_wer).
+        """
         self._load_whisper()
-        from jiwer import cer
+        from jiwer import cer, wer
 
         wav = wav.astype(np.float32)
         if wav.ndim > 1:
@@ -277,8 +324,11 @@ class QualityMetrics:
         transcript = result["text"].strip()
         ref = reference_text.strip()
         if not ref:
-            return 0.0, transcript
-        return float(cer(ref, transcript)), transcript
+            return 0.0, 0.0, transcript
+        ref_norm = self._normalize_for_wer(ref)
+        hyp_norm = self._normalize_for_wer(transcript)
+        word_error = float(wer(ref_norm, hyp_norm)) if ref_norm else 0.0
+        return float(cer(ref, transcript)), word_error, transcript
 
     # Sentinel values for self._wavlm_model:
     #   None  — not loaded yet
@@ -644,7 +694,8 @@ def run_generation(
         temperature=dp["temperature"],
         prompt_language=lang_pr,
         text_language=langs,
-        turboquant_config=tq_config,
+        turboquant_config=tq_config.ar if tq_config is not None else None,
+        turboquant_config_nar=tq_config.nar if tq_config is not None else None,
     )
     if _is_cuda(device):
         torch.cuda.synchronize(device)
@@ -660,8 +711,15 @@ def run_generation(
 
     wav = decode_audio(codec, vocos, encoded_frames, device)
 
+    # Memory report exists only for the AR cache manager; NAR-only arms have
+    # nothing cached, so their memory fields stay empty by design.
     memory_report = None
-    if tq_config is not None and hasattr(model, "_tq_cache_manager"):
+    if (
+        tq_config is not None
+        and tq_config.ar is not None
+        and hasattr(model, "_tq_cache_manager")
+        and model._tq_cache_manager is not None
+    ):
         memory_report = model._tq_cache_manager.memory_report()
 
     return (
@@ -680,9 +738,21 @@ def run_generation(
 # ---------------------------------------------------------------------------
 
 
-def _out_path(output_dir: str, group_name: str, idx: int, config_name: str) -> str:
+def _out_path(
+    output_dir: str,
+    group_name: str,
+    idx: int,
+    config_name: str,
+    arm: str = "sampling",
+    seed: int = 0,
+    temperature=None,
+) -> str:
+    """Path a generated wav was saved to (must mirror the save in the sweep)."""
     safe = config_name.replace(" ", "_").replace("/", "_")
-    return os.path.join(output_dir, f"vallex_{group_name}_{idx}_{safe}.wav")
+    tsuf = "" if temperature is None else f"_t{temperature}"
+    return os.path.join(
+        output_dir, f"vallex_{group_name}_{idx}_{arm}_s{seed}{tsuf}_{safe}.wav"
+    )
 
 
 def _tee(fh, msg):
@@ -718,6 +788,7 @@ def _vallex_empty_group_results() -> dict:
         "ar_rtf",
         "nar_rtf",
         "cer",
+        "wer",
         "spk_sim",
         "spk_sim_ref",
         "theoretical_ratio",
@@ -783,7 +854,9 @@ def _vallex_sweep_sentence_seed(
     baseline_wav = None
     ref_wav, ref_sr = _load_reference_clip(item, metrics)
     for config_name, tq_config in TURBOQUANT_CONFIGS:
-        key_bits, value_bits, residual_window = config_bits(tq_config)
+        key_bits, value_bits, residual_window = config_bits(
+            tq_config.primary if tq_config is not None else None
+        )
         try:
             (
                 wav,
@@ -837,13 +910,17 @@ def _vallex_sweep_sentence_seed(
                     r[k].append(mm[k])
 
             error_rate = None
+            word_error_rate = None
             spk_sim = None
             spk_sim_ref = None
             transcript_len = None
             if metrics:
-                error_rate, transcript = metrics.whisper_cer(wav, SAMPLE_RATE, text)
+                error_rate, word_error_rate, transcript = metrics.whisper_scores(
+                    wav, SAMPLE_RATE, text
+                )
                 transcript_len = len(transcript)
                 r["cer"].append(error_rate)
+                r["wer"].append(word_error_rate)
                 if tq_config is None:
                     baseline_wav = wav
                 elif baseline_wav is not None:
@@ -876,6 +953,8 @@ def _vallex_sweep_sentence_seed(
             )
             if error_rate is not None:
                 status += f" CER={error_rate:.1%}"
+                if word_error_rate is not None:
+                    status += f" WER={word_error_rate:.1%}"
                 if spk_sim is not None:
                     status += f" SpkSim={spk_sim:.4f}"
                 if spk_sim_ref is not None:
@@ -1268,7 +1347,8 @@ def profile_generation(
             temperature=1.0,
             prompt_language=lang_pr,
             text_language=langs,
-            turboquant_config=tq_config,
+            turboquant_config=tq_config.ar if tq_config is not None else None,
+            turboquant_config_nar=tq_config.nar if tq_config is not None else None,
         )
     if _is_cuda(device):
         torch.cuda.synchronize(device)
@@ -1399,7 +1479,12 @@ def profile_all_configs(args):
 
             peak_vram_mb = read_peak_memory_mb(device)
             mem_report = None
-            if tq_config is not None and hasattr(model, "_tq_cache_manager"):
+            if (
+                tq_config is not None
+                and tq_config.ar is not None
+                and hasattr(model, "_tq_cache_manager")
+                and model._tq_cache_manager is not None
+            ):
                 mem_report = model._tq_cache_manager.memory_report()
 
             _tee(
@@ -1497,12 +1582,15 @@ def evaluate_saved_wavs(args):
             baseline_wav = None
             baseline_sr = None
             for config_name, tq_config in TURBOQUANT_CONFIGS:
+                # Note: assumes the default sweep shape (sampling arm, seed 0,
+                # no temperature suffix). For full post-hoc scoring incl. WER
+                # use tools/score_wav_dir.py instead.
                 out_path = _out_path(output_dir, group_name, i, config_name)
                 if not os.path.exists(out_path):
                     continue
                 wav, sr = sf.read(out_path)
                 wav = wav.astype(np.float32)
-                error_rate, _ = metrics.whisper_cer(wav, sr, text)
+                error_rate, _, _ = metrics.whisper_scores(wav, sr, text)
                 group_results[config_name]["cer"].append(error_rate)
                 if tq_config is None:
                     baseline_wav = wav
@@ -1618,11 +1706,13 @@ def main():
     parser.add_argument(
         "--configs",
         default="",
-        help="Explicit per-config sweep, e.g. 'fp16,K4V4@0,K4V4@64,K3V3@128' "
-        "(K<key_bits>V<value_bits>@<residual_window>; 'fp16' = no-TQ baseline). "
-        "Same grammar as the Qwen divergence experiment. Overrides the default "
-        "sweep and --residual-window, and FORCES track_only=False (lossy "
-        "write-back path) on every TQ config so quality differences are real.",
+        help="Explicit per-config sweep, e.g. "
+        "'fp16,K4V4@64,nar:K4V4@64,both:K4V4@64' "
+        "(K<key_bits>V<value_bits>@<residual_window>; 'fp16' = no-TQ baseline; "
+        "optional stage prefix 'ar:' (default) / 'nar:' / 'both:' selects which "
+        "decoder stage gets quantized K/V). Overrides the default sweep and "
+        "--residual-window, and FORCES track_only=False (lossy write-back "
+        "path) on every TQ config so quality differences are real.",
     )
     parser.add_argument(
         "--protected-layers",
@@ -1682,15 +1772,19 @@ def main():
         )
     else:
         TURBOQUANT_CONFIGS = build_turboquant_configs(args.residual_window)
-        for _, cfg in TURBOQUANT_CONFIGS:
-            if cfg is not None:
-                cfg.protected_layers = args.protected_layers
+        for _, entry in TURBOQUANT_CONFIGS:
+            if entry is not None:
+                for cfg in (entry.ar, entry.nar):
+                    if cfg is not None:
+                        cfg.protected_layers = args.protected_layers
 
     # Propagate track_only=False into every TurboQuantConfig if requested.
     if args.track_only_off:
-        for _, cfg in TURBOQUANT_CONFIGS:
-            if cfg is not None:
-                cfg.track_only = False
+        for _, entry in TURBOQUANT_CONFIGS:
+            if entry is not None:
+                for cfg in (entry.ar, entry.nar):
+                    if cfg is not None:
+                        cfg.track_only = False
 
     # Validate and apply --groups / --max-per-group filters.
     requested = [g.strip() for g in args.groups.split(",") if g.strip()]

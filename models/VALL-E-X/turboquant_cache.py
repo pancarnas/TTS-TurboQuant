@@ -42,6 +42,60 @@ from turboquant.compressors_v3 import TurboQuantV3
 _INITIAL_CAPACITY = 256
 
 
+class NARQuantizer:
+    """Stateless per-call K/V quantize->dequantize for the NAR decoder.
+
+    Duck-typed to the attention hook in modules/activation.py
+    (multi_head_attention_forward): exposes ``update(layer_idx, k, v)``.
+    Unlike TurboQuantValleCache there is no storage — each NAR stage is a
+    full-sequence bidirectional pass, so "compression" means quantizing the
+    K/V that pass computes: tokens ``[0 : S-rw]`` lossy, the last ``rw``
+    tokens kept fp16. This is a robustness ablation, not a memory saving
+    (NAR caches nothing between stages).
+    """
+
+    def __init__(self, config: TurboQuantConfig, n_layers: int = 12):
+        self.config = config
+        self.n_layers = n_layers
+        self._compressors: dict[int, TurboQuantV3] = {}
+
+    def _get_compressor(self, layer_idx: int, head_dim: int,
+                        device: torch.device) -> TurboQuantV3:
+        if layer_idx not in self._compressors:
+            self._compressors[layer_idx] = TurboQuantV3(
+                head_dim=head_dim,
+                key_bits=self.config.key_bits,
+                value_bits=self.config.value_bits,
+                residual_window=0,
+                layer_idx=layer_idx,
+                n_layers=self.n_layers,
+                protected_layers=self.config.protected_layers,
+                protected_bits=self.config.protected_bits,
+                seed=self.config.seed,
+                device=str(device),
+            )
+        return self._compressors[layer_idx]
+
+    @torch.no_grad()
+    def update(self, layer_idx: int, k: torch.Tensor,
+               v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize->dequantize all but the last residual_window tokens.
+
+        k / v: (B, H, S, D) — the FULL sequence of one NAR pass, not an
+        incremental step. Returns same-shape tensors.
+        """
+        S = k.shape[2]
+        split = max(S - self.config.residual_window, 0)
+        if split == 0:
+            return k, v
+        comp = self._get_compressor(layer_idx, k.shape[-1], k.device)
+        ck, cv = comp.compress_kv(k[:, :, :split, :], v[:, :, :split, :])
+        rec_k, rec_v = comp.decompress_kv(ck, cv)
+        k = torch.cat([rec_k.to(k.dtype), k[:, :, split:, :]], dim=2)
+        v = torch.cat([rec_v.to(v.dtype), v[:, :, split:, :]], dim=2)
+        return k, v
+
+
 class TurboQuantValleCache:
     """Preallocated-buffer KV cache manager for VALL-E-X.
 

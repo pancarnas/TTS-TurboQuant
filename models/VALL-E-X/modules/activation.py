@@ -176,7 +176,10 @@ def multi_head_attention_forward(
             present = None
 
     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-    att = att.masked_fill(attn_mask[FULL_T - T:FULL_T, :FULL_T], float('-inf'))
+    if attn_mask is not None:
+        # None = full bidirectional attention (NAR decoder passes); AR always
+        # provides a causal mask, sliced to the current step's rows.
+        att = att.masked_fill(attn_mask[FULL_T - T:FULL_T, :FULL_T], float('-inf'))
     att = F.softmax(att, dim=-1)
     y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
     y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side

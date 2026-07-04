@@ -469,6 +469,7 @@ class VALLE(VALLF):
         length_penalty: float = 1.0,
         return_worst: bool = False,
         turboquant_config=None,
+        turboquant_config_nar=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -633,6 +634,15 @@ class VALLE(VALLF):
         # Non-AR Decoders
         if _nar_start_ev is not None:
             _nar_start_ev.record()
+
+        # NAR K/V quantization (robustness ablation): each stage is a full-
+        # sequence bidirectional pass, so the quantizer is a stateless
+        # per-call quantize->dequantize of the K/V that pass computes.
+        nar_tq = None
+        if turboquant_config_nar is not None and turboquant_config_nar.enabled:
+            from turboquant_cache import NARQuantizer
+            nar_tq = NARQuantizer(turboquant_config_nar, n_layers=12)
+
         y_emb = self.nar_audio_embeddings[0](
             y[:, int(self.ar_audio_prepend_bos) :]
         )
@@ -674,7 +684,8 @@ class VALLE(VALLF):
                 xy_pos = torch.concat([x, y_pos], dim=1)
 
                 xy_dec, _ = self.nar_decoder(
-                    (xy_pos, self.nar_stage_embeddings[i].weight)
+                    (xy_pos, self.nar_stage_embeddings[i].weight),
+                    tq_cache=nar_tq,
                 )
                 logits = predict_layer(xy_dec[:, text_len + prefix_len :])
 
@@ -703,7 +714,8 @@ class VALLE(VALLF):
                 xy_pos = torch.concat([x, y_pos], dim=1)
 
                 xy_dec, _ = self.nar_decoder(
-                    (xy_pos, self.nar_stage_embeddings[i].weight)
+                    (xy_pos, self.nar_stage_embeddings[i].weight),
+                    tq_cache=nar_tq,
                 )
                 logits = predict_layer(xy_dec[:, text_len + prefix_len :])
 
@@ -780,7 +792,8 @@ class VALLE(VALLF):
                 xy_pos = torch.concat([x, y_pos], dim=1)
 
                 xy_dec, _ = self.nar_decoder(
-                    (xy_pos, self.nar_stage_embeddings[i].weight)
+                    (xy_pos, self.nar_stage_embeddings[i].weight),
+                    tq_cache=nar_tq,
                 )
                 logits = predict_layer(xy_dec[:, text_len + prefix_len :])
 
@@ -809,7 +822,8 @@ class VALLE(VALLF):
                 xy_pos = torch.concat([x, y_pos], dim=1)
 
                 xy_dec, _ = self.nar_decoder(
-                    (xy_pos, self.nar_stage_embeddings[i].weight)
+                    (xy_pos, self.nar_stage_embeddings[i].weight),
+                    tq_cache=nar_tq,
                 )
                 logits = predict_layer(xy_dec[:, text_len + prefix_len :])
 

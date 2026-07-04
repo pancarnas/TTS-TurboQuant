@@ -267,6 +267,8 @@ class TransformerEncoderLayer(nn.Module):
         src: Tensor,
         src_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
+        tq_cache=None,
+        layer_idx=None,
     ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
@@ -274,6 +276,9 @@ class TransformerEncoderLayer(nn.Module):
             src: the sequence to the encoder layer (required).
             src_mask: the mask for the src sequence (optional).
             src_key_padding_mask: the mask for the src keys per batch (optional).
+            tq_cache: optional TurboQuant K/V quantizer (e.g. NARQuantizer);
+                when set, self-attention reads quantize->dequantize K/V.
+            layer_idx: this layer's index, required when tq_cache is set.
 
         Shape:
             see the docs in Transformer class.
@@ -298,11 +303,20 @@ class TransformerEncoderLayer(nn.Module):
                 self.norm1(x, stage_embedding),
                 src_mask,
                 src_key_padding_mask,
+                tq_cache=tq_cache,
+                layer_idx=layer_idx,
             )
             x = x + self._ff_block(self.norm2(x, stage_embedding))
         else:
             x = self.norm1(
-                x + self._sa_block(x, src_mask, src_key_padding_mask),
+                x
+                + self._sa_block(
+                    x,
+                    src_mask,
+                    src_key_padding_mask,
+                    tq_cache=tq_cache,
+                    layer_idx=layer_idx,
+                ),
                 stage_embedding,
             )
             x = self.norm2(x + self._ff_block(x), stage_embedding)
@@ -360,7 +374,29 @@ class TransformerEncoderLayer(nn.Module):
         x: Tensor,
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
+        tq_cache=None,
+        layer_idx=None,
     ) -> Tensor:
+        if tq_cache is not None:
+            # TurboQuant path (NAR quantization): route through the local
+            # multi_head_attention_forward, which exposes projected K/V to the
+            # tq_cache.update() hook. Stock F.multi_head_attention_forward
+            # (the else-branch) offers no interception point.
+            if key_padding_mask is not None:
+                raise NotImplementedError(
+                    "TurboQuant K/V quantization does not support "
+                    "key_padding_mask in the forward path"
+                )
+            x = self.self_attn.infer(
+                x,
+                attn_mask=attn_mask,
+                need_weights=False,
+                past_kv=None,
+                use_cache=False,
+                tq_cache=tq_cache,
+                layer_idx=layer_idx,
+            )[0]
+            return self.dropout1(x)
         x = self.self_attn(
             x,
             x,
@@ -409,6 +445,7 @@ class TransformerEncoder(nn.Module):
         mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
         return_layer_states: bool = False,
+        tq_cache=None,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
@@ -417,6 +454,8 @@ class TransformerEncoder(nn.Module):
             mask: the mask for the src sequence (optional).
             src_key_padding_mask: the mask for the src keys per batch (optional).
             return_layer_states: return layers' state (optional).
+            tq_cache: optional TurboQuant K/V quantizer (e.g. NARQuantizer)
+                applied per layer in self-attention (optional).
 
         Shape:
             see the docs in Transformer class.
@@ -424,11 +463,13 @@ class TransformerEncoder(nn.Module):
         if return_layer_states:
             layer_states = []  # layers' output
             output = src
-            for mod in self.layers:
+            for layer_idx, mod in enumerate(self.layers):
                 output = mod(
                     output,
                     src_mask=mask,
                     src_key_padding_mask=src_key_padding_mask,
+                    tq_cache=tq_cache,
+                    layer_idx=layer_idx,
                 )
                 layer_states.append(output[0])
 
@@ -438,9 +479,13 @@ class TransformerEncoder(nn.Module):
             return layer_states, output
 
         output = src
-        for mod in self.layers:
+        for layer_idx, mod in enumerate(self.layers):
             output = mod(
-                output, src_mask=mask, src_key_padding_mask=src_key_padding_mask
+                output,
+                src_mask=mask,
+                src_key_padding_mask=src_key_padding_mask,
+                tq_cache=tq_cache,
+                layer_idx=layer_idx,
             )
 
         if self.norm is not None:
