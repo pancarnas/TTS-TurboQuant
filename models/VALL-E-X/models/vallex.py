@@ -733,6 +733,118 @@ class VALLE(VALLF):
             self._nar_elapsed_ms = _nar_start_ev.elapsed_time(_nar_end_ev)
         return torch.stack(codes, dim=-1)
 
+    @torch.no_grad()
+    def teacher_forced_ar(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: torch.Tensor,
+        enroll_x_lens: torch.Tensor,
+        forced_tokens: torch.Tensor,
+        prompt_language: str = None,
+        text_language: str = None,
+        turboquant_config=None,
+        recorder=None,
+    ):
+        """Teacher-forced AR pass for PPL/KL/attention-divergence diagnostics.
+
+        Identical text/prompt embedding, masks, and (TurboQuant) cache
+        semantics to ``inference()``'s AR loop, but each step SCORES and
+        appends ``forced_tokens[t]`` (codebook-0 ids) instead of sampling —
+        deterministic, so runs pair exactly across configs. ``recorder`` (a
+        turboquant_cache.DivergenceRecorder) is attached to the TurboQuant
+        cache when both are given.
+
+        Returns ``(logprobs, logits)``: log p(forced_t | prefix), shape (T,),
+        and the full pre-softmax logits per step, shape (T, V) — both float32
+        on CPU.
+        """
+        assert torch.all(x_lens > 0)
+
+        text = x
+        x = self.ar_text_embedding(text)
+        prompt_language_id = torch.LongTensor(
+            np.array([self.language_ID[prompt_language]])
+        ).to(x.device)
+        if isinstance(text_language, str):
+            text_language_id = torch.LongTensor(
+                np.array([self.language_ID[text_language]])
+            ).to(x.device)
+        elif isinstance(text_language, List):
+            text_language_id = torch.LongTensor(
+                np.array([self.language_ID[tl] for tl in text_language])
+            ).to(x.device)
+        x[:, :enroll_x_lens, :] += self.ar_language_embedding(prompt_language_id)
+        x[:, enroll_x_lens:, :] += self.ar_language_embedding(text_language_id)
+        x = self.ar_text_prenet(x)
+        x = self.ar_text_position(x)
+
+        prompts = y
+        y = prompts[..., 0]
+        if self.ar_audio_prepend_bos:
+            y = F.pad(y, (1, 0), value=NUM_AUDIO_TOKENS + 1)
+
+        x_len = x_lens.max()
+        x_attn_mask = torch.zeros((x_len, x_len), dtype=torch.bool)
+
+        kv_cache = None
+        use_kv_caching = True
+        tq_cache_manager = None
+        if turboquant_config is not None and turboquant_config.enabled:
+            from turboquant_cache import TurboQuantValleCache
+            tq_cache_manager = TurboQuantValleCache(turboquant_config, n_layers=12)
+            if recorder is not None:
+                tq_cache_manager.recorder = recorder
+            use_kv_caching = False
+
+        forced = forced_tokens.to(y.device).view(-1).long()
+        logprobs = torch.empty(forced.shape[0], dtype=torch.float32)
+        all_logits = []
+
+        for t in range(forced.shape[0]):
+            y_emb = self.ar_audio_embedding(y)
+            y_emb = self.ar_audio_prenet(y_emb)
+            y_pos = self.ar_audio_position(y_emb)
+            xy_pos = torch.concat([x, y_pos], dim=1)
+
+            y_len = y.shape[1]
+            x_attn_mask_pad = F.pad(x_attn_mask, (0, y_len), value=True)
+            y_attn_mask = F.pad(
+                torch.triu(
+                    torch.ones(y_len, y_len, dtype=torch.bool), diagonal=1
+                ),
+                (x_len, 0),
+                value=False,
+            )
+            xy_attn_mask = torch.concat(
+                [x_attn_mask_pad, y_attn_mask], dim=0
+            ).to(y.device)
+
+            if use_kv_caching and kv_cache is not None:
+                xy_pos = xy_pos[:, [-1]]
+            elif (
+                tq_cache_manager is not None
+                and tq_cache_manager.get_seq_length() > 0
+            ):
+                xy_pos = xy_pos[:, [-1]]
+
+            xy_dec, kv_cache = self.ar_decoder.infer(
+                xy_pos,
+                mask=xy_attn_mask,
+                past_kv=kv_cache,
+                use_cache=use_kv_caching,
+                tq_cache=tq_cache_manager,
+            )
+
+            logits = self.ar_predict_layer(xy_dec[:, -1]).float()
+            step_logprobs = F.log_softmax(logits, dim=-1)
+            logprobs[t] = step_logprobs[0, forced[t]].cpu()
+            all_logits.append(logits[0].cpu())
+
+            y = torch.concat([y, forced[t].view(1, 1)], dim=1)
+
+        return logprobs, torch.stack(all_logits, dim=0)
+
     def continual(
         self,
         x: torch.Tensor,
@@ -773,7 +885,8 @@ class VALLE(VALLF):
         prompts = y[:, :prefix_len]
 
         codes = [y[:, prefix_len:, 0]]
-        # Non-AR Decoders
+        # Non-AR Decoders (continual mode never quantizes NAR K/V)
+        nar_tq = None
         x = self.nar_text_embedding(text)
         x = self.nar_text_prenet(x)
         x = self.nar_text_position(x)

@@ -631,6 +631,33 @@ def decode_audio(codec, vocos, codes, device):
     return codec.decode([(codes, None)]).squeeze().cpu().numpy()
 
 
+def prepare_text_and_prompt(text: str, language: str, preset_path: str):
+    """Tokenize the text and load the voice preset — the model-input front
+    half of run_generation, shared with the teacher-forced PPL/divergence
+    diagnostic (vallex_ppl_divergence.py). Returns CPU tensors; callers move
+    ``audio_prompts`` to their device.
+    """
+    text_tokenizer = PhonemeBpeTokenizer(
+        tokenizer_path=os.path.join(_VALLEX_DIR, "utils", "g2p", "bpe_69.json")
+    )
+    text_collater = get_text_token_collater()
+
+    prompt_data = np.load(preset_path)
+    audio_prompts = torch.tensor(prompt_data["audio_tokens"]).int()
+    text_prompts = torch.tensor(prompt_data["text_tokens"]).int()
+    lang_pr = {0: "zh", 1: "ja", 2: "en"}[int(prompt_data["lang_code"])]
+    enroll_x_lens = text_prompts.shape[-1]
+
+    lang_token = lang2token[language]
+    formatted_text = lang_token + text + lang_token
+
+    phone_tokens, langs = text_tokenizer.tokenize(text=f"_{formatted_text}".strip())
+    text_tokens, text_tokens_lens = text_collater([phone_tokens])
+    text_tokens = torch.cat([text_prompts, text_tokens], dim=-1)
+    text_tokens_lens += enroll_x_lens
+    return text_tokens, text_tokens_lens, audio_prompts, enroll_x_lens, lang_pr, langs
+
+
 @torch.no_grad()
 def run_generation(
     model,
@@ -658,24 +685,15 @@ def run_generation(
     dp = {"top_k": -100, "temperature": 1.0}
     if decode_params:
         dp.update(decode_params)
-    text_tokenizer = PhonemeBpeTokenizer(
-        tokenizer_path=os.path.join(_VALLEX_DIR, "utils", "g2p", "bpe_69.json")
-    )
-    text_collater = get_text_token_collater()
-
-    prompt_data = np.load(preset_path)
-    audio_prompts = torch.tensor(prompt_data["audio_tokens"]).int().to(device)
-    text_prompts = torch.tensor(prompt_data["text_tokens"]).int()
-    lang_pr = {0: "zh", 1: "ja", 2: "en"}[int(prompt_data["lang_code"])]
-    enroll_x_lens = text_prompts.shape[-1]
-
-    lang_token = lang2token[language]
-    formatted_text = lang_token + text + lang_token
-
-    phone_tokens, langs = text_tokenizer.tokenize(text=f"_{formatted_text}".strip())
-    text_tokens, text_tokens_lens = text_collater([phone_tokens])
-    text_tokens = torch.cat([text_prompts, text_tokens], dim=-1)
-    text_tokens_lens += enroll_x_lens
+    (
+        text_tokens,
+        text_tokens_lens,
+        audio_prompts,
+        enroll_x_lens,
+        lang_pr,
+        langs,
+    ) = prepare_text_and_prompt(text, language, preset_path)
+    audio_prompts = audio_prompts.to(device)
 
     if _is_cuda(device):
         torch.cuda.synchronize(device)
@@ -1252,6 +1270,9 @@ def benchmark_vallex(args):
     _tee(results_fh, "Warmup done.\n")
 
     output_dir = os.path.join(_THIS_DIR, "outputs")
+    subdir = getattr(args, "output_subdir", "") or ""
+    if subdir:
+        output_dir = os.path.join(output_dir, subdir)
     os.makedirs(output_dir, exist_ok=True)
 
     active_groups = getattr(args, "active_groups", available_groups())
@@ -1713,6 +1734,14 @@ def main():
         "decoder stage gets quantized K/V). Overrides the default sweep and "
         "--residual-window, and FORCES track_only=False (lossy write-back "
         "path) on every TQ config so quality differences are real.",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        default="",
+        help="Save wavs under outputs/<subdir>/ instead of outputs/. Use for "
+        "runs whose config labels would collide with an existing sweep's wav "
+        "names (e.g. a --protected-layers 0 rerun of a config already "
+        "generated at pl=2 — pl is not part of the wav filename).",
     )
     parser.add_argument(
         "--protected-layers",

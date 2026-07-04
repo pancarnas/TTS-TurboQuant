@@ -156,6 +156,12 @@ def multi_head_attention_forward(
         # path to consume compressed K/V directly — see the Phase 4 design
         # sketch in benchmarks/benchmark_vallex_real.py docstring.
         k, v = tq_cache.update(layer_idx, k, v)
+        # Divergence diagnostics: when a recorder is attached, compare the
+        # quantized attention against the shadow exact K/V the cache keeps.
+        rec = getattr(tq_cache, "recorder", None)
+        if rec is not None:
+            k_exact, v_exact = tq_cache.exact_kv(layer_idx)
+            rec.observe(layer_idx, q, k, v, k_exact, v_exact)
         FULL_T = k.shape[-2]
         present = "tq_managed"  # sentinel — cache is managed externally
     elif past_kv is not None:

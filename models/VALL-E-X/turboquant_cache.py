@@ -42,6 +42,102 @@ from turboquant.compressors_v3 import TurboQuantV3
 _INITIAL_CAPACITY = 256
 
 
+class DivergenceRecorder:
+    """Per-(layer, position) attention-divergence stats, quantized vs exact.
+
+    Attach to a TurboQuantValleCache (``cache.recorder = rec``): the cache
+    then keeps a shadow un-quantized K/V copy, and the attention hook in
+    modules/activation.py calls ``observe()`` each decode step with the
+    current query plus both K/V versions. Metric names and semantics mirror
+    the Qwen divergence experiment (kv_attn_divergence_experiment.py) so
+    tools/analyze_divergence.py reads both CSVs:
+
+      attn_js / attn_tv / attn_top1 / attn_dentropy — divergence between the
+        attention distributions computed with quantized vs exact keys (last
+        query only, i.e. the token being decoded), averaged over heads;
+      out_cos — cosine of the two attention *outputs* (att @ V);
+      cos_k/cos_v, relmse_k/relmse_v — K/V reconstruction on the compressed
+        prefix only (the last ``rw`` tokens are bit-exact and would dilute
+        the error as S grows).
+
+    ``rows`` collects [layer, pos, <metrics...>]; the driver script prepends
+    sentence/config columns when writing the CSV.
+    """
+
+    METRICS = [
+        "attn_js",
+        "attn_tv",
+        "attn_top1",
+        "attn_dentropy",
+        "out_cos",
+        "cos_k",
+        "cos_v",
+        "relmse_k",
+        "relmse_v",
+    ]
+
+    def __init__(self, residual_window: int, step_stride: int = 1):
+        self.rw = residual_window
+        self.stride = max(int(step_stride), 1)
+        self.rows: list[list] = []
+
+    @staticmethod
+    def _entropy(p: torch.Tensor) -> torch.Tensor:
+        return -(p * (p + 1e-12).log()).sum(-1)
+
+    @torch.no_grad()
+    def observe(self, layer_idx: int, q: torch.Tensor,
+                k_q: torch.Tensor, v_q: torch.Tensor,
+                k_e: torch.Tensor, v_e: torch.Tensor) -> None:
+        """q: (B,H,T,D) this step's queries; k/v_(q|e): (B,H,S,D) full cache,
+        quantized and exact. Stats are for the LAST query position only."""
+        S = k_q.shape[2]
+        pos = S - 1
+        if pos % self.stride:
+            return
+
+        ql = q[:, :, -1:, :].float()
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        att_q = torch.softmax((ql @ k_q.float().transpose(-2, -1)) * scale, dim=-1)
+        att_e = torch.softmax((ql @ k_e.float().transpose(-2, -1)) * scale, dim=-1)
+
+        m = 0.5 * (att_q + att_e)
+        kl_qm = (att_q * ((att_q + 1e-12).log() - (m + 1e-12).log())).sum(-1)
+        kl_em = (att_e * ((att_e + 1e-12).log() - (m + 1e-12).log())).sum(-1)
+        attn_js = float((0.5 * (kl_qm + kl_em)).mean())
+        attn_tv = float((0.5 * (att_q - att_e).abs().sum(-1)).mean())
+        attn_top1 = float(
+            (att_q.argmax(-1) == att_e.argmax(-1)).float().mean()
+        )
+        attn_dentropy = float((self._entropy(att_q) - self._entropy(att_e)).mean())
+
+        out_q = (att_q @ v_q.float()).flatten()
+        out_e = (att_e @ v_e.float()).flatten()
+        out_cos = float(
+            torch.nn.functional.cosine_similarity(out_q, out_e, dim=0)
+        )
+
+        split = max(S - self.rw, 0)
+        if split > 0:
+            kq, ke = k_q[:, :, :split, :].float(), k_e[:, :, :split, :].float()
+            vq, ve = v_q[:, :, :split, :].float(), v_e[:, :, :split, :].float()
+            cos_k = float(
+                torch.nn.functional.cosine_similarity(kq, ke, dim=-1).mean()
+            )
+            cos_v = float(
+                torch.nn.functional.cosine_similarity(vq, ve, dim=-1).mean()
+            )
+            relmse_k = float((kq - ke).pow(2).sum() / (ke.pow(2).sum() + 1e-12))
+            relmse_v = float((vq - ve).pow(2).sum() / (ve.pow(2).sum() + 1e-12))
+        else:
+            cos_k = cos_v = relmse_k = relmse_v = ""
+
+        self.rows.append(
+            [layer_idx, pos, attn_js, attn_tv, attn_top1, attn_dentropy,
+             out_cos, cos_k, cos_v, relmse_k, relmse_v]
+        )
+
+
 class NARQuantizer:
     """Stateless per-call K/V quantize->dequantize for the NAR decoder.
 
@@ -116,6 +212,13 @@ class TurboQuantValleCache:
         self._buf_k: dict[int, torch.Tensor] = {}
         self._buf_v: dict[int, torch.Tensor] = {}
         self._cur_len: dict[int, int] = {}
+
+        # Divergence recording (diagnostics only): when a DivergenceRecorder
+        # is attached, a shadow UN-quantized K/V copy is kept per layer so the
+        # attention hook can compare quantized vs exact attention.
+        self.recorder = None
+        self._exact_k: dict[int, torch.Tensor] = {}
+        self._exact_v: dict[int, torch.Tensor] = {}
 
         # Legacy off-path compression state (only populated when
         # config.track_only=False).
@@ -251,12 +354,46 @@ class TurboQuantValleCache:
         self._buf_v[layer_idx][:, :, s:s + n, :].copy_(new_value)
         self._cur_len[layer_idx] = needed
 
+        # Shadow exact copy (diagnostics): written BEFORE the lossy path can
+        # overwrite the main buffer, never quantized.
+        if self.recorder is not None:
+            self._ensure_exact_capacity(layer_idx, needed, template=new_key)
+            self._exact_k[layer_idx][:, :, s:s + n, :].copy_(new_key)
+            self._exact_v[layer_idx][:, :, s:s + n, :].copy_(new_value)
+
         if not self.config.track_only:
             self._legacy_compress_overflow(layer_idx, needed, new_key, new_value)
 
         full_k = self._buf_k[layer_idx][:, :, :needed, :]
         full_v = self._buf_v[layer_idx][:, :, :needed, :]
         return full_k, full_v
+
+    def _ensure_exact_capacity(self, layer_idx: int, needed_len: int,
+                               template: torch.Tensor) -> None:
+        B, H, _, D = template.shape
+        buf = self._exact_k.get(layer_idx)
+        cap = buf.shape[2] if buf is not None else 0
+        if cap >= needed_len:
+            return
+        new_cap = max(_INITIAL_CAPACITY, cap)
+        while new_cap < needed_len:
+            new_cap *= 2
+        for store in (self._exact_k, self._exact_v):
+            new = torch.empty(B, H, new_cap, D, dtype=template.dtype,
+                              device=template.device)
+            old = store.get(layer_idx)
+            if old is not None:
+                s = min(self._cur_len.get(layer_idx, 0), old.shape[2])
+                new[:, :, :s, :].copy_(old[:, :, :s, :])
+            store[layer_idx] = new
+
+    def exact_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Un-quantized shadow K/V views (recorder mode only)."""
+        s = self._cur_len.get(layer_idx, 0)
+        return (
+            self._exact_k[layer_idx][:, :, :s, :],
+            self._exact_v[layer_idx][:, :, :s, :],
+        )
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return self._cur_len.get(layer_idx, 0)
