@@ -17,7 +17,9 @@ set -euo pipefail
 
 N="${1:-3}"
 MAXPG="${2:-50}"
-GROUPS="${3:-seedtts_en,librispeech_pc,ellav_hard}"
+# NOTE: not named GROUPS — that's a bash builtin (user's group ids) and
+# assignments to it are silently ignored.
+EVAL_GROUPS="${3:-seedtts_en,librispeech_pc,ellav_hard}"
 TAG="${4:-vallex_kv_perm_pl2}"
 export OMP_NUM_THREADS=2
 
@@ -27,7 +29,7 @@ CFGS="$CFGS,both:K4V4@0,both:K4V4@64,both:K4V4@128,both:K3V3@128"
 
 for i in $(seq 0 $((N - 1))); do
   python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
-    --groups "$GROUPS" --max-per-group "$MAXPG" \
+    --groups "$EVAL_GROUPS" --max-per-group "$MAXPG" \
     --data-dir data --no-quality --configs "$CFGS" \
     --protected-layers 2 --seeds 0 --decode sampling \
     --num-shards "$N" --shard-id "$i" --run-tag "$TAG" \
