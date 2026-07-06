@@ -25,8 +25,11 @@ import argparse
 import glob
 import io
 import os
+import sys
 
-from turboquant.eval_sentences import LONG_BUCKETS, plan_long_concatenations
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from turboquant.eval_sentences import LONG_BUCKETS, plan_long_concatenations  # noqa: E402
 
 
 def _find_col(columns, *candidates):
