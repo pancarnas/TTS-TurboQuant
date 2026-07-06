@@ -161,6 +161,19 @@ def main() -> None:
     print(f"collected {len(records)} LibriTTS-R utterances from parquet")
     plan = plan_long_concatenations(records, buckets=LONG_BUCKETS)
 
+    # Interleave buckets round-robin so any --max-per-group prefix of the
+    # manifest samples ALL length buckets evenly (the planner emits them
+    # bucket-by-bucket, which would make a prefix all-short).
+    by_bucket: dict[int, list[dict]] = {}
+    for rec in plan:
+        by_bucket.setdefault(rec["bucket"], []).append(rec)
+    plan = []
+    queues = [by_bucket[b] for b in sorted(by_bucket)]
+    while any(queues):
+        for q in queues:
+            if q:
+                plan.append(q.pop(0))
+
     manifest = os.path.join(out_dir, "manifest.lst")
     per_bucket: dict[int, int] = {}
     written = 0
