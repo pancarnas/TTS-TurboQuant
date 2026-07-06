@@ -17,6 +17,9 @@ set -euo pipefail
 
 N="${1:-3}"
 MAXPG="${2:-50}"
+# Reduce CUDA fragmentation — long-sequence NAR passes allocate/free big
+# transient buffers; without this the allocator OOMs well below capacity.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # NOTE: not named GROUPS — that's a bash builtin (user's group ids) and
 # assignments to it are silently ignored.
 EVAL_GROUPS="${3:-seedtts_en,librispeech_pc,ellav_hard}"

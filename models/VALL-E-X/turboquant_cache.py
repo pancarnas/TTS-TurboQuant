@@ -172,6 +172,12 @@ class NARQuantizer:
             )
         return self._compressors[layer_idx]
 
+    # Tokens per compress_kv call. The MSE quantizer's temp buffers scale
+    # with the tokens it sees at once ((B*H*S, D, n_levels) diffs), which
+    # OOMs on multi-minute NAR passes; chunking is EXACT (quantization is
+    # per-vector), it only bounds the transient memory.
+    _CHUNK_TOKENS = 2048
+
     @torch.no_grad()
     def update(self, layer_idx: int, k: torch.Tensor,
                v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -185,10 +191,15 @@ class NARQuantizer:
         if split == 0:
             return k, v
         comp = self._get_compressor(layer_idx, k.shape[-1], k.device)
-        ck, cv = comp.compress_kv(k[:, :, :split, :], v[:, :, :split, :])
-        rec_k, rec_v = comp.decompress_kv(ck, cv)
-        k = torch.cat([rec_k.to(k.dtype), k[:, :, split:, :]], dim=2)
-        v = torch.cat([rec_v.to(v.dtype), v[:, :, split:, :]], dim=2)
+        rec_k, rec_v = [], []
+        for s0 in range(0, split, self._CHUNK_TOKENS):
+            s1 = min(s0 + self._CHUNK_TOKENS, split)
+            ck, cv = comp.compress_kv(k[:, :, s0:s1, :], v[:, :, s0:s1, :])
+            rk, rv = comp.decompress_kv(ck, cv)
+            rec_k.append(rk.to(k.dtype))
+            rec_v.append(rv.to(v.dtype))
+        k = torch.cat(rec_k + [k[:, :, split:, :]], dim=2)
+        v = torch.cat(rec_v + [v[:, :, split:, :]], dim=2)
         return k, v
 
 
