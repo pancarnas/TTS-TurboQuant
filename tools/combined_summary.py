@@ -138,6 +138,11 @@ def main() -> None:
         help="Repeatable. Divergence CSV optional (use '-' to omit).",
     )
     ap.add_argument("--out", default="results/combined_summary.csv")
+    ap.add_argument(
+        "--markdown",
+        default="",
+        help="Also write metrics-only markdown tables (one per dataset) here.",
+    )
     args = ap.parse_args()
 
     models = []
@@ -163,6 +168,38 @@ def main() -> None:
     show["collapse_pct"] = show["collapse_pct"].round(1)
     print(show.to_string(index=False))
     print(f"\nwrote {args.out}  ({len(df)} rows)")
+
+    if args.markdown:
+        _write_markdown(df, args.markdown)
+        print(f"wrote {args.markdown}")
+
+
+def _write_markdown(df: pd.DataFrame, path: str) -> None:
+    """Metrics-only markdown: one table per dataset, no interpretation."""
+    def cell(x):
+        if pd.isna(x):
+            return "—"
+        return f"{x:.4f}" if abs(x) < 1 else f"{x:.1f}"
+
+    cols = ["model", "config", "cer", "wer", "collapse_pct", "spk_sim",
+            "cos_k", "cos_v"]
+    head = "| model | config | CER | WER | collapse% | spkSim | cos_k | cos_v |"
+    sep = "|---|---|---|---|---|---|---|---|"
+    lines = ["# Metrics (CER / WER / collapse% / spkSim / cos_k / cos_v)", ""]
+    for grp in sorted(df["group"].unique()):
+        lines += [f"## {grp}", "", head, sep]
+        sub = df[df["group"] == grp].sort_values(["model", "config"])
+        for _, r in sub.iterrows():
+            lines.append(
+                "| " + " | ".join([
+                    str(r["model"]), str(r["config"]),
+                    cell(r["cer"]), cell(r["wer"]), cell(r["collapse_pct"]),
+                    cell(r["spk_sim"]), cell(r["cos_k"]), cell(r["cos_v"]),
+                ]) + " |"
+            )
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
 
 
 if __name__ == "__main__":
