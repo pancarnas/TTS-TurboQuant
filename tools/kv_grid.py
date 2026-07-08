@@ -72,10 +72,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--summary", default="results/combined_summary.csv")
     ap.add_argument("--out", default="results/kv_grids.md")
+    ap.add_argument(
+        "--overall",
+        action="store_true",
+        help="One grid per model using the mean over all datasets only "
+        "(skip the per-dataset grids).",
+    )
     args = ap.parse_args()
 
     df = build(args.summary)
-    lines = ["# Key-bits × value-bits grids (AR-only, averaged over residual window)", ""]
+    title = "# Key-bits × value-bits grids (AR-only, averaged over residual window"
+    title += ", mean over datasets)" if args.overall else ")"
+    lines = [title, ""]
 
     for metric, label in METRICS:
         lines.append(f"## {label}")
@@ -84,22 +92,23 @@ def main() -> None:
             m = df[df["model"] == model]
             lines.append(f"### {model}")
             lines.append("")
-            groups = sorted(m["group"].unique())
             per_group_pivots = []
-            for grp in groups:
+            for grp in sorted(m["group"].unique()):
                 sub = m[m["group"] == grp]
                 piv = sub.pivot_table(
                     index="key_bits", columns="value_bits",
                     values=metric, aggfunc="mean",
                 )
                 per_group_pivots.append(piv)
-                lines.append(f"**{grp}**")
-                lines += _grid_md(piv, label)
-                lines.append("")
+                if not args.overall:
+                    lines.append(f"**{grp}**")
+                    lines += _grid_md(piv, label)
+                    lines.append("")
             # Macro mean across datasets: average the per-group cell means.
             if per_group_pivots:
                 mean_piv = pd.concat(per_group_pivots).groupby(level=0).mean()
-                lines.append("**mean over datasets**")
+                if not args.overall:
+                    lines.append("**mean over datasets**")
                 lines += _grid_md(mean_piv, label)
                 lines.append("")
 
