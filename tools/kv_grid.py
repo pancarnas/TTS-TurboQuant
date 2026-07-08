@@ -35,9 +35,15 @@ METRICS = [("cer", "CER"), ("wer", "WER"), ("cos_k", "cos_k"), ("cos_v", "cos_v"
 
 
 def _parse_bits(df: pd.DataFrame) -> pd.DataFrame:
+    # fp16 has no bits: mark with -1 so it survives the notna filter and lands
+    # in its own 'fp16' corner cell. nar/both configs don't match _CFG_RE
+    # (AR-only filter) -> None -> dropped.
     kb, vb, rw = [], [], []
     for c in df["config"]:
-        m = _CFG_RE.match(str(c))
+        cs = str(c)
+        if cs.lower() == "fp16":
+            kb.append(-1); vb.append(-1); rw.append(-1); continue
+        m = _CFG_RE.match(cs)
         kb.append(int(m.group(1)) if m else None)
         vb.append(int(m.group(2)) if m else None)
         rw.append(int(m.group(3)) if m else None)
@@ -52,6 +58,8 @@ def _parse_bits(df: pd.DataFrame) -> pd.DataFrame:
 
 def _numkey(label: str) -> tuple:
     """Sort key from a label's numbers: bits desc, then rw asc. 'K4rw64'->(-4,64)."""
+    if str(label) == "fp16":
+        return (-999, 0)  # baseline sorts first (top-left)
     nums = [int(x) for x in re.findall(r"\d+", str(label))]
     bits = nums[0] if nums else 0
     rw = nums[1] if len(nums) > 1 else 0
@@ -106,6 +114,9 @@ def main() -> None:
     else:
         df["rowkey"] = "K" + df["key_bits"].astype(str)
         df["colkey"] = "V" + df["value_bits"].astype(str)
+    is_fp16 = df["key_bits"] < 0
+    df.loc[is_fp16, "rowkey"] = "fp16"
+    df.loc[is_fp16, "colkey"] = "fp16"
     title = "# Key-bits × value-bits grids (AR-only, averaged over residual window"
     title += ", mean over datasets)" if args.overall else ")"
     lines = [title, ""]
