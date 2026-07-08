@@ -74,7 +74,6 @@ def main() -> None:
     tbl.set_fontsize(8)
     tbl.scale(1, 1.3)
 
-    ncol = len(header)
     for (row, col), cell in tbl.get_celld().items():
         cell.set_edgecolor("#dddddd")
         if row == 0:  # header
