@@ -33,7 +33,8 @@ import pandas as pd  # noqa: E402
 _CFG_RE = re.compile(r"^K(\d+)V(\d+)@(\d+)$")
 _LABELS = {
     "cer": "CER", "wer": "WER", "collapse_pct": "collapse %",
-    "cos_k": "cos_k (key similarity)", "cos_v": "cos_v (value similarity)",
+    "spk_sim": "speaker sim", "cos_k": "cos_k (key similarity)",
+    "cos_v": "cos_v (value similarity)",
 }
 _ERROR_METRICS = {"cer", "wer", "collapse_pct"}
 
