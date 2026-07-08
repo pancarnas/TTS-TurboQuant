@@ -33,7 +33,12 @@ COLS = [
 ]
 
 
+_NUMERIC = {"cer", "wer", "spk_sim", "cos_k", "cos_v"}
+
+
 def _fmt(col: str, v) -> str:
+    if col not in _NUMERIC and col != "collapse_pct":
+        return str(v)  # model / dataset / config — text, pass through
     if pd.isna(v):
         return "—"
     if col == "collapse_pct":
