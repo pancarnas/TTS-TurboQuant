@@ -117,9 +117,13 @@ def main() -> None:
     is_fp16 = df["key_bits"] < 0
     df.loc[is_fp16, "rowkey"] = "fp16"
     df.loc[is_fp16, "colkey"] = "fp16"
-    title = "# Key-bits × value-bits grids (AR-only, averaged over residual window"
-    title += ", mean over datasets)" if args.overall else ")"
-    lines = [title, ""]
+    rw_note = (
+        "residual window explicit on axes (not averaged)"
+        if args.with_rw
+        else "averaged over residual window"
+    )
+    ds_note = ", mean over datasets" if args.overall else ""
+    lines = [f"# Key-bits × value-bits grids (AR-only, {rw_note}{ds_note})", ""]
 
     for metric, label in METRICS:
         lines.append(f"## {label}")
