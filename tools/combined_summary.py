@@ -37,30 +37,57 @@ import pandas as pd  # noqa: E402
 COLLAPSE_CER = 0.5
 
 
-def _config_from_bits(row) -> str:
-    kb = row.get("key_bits")
-    if pd.isna(kb) or kb == "":
-        return "fp16"
-    return f"K{int(kb)}V{int(row['value_bits'])}@{int(row['rw'])}"
+_DIV_USECOLS = [
+    "group", "layer", "key_bits", "value_bits", "rw",
+    "protected_layers", "cos_k", "cos_v",
+]
 
 
 def _divergence_by_group_config(div_path: str) -> pd.DataFrame:
-    """Mean cos_k/cos_v per (group, config), UNPROTECTED layers only."""
-    d = pd.read_csv(div_path)
-    d = d[d.get("group") != "smoke"].copy()
-    d["config"] = d.apply(_config_from_bits, axis=1)
-    # Infer n_layers and drop protected first/last-N layers so cos is the
-    # genuine per-token quantization error, not diluted by lossless layers.
-    n_layers = int(d["layer"].max()) + 1
-    pl = d["protected_layers"].fillna(0).astype(int)
-    protected = (d["layer"] < pl) | (d["layer"] >= (n_layers - pl))
-    d = d[~protected]
-    agg = (
-        d.groupby(["group", "config"])[["cos_k", "cos_v"]]
-        .mean()
-        .reset_index()
-    )
-    return agg
+    """Mean cos_k/cos_v per (group, config), UNPROTECTED layers only.
+
+    Streamed in chunks (the Qwen divergence CSV is ~20M rows) and fully
+    vectorized — a row-wise apply on a file that size OOMs. cos columns may be
+    blank (pos < rw → no compressed prefix); those read as NaN and are skipped
+    by sum()/count().
+    """
+    # Pass 1: infer n_layers cheaply (one column).
+    max_layer = 0
+    for ch in pd.read_csv(div_path, usecols=["layer"], chunksize=5_000_000):
+        max_layer = max(max_layer, int(ch["layer"].max()))
+    n_layers = max_layer + 1
+
+    # Pass 2: accumulate sum/count of cos_k/cos_v per (group, config).
+    acc: dict = {}  # (group, config) -> [sum_k, cnt_k, sum_v, cnt_v]
+    for ch in pd.read_csv(div_path, usecols=_DIV_USECOLS, chunksize=2_000_000):
+        ch = ch[ch["group"] != "smoke"]
+        pl = ch["protected_layers"].fillna(0).astype(int)
+        ch = ch[~((ch["layer"] < pl) | (ch["layer"] >= (n_layers - pl)))]
+        if ch.empty:
+            continue
+        cfg = (
+            "K" + ch["key_bits"].astype(int).astype(str)
+            + "V" + ch["value_bits"].astype(int).astype(str)
+            + "@" + ch["rw"].astype(int).astype(str)
+        )
+        ch = ch.assign(config=cfg)
+        g = ch.groupby(["group", "config"])
+        sums = g[["cos_k", "cos_v"]].sum()
+        cnts = g[["cos_k", "cos_v"]].count()
+        for key in sums.index:
+            a = acc.setdefault(key, [0.0, 0, 0.0, 0])
+            a[0] += float(sums.loc[key, "cos_k"]); a[1] += int(cnts.loc[key, "cos_k"])
+            a[2] += float(sums.loc[key, "cos_v"]); a[3] += int(cnts.loc[key, "cos_v"])
+
+    rows = [
+        {
+            "group": grp, "config": cfg,
+            "cos_k": sk / ck if ck else float("nan"),
+            "cos_v": sv / cv if cv else float("nan"),
+        }
+        for (grp, cfg), (sk, ck, sv, cv) in acc.items()
+    ]
+    return pd.DataFrame(rows)
 
 
 def _scores_by_group_config(wav_path: str) -> pd.DataFrame:
