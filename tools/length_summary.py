@@ -23,6 +23,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import matplotlib  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 
 SHORT_MID = ["seedtts_en", "librispeech_pc", "ellav_hard"]
@@ -49,10 +52,47 @@ def _table(rows: pd.DataFrame, id_cols: list[str]) -> list[str]:
     return out
 
 
+def _render_png(rows: pd.DataFrame, id_cols: list[str], out: str, title: str) -> None:
+    """Styled table image of `rows` (id_cols + the metric columns)."""
+    if rows.empty:
+        print(f"  skip {out}: no rows")
+        return
+    header = id_cols + [lab for _, lab in METRIC_COLS]
+    text = [
+        [str(r[c]) for c in id_cols] + [_fmt(c, r[c]) for c, _ in METRIC_COLS]
+        for _, r in rows.iterrows()
+    ]
+    n = len(text)
+    fig, ax = plt.subplots(figsize=(11, 0.34 * (n + 1) + 0.8))
+    ax.axis("off")
+    tbl = ax.table(cellText=text, colLabels=header, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1, 1.3)
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#dddddd")
+        if row == 0:
+            cell.set_facecolor("#40466e")
+            cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_facecolor("#f4f5fa" if row % 2 else "#ffffff")
+        if col < len(id_cols):
+            cell.set_text_props(fontweight="bold")
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {out}  ({n} rows)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--summary", default="results/combined_summary.csv")
     ap.add_argument("--out", default="results/length_summary.md")
+    ap.add_argument(
+        "--img-dir", default="results/figures/tables",
+        help="Also write long.png and short_mid.png table images here.",
+    )
     args = ap.parse_args()
 
     df = pd.read_csv(args.summary)
@@ -88,6 +128,18 @@ def main() -> None:
         fh.write("\n".join(lines))
     print("\n".join(lines))
     print(f"\nwrote {args.out}")
+
+    if args.img_dir:
+        _render_png(
+            lg, ["model", "config"],
+            os.path.join(args.img_dir, "length_long.png"),
+            "Long sequences — libritts_long (VALL-E only)",
+        )
+        _render_png(
+            agg, ["model", "config"],
+            os.path.join(args.img_dir, "length_short_mid.png"),
+            "Short / mid — mean over seedtts_en, librispeech_pc, ellav_hard",
+        )
 
 
 if __name__ == "__main__":
