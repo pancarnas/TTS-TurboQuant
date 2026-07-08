@@ -63,45 +63,32 @@ def _prep(summary_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--summary", default="results/combined_summary.csv")
-    ap.add_argument("--metric", default="cer", choices=list(_LABELS))
-    ap.add_argument(
-        "--models",
-        default="",
-        help="Comma list to restrict/order panels (e.g. 'valle' for WER, which "
-        "Qwen lacks until re-scored). Default: all models in the summary.",
-    )
-    ap.add_argument("--out", default="results/kv_grid.png")
-    args = ap.parse_args()
-
-    df = _prep(args.summary)
-    metric = args.metric
-    if args.models:
-        models = [m.strip() for m in args.models.split(",") if m.strip()]
-    else:
+def render(df: pd.DataFrame, metric: str, out: str,
+           models: list | None = None, title: str | None = None) -> bool:
+    """Draw shared-scale heatmap panels (one per model) for `metric` over the
+    K{bits}rw{rw} × V{bits}rw{rw} grid. `df` is a prepared frame (see _prep),
+    already filtered to the datasets to average over. Returns False (and skips
+    writing) if there is nothing to plot. Both requested models always get a
+    panel, blank where that model has no data."""
+    if models is None:
         models = sorted(df["model"].unique())
-    df = df[df["model"].isin(models)]
-
-    # Mean over datasets per (model, rowkey, colkey).
-    cell = (
-        df.groupby(["model", "rowkey", "colkey"])[metric].mean().reset_index()
-    )
+    cell = df.groupby(["model", "rowkey", "colkey"])[metric].mean().reset_index()
     rowkeys = sorted(cell["rowkey"].unique(), key=_numkey)
     colkeys = sorted(cell["colkey"].unique(), key=_numkey)
 
-    # Shared color scale across both panels.
     vals = cell[metric].to_numpy(dtype=float)
     vals = vals[~np.isnan(vals)]
-    if vals.size == 0:
-        raise SystemExit(f"no data for metric {metric!r} (all blank?)")
+    if vals.size == 0 or not rowkeys:
+        print(f"  skip {out}: no data for {metric}")
+        return False
     vmin, vmax = float(vals.min()), float(vals.max())
+    span = (vmax - vmin) or 1.0
     cmap = plt.get_cmap("Reds" if metric in _ERROR_METRICS else "Blues")
 
     im = None
     fig, axes = plt.subplots(
-        1, len(models), figsize=(1.1 * len(colkeys) * len(models) + 2, 0.7 * len(rowkeys) + 2),
+        1, len(models),
+        figsize=(1.1 * len(colkeys) * len(models) + 2, 0.7 * len(rowkeys) + 2),
         squeeze=False,
     )
     for ax, model in zip(axes[0], models):
@@ -115,31 +102,53 @@ def main() -> None:
         im = ax.imshow(grid, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
         ax.set_xticks(range(len(colkeys)), colkeys, rotation=45, ha="right", fontsize=8)
         ax.set_yticks(range(len(rowkeys)), rowkeys, fontsize=8)
-        ax.set_title(model, fontsize=12, fontweight="bold")
-        span = (vmax - vmin) or 1.0
+        empty = "  (none)" if sub.empty or sub[metric].isna().all() else ""
+        ax.set_title(f"{model}{empty}", fontsize=12, fontweight="bold")
         for i in range(len(rowkeys)):
             for j in range(len(colkeys)):
                 if not np.isnan(grid[i, j]):
                     dark = (grid[i, j] - vmin) / span > 0.6
-                    ax.text(
-                        j, i, f"{grid[i, j]:.3f}", ha="center", va="center",
-                        fontsize=7, color="white" if dark else "black",
-                    )
-        # 2px surface gaps between cells (skill: separate adjacent fills).
+                    ax.text(j, i, f"{grid[i, j]:.3f}", ha="center", va="center",
+                            fontsize=7, color="white" if dark else "black")
         ax.set_xticks(np.arange(-0.5, len(colkeys), 1), minor=True)
         ax.set_yticks(np.arange(-0.5, len(rowkeys), 1), minor=True)
         ax.grid(which="minor", color="white", linewidth=2)
         ax.tick_params(which="minor", length=0)
 
     fig.colorbar(im, ax=axes[0], shrink=0.8, label=_LABELS[metric])
-    fig.suptitle(
-        f"{_LABELS[metric]} by key/value bits × residual window "
-        "(AR-only, mean over datasets)",
-        fontsize=13,
+    fig.suptitle(title or f"{_LABELS[metric]} — key/value bits × residual window",
+                 fontsize=13)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {out}  ({len(models)} panels, metric={metric})")
+    return True
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--summary", default="results/combined_summary.csv")
+    ap.add_argument("--metric", default="cer", choices=list(_LABELS))
+    ap.add_argument(
+        "--models",
+        default="",
+        help="Comma list to restrict/order panels (e.g. 'valle' for WER, which "
+        "Qwen lacks until re-scored). Default: all models in the summary.",
     )
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    fig.savefig(args.out, dpi=150, bbox_inches="tight")
-    print(f"wrote {args.out}  ({len(models)} panels, metric={metric})")
+    ap.add_argument("--groups", default="", help="comma dataset filter/average set")
+    ap.add_argument("--out", default="results/kv_grid.png")
+    ap.add_argument("--title", default="")
+    args = ap.parse_args()
+
+    df = _prep(args.summary)
+    if args.groups:
+        keep = [g.strip() for g in args.groups.split(",") if g.strip()]
+        df = df[df["group"].isin(keep)]
+    models = (
+        [m.strip() for m in args.models.split(",") if m.strip()]
+        if args.models else None
+    )
+    render(df, args.metric, args.out, models, args.title or None)
 
 
 if __name__ == "__main__":
