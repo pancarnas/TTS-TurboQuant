@@ -67,12 +67,22 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--summary", default="results/combined_summary.csv")
     ap.add_argument("--metric", default="cer", choices=list(_LABELS))
+    ap.add_argument(
+        "--models",
+        default="",
+        help="Comma list to restrict/order panels (e.g. 'valle' for WER, which "
+        "Qwen lacks until re-scored). Default: all models in the summary.",
+    )
     ap.add_argument("--out", default="results/kv_grid.png")
     args = ap.parse_args()
 
     df = _prep(args.summary)
     metric = args.metric
-    models = sorted(df["model"].unique())
+    if args.models:
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+    else:
+        models = sorted(df["model"].unique())
+    df = df[df["model"].isin(models)]
 
     # Mean over datasets per (model, rowkey, colkey).
     cell = (
@@ -89,6 +99,7 @@ def main() -> None:
     vmin, vmax = float(vals.min()), float(vals.max())
     cmap = plt.get_cmap("Reds" if metric in _ERROR_METRICS else "Blues")
 
+    im = None
     fig, axes = plt.subplots(
         1, len(models), figsize=(1.1 * len(colkeys) * len(models) + 2, 0.7 * len(rowkeys) + 2),
         squeeze=False,
