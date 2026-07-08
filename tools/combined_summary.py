@@ -181,8 +181,6 @@ def _write_markdown(df: pd.DataFrame, path: str) -> None:
             return "—"
         return f"{x:.4f}" if abs(x) < 1 else f"{x:.1f}"
 
-    cols = ["model", "config", "cer", "wer", "collapse_pct", "spk_sim",
-            "cos_k", "cos_v"]
     head = "| model | config | CER | WER | collapse% | spkSim | cos_k | cos_v |"
     sep = "|---|---|---|---|---|---|---|---|"
     lines = ["# Metrics (CER / WER / collapse% / spkSim / cos_k / cos_v)", ""]
