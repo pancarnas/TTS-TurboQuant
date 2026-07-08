@@ -35,30 +35,42 @@ METRICS = [("cer", "CER"), ("wer", "WER"), ("cos_k", "cos_k"), ("cos_v", "cos_v"
 
 
 def _parse_bits(df: pd.DataFrame) -> pd.DataFrame:
-    kb, vb = [], []
+    kb, vb, rw = [], [], []
     for c in df["config"]:
         m = _CFG_RE.match(str(c))
         kb.append(int(m.group(1)) if m else None)
         vb.append(int(m.group(2)) if m else None)
+        rw.append(int(m.group(3)) if m else None)
     out = df.copy()
     out["key_bits"] = kb
     out["value_bits"] = vb
-    return out[out["key_bits"].notna()].astype({"key_bits": int, "value_bits": int})
+    out["rw"] = rw
+    return out[out["key_bits"].notna()].astype(
+        {"key_bits": int, "value_bits": int, "rw": int}
+    )
+
+
+def _numkey(label: str) -> tuple:
+    """Sort key from a label's numbers: bits desc, then rw asc. 'K4rw64'->(-4,64)."""
+    nums = [int(x) for x in re.findall(r"\d+", str(label))]
+    bits = nums[0] if nums else 0
+    rw = nums[1] if len(nums) > 1 else 0
+    return (-bits, rw)
 
 
 def _grid_md(pivot: pd.DataFrame, metric: str) -> list[str]:
-    """Render a key×value pivot as a markdown table (rows=key bits desc)."""
-    vcols = sorted(pivot.columns, reverse=True)
-    krows = sorted(pivot.index, reverse=True)
-    head = f"| {metric}  (K↓ / V→) | " + " | ".join(f"V{v}" for v in vcols) + " |"
-    sep = "|---" * (len(vcols) + 1) + "|"
+    """Render a pivot as a markdown table; row/col labels are strings."""
+    rows = sorted(pivot.index, key=_numkey)
+    cols = sorted(pivot.columns, key=_numkey)
+    head = f"| {metric}  (K↓ / V→) | " + " | ".join(str(c) for c in cols) + " |"
+    sep = "|---" * (len(cols) + 1) + "|"
     lines = [head, sep]
-    for k in krows:
+    for r in rows:
         cells = []
-        for v in vcols:
-            x = pivot.loc[k, v] if v in pivot.columns else None
+        for c in cols:
+            x = pivot.loc[r, c] if c in pivot.columns else None
             cells.append("—" if x is None or pd.isna(x) else f"{x:.4f}")
-        lines.append(f"| K{k} | " + " | ".join(cells) + " |")
+        lines.append(f"| {r} | " + " | ".join(cells) + " |")
     return lines
 
 
@@ -78,9 +90,22 @@ def main() -> None:
         help="One grid per model using the mean over all datasets only "
         "(skip the per-dataset grids).",
     )
+    ap.add_argument(
+        "--with-rw",
+        action="store_true",
+        help="Fold the residual window into the axes: rows K{bits}rw{rw}, "
+        "cols V{bits}rw{rw}. NOTE rw is shared by K and V in a config, so only "
+        "rw-matched cells fill (block-diagonal); off-diagonal is '—'.",
+    )
     args = ap.parse_args()
 
     df = build(args.summary)
+    if args.with_rw:
+        df["rowkey"] = "K" + df["key_bits"].astype(str) + "rw" + df["rw"].astype(str)
+        df["colkey"] = "V" + df["value_bits"].astype(str) + "rw" + df["rw"].astype(str)
+    else:
+        df["rowkey"] = "K" + df["key_bits"].astype(str)
+        df["colkey"] = "V" + df["value_bits"].astype(str)
     title = "# Key-bits × value-bits grids (AR-only, averaged over residual window"
     title += ", mean over datasets)" if args.overall else ")"
     lines = [title, ""]
@@ -96,7 +121,7 @@ def main() -> None:
             for grp in sorted(m["group"].unique()):
                 sub = m[m["group"] == grp]
                 piv = sub.pivot_table(
-                    index="key_bits", columns="value_bits",
+                    index="rowkey", columns="colkey",
                     values=metric, aggfunc="mean",
                 )
                 per_group_pivots.append(piv)
