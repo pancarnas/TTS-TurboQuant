@@ -90,7 +90,7 @@ def main() -> None:
     args = ap.parse_args()
 
     srcs = [spec.split("=", 1) for spec in args.scores]  # [(label, path), ...]
-    cmap = plt.get_cmap("Reds" if args.metric in _ERROR else "Blues")
+    cmap = plt.get_cmap("Blues")
     label = _LABELS[args.metric]
 
     # rw columns (only when --by-rw); union across files.
@@ -120,23 +120,19 @@ def main() -> None:
 
     nrows, ncols = len(srcs), (len(rws) if args.by_rw else 1)
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(3.1 * ncols + 1.5, 3.3 * nrows + 0.5),
-                             squeeze=False)
-    im = None
+                             figsize=(3.4 * ncols + 0.5, 3.4 * nrows + 0.8),
+                             squeeze=False, constrained_layout=True)
     for ri, (lab, _path) in enumerate(srcs):
         cols = rws if args.by_rw else [None]
         for cj, rw in enumerate(cols):
-            title = f"{lab} rw{rw}" if args.by_rw else \
-                    f"{lab}  (fp16 {label} {fp16[lab]:.3f})"
-            im = _draw(axes[ri][cj], cells[(ri, cj)], ks, vs, cmap,
-                       vmin, vmax, span, title)
+            title = f"{lab} rw{rw}" if args.by_rw else lab
+            _draw(axes[ri][cj], cells[(ri, cj)], ks, vs, cmap,
+                  vmin, vmax, span, title)
 
-    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label=label)
-    sup = label
-    if args.by_rw:
-        sup += "   (fp16: " + ", ".join(
-            f"{lab} {fp16[lab]:.3f}" for lab, _ in srcs) + ")"
-    fig.suptitle(sup, fontsize=14, fontweight="bold")
+    # fp16 is pl-independent (no quantization), so report a single value.
+    fp16_val = sum(fp16.values()) / len(fp16)
+    fig.suptitle(f"{label}   (fp16 {label} {fp16_val:.3f})",
+                 fontsize=14, fontweight="bold")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
     plt.close(fig)
