@@ -240,8 +240,15 @@ def score_entries(
         hyp = transcribe(e["path"])
         spk_sim = ""
         if e["baseline_path"]:
-            a, b = cached_embed(e["baseline_path"]), embed(e["path"])
-            spk_sim = float(sum(x * y for x, y in zip(a, b)))
+            # A single unembeddable clip (e.g. a collapsed config produces audio
+            # too short for WavLM's TDNN receptive field) must not kill the whole
+            # run — leave spk_sim blank and carry on.
+            try:
+                a, b = cached_embed(e["baseline_path"]), embed(e["path"])
+                spk_sim = float(sum(x * y for x, y in zip(a, b)))
+            except Exception as exc:  # noqa: BLE001 - report + skip, never crash
+                print(f"  WARNING: spk_sim failed for {e['wav']}: {exc}")
+                spk_sim = ""
         emit(
             {
                 **{k: e[k] for k in COLUMNS if k in e},
@@ -296,14 +303,23 @@ class WavLMEmbedder:
         )
         self._device = device
 
+    # WavLM's TDNN stack needs a minimum receptive field; clips shorter than
+    # ~1 s can produce too few frames and crash the conv (collapsed configs
+    # sometimes emit near-empty audio). Pad up to this many 16 kHz samples.
+    _MIN_SAMPLES = 16000
+
     def __call__(self, path: str):
+        import numpy as np
         import soundfile as sf
 
         from tools.rescore_audio import to_16k
 
         wav, sr = sf.read(path)
+        w = np.asarray(to_16k(wav, sr))
+        if w.shape[0] < self._MIN_SAMPLES:
+            w = np.pad(w, (0, self._MIN_SAMPLES - w.shape[0]))
         inputs = self._extractor(
-            to_16k(wav, sr), sampling_rate=16000, return_tensors="pt", padding=True
+            w, sampling_rate=16000, return_tensors="pt", padding=True
         )
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         with self._torch.no_grad():
