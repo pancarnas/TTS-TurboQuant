@@ -32,14 +32,17 @@ _LABELS = {"cer": "CER", "wer": "WER", "spk_sim": "speaker sim"}
 _ERROR = {"cer", "wer"}
 
 
-def _grid(path: str, metric: str, rw=None):
+def _grid(path: str, metric: str, rw=None, exclude=()):
     """(pivot key_bits×value_bits mean of metric, fp16 mean) from a score CSV.
 
     If ``rw`` is given, average only that residual window; else over all rw.
-    fp16 has no rw so its mean is always over all fp16 rows.
+    ``exclude`` drops whole dataset groups (e.g. ellav_hard). fp16 has no rw so
+    its mean is always over all remaining fp16 rows.
     """
     d = pd.read_csv(path)
     d = d[d["group"] != "smoke"]
+    if exclude:
+        d = d[~d["group"].isin(exclude)]
     fp16 = float(d[d["config"].astype(str).str.lower() == "fp16"][metric].mean())
     ar = d[d["config"].astype(str).str.match(_AR)].copy()
     ar["key_bits"] = ar["key_bits"].astype(int)
@@ -86,20 +89,27 @@ def main() -> None:
     ap.add_argument("--by-rw", action="store_true",
                     help="add rw as a dimension: rows=pl, columns=rw (each cell "
                     "a K×V heatmap). Default: average over rw.")
+    ap.add_argument("--exclude-groups", default="ellav_hard",
+                    help="comma list of datasets to drop (default ellav_hard, "
+                    "whose ~0.5 fp16 CER inflates the means). Empty to keep all.")
     ap.add_argument("--out", default="results/figures/kv_pl.png")
     args = ap.parse_args()
 
+    excl = [g.strip() for g in args.exclude_groups.split(",") if g.strip()]
     srcs = [spec.split("=", 1) for spec in args.scores]  # [(label, path), ...]
     cmap = plt.get_cmap("Blues")
     label = _LABELS[args.metric]
 
-    # rw columns (only when --by-rw); union across files.
+    # rw columns (only when --by-rw); union across files (post-exclude).
     rws = None
     if args.by_rw:
-        rws = sorted(set().union(*[
-            set(pd.read_csv(p)[pd.read_csv(p)["config"].astype(str).str.match(_AR)]
-                ["rw"].astype(int)) for _, p in srcs
-        ]))
+        vals = set()
+        for _, p in srcs:
+            dd = pd.read_csv(p)
+            dd = dd[~dd["group"].isin(excl)]
+            dd = dd[dd["config"].astype(str).str.match(_AR)]
+            vals |= set(dd["rw"].astype(int))
+        rws = sorted(vals)
 
     # Build every (pl, rw) pivot once; collect fp16 per pl and a shared scale.
     cells = {}          # (row_i, col_j) -> pivot
@@ -107,7 +117,7 @@ def main() -> None:
     for ri, (lab, path) in enumerate(srcs):
         cols = rws if args.by_rw else [None]
         for cj, rw in enumerate(cols):
-            piv, f = _grid(path, args.metric, rw)
+            piv, f = _grid(path, args.metric, rw, exclude=excl)
             cells[(ri, cj)] = piv
             fp16[lab] = f
 
