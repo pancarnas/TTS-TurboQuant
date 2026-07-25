@@ -48,12 +48,24 @@ def _cbpt(bits: int, D: int, ideal: bool) -> int:
     return idx + 2  # + fp16 vector norm
 
 
-def _ratio(kb: int, vb: int, D: int, ideal: bool) -> float:
-    fp16 = 2 * D * 2  # K + V, fp16 (2 bytes/coord)
-    return fp16 / (_cbpt(kb, D, ideal) + _cbpt(vb, D, ideal))
+def _ratio(kb: int, vb: int, D: int, ideal: bool, pl: int, n_layers: int) -> float:
+    """TRUE achieved compression, accounting for protected layers.
+
+    pl>0 keeps the first pl AND last pl layers at 8-bit, so those layers are
+    barely compressed — the achieved ratio is the layer-averaged cost, NOT the
+    config-bit cost. Ignoring this over-states pl>0 compression and hides that
+    protection is dominated (a less-aggressive unprotected config beats it at
+    the same real memory).
+    """
+    fp16 = 2 * D * 2  # K + V per token per layer, fp16
+    nprot = min(2 * pl, n_layers)
+    cfg_bytes = _cbpt(kb, D, ideal) + _cbpt(vb, D, ideal)
+    prot_bytes = 2 * _cbpt(8, D, ideal)  # 8-bit K + V
+    per_layer = (nprot * prot_bytes + (n_layers - nprot) * cfg_bytes) / n_layers
+    return fp16 / per_layer
 
 
-def _points(path: str, metric: str, exclude, D, ideal):
+def _points(path: str, metric: str, exclude, D, ideal, pl, n_layers):
     d = pd.read_csv(path)
     d = d[d["group"] != "smoke"]
     if exclude:
@@ -63,29 +75,23 @@ def _points(path: str, metric: str, exclude, D, ideal):
     ar["key_bits"] = ar["key_bits"].astype(int)
     ar["value_bits"] = ar["value_bits"].astype(int)
     g = ar.groupby(["key_bits", "value_bits"])[metric].mean().reset_index()
-    g["ratio"] = [_ratio(k, v, D, ideal) for k, v in zip(g["key_bits"], g["value_bits"])]
+    g["ratio"] = [_ratio(k, v, D, ideal, pl, n_layers)
+                  for k, v in zip(g["key_bits"], g["value_bits"])]
     g["label"] = "K" + g["key_bits"].astype(str) + "V" + g["value_bits"].astype(str)
     return g, fp16
 
 
-def _pareto(g, metric):
-    """Boolean mask: point is Pareto-optimal (no other has >=ratio and <=metric)."""
-    mask = []
-    for _, r in g.iterrows():
-        dominated = (
-            (g["ratio"] >= r["ratio"]) & (g[metric] <= r[metric])
-            & ((g["ratio"] > r["ratio"]) | (g[metric] < r[metric]))
-        ).any()
-        mask.append(not dominated)
-    return mask
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--scores", nargs="+", required=True, metavar="label=path")
+    ap.add_argument("--scores", nargs="+", required=True,
+                    metavar="label=path[=pl]",
+                    help="series spec; optional 3rd field = protected_layers "
+                    "(default 0) so the compression ratio is the TRUE achieved "
+                    "ratio, e.g. pl2=results/grid_pl2_scores.csv=2")
     ap.add_argument("--metric", default="cer", choices=list(_LABELS))
     ap.add_argument("--exclude-groups", default="ellav_hard")
     ap.add_argument("--head-dim", type=int, default=64, help="VALL-E head_dim=64")
+    ap.add_argument("--n-layers", type=int, default=12, help="VALL-E AR layers=12")
     ap.add_argument("--ideal", action="store_true",
                     help="ideal sub-byte packing instead of the 8//bits as-run cost")
     ap.add_argument("--out", default="results/figures/tradeoff.png")
@@ -96,32 +102,45 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
     colors = plt.cm.tab10.colors
 
+    # Collect every point across all series first, so the Pareto frontier is
+    # the COMBINED one (this is what shows a protected series being dominated
+    # by a cheaper unprotected config at the same true compression).
+    allpts = []  # (name, label, ratio, metric, color)
     for si, spec in enumerate(args.scores):
-        name, path = spec.split("=", 1)
-        g, fp16 = _points(path, metric, excl, args.head_dim, args.ideal)
+        parts = spec.split("=")
+        name, path = parts[0], parts[1]
+        pl = int(parts[2]) if len(parts) > 2 else 0
+        g, fp16 = _points(path, metric, excl, args.head_dim, args.ideal,
+                          pl, args.n_layers)
         col = colors[si]
         ax.scatter(g["ratio"], g[metric], color=col, s=55, zorder=3, label=name)
         for _, r in g.iterrows():
             ax.annotate(r["label"], (r["ratio"], r[metric]),
                         textcoords="offset points", xytext=(5, 4), fontsize=7,
                         color=col)
-        # Pareto frontier line (sorted by ratio)
-        pm = _pareto(g, metric)
-        pf = g[pd.Series(pm, index=g.index)].sort_values("ratio")
-        ax.plot(pf["ratio"], pf[metric], color=col, lw=1.5, alpha=0.5, zorder=2)
-        # fp16 baseline reference (ratio 1)
+            allpts.append((name, r["label"], r["ratio"], r[metric]))
         ax.axhline(fp16, color=col, ls=":", lw=1, alpha=0.6)
         ax.annotate(f"{name} fp16 ({fp16:.3f})", (1.0, fp16),
                     textcoords="offset points", xytext=(4, 3), fontsize=7, color=col)
 
-    ax.set_xlabel("KV-cache compression ratio  (× vs fp16)")
+    # Combined Pareto frontier (higher ratio + lower metric dominates).
+    def dominated(p):
+        return any((q[2] >= p[2] and q[3] <= p[3])
+                   and (q[2] > p[2] or q[3] < p[3]) for q in allpts)
+    front = sorted([p for p in allpts if not dominated(p)], key=lambda p: p[2])
+    ax.plot([p[2] for p in front], [p[3] for p in front],
+            color="black", lw=2, alpha=0.7, zorder=2, label="Pareto frontier")
+
+    ax.set_xlabel("KV-cache compression ratio  (× vs fp16, protected layers incl.)")
     ax.set_ylabel(label)
     pack = "ideal sub-byte packing" if args.ideal else "as-implemented (8//bits) packing"
     ax.set_title(f"{label} vs KV-cache compression\n"
-                 f"lower-right is better; line = Pareto frontier  [{pack}]",
+                 f"lower-right is better; black line = combined Pareto frontier  [{pack}]",
                  fontsize=11, fontweight="bold")
     ax.grid(True, alpha=0.25)
-    ax.legend(title="protection", fontsize=9)
+    ax.legend(fontsize=9)
+    front_str = " > ".join(f"{n}:{l}" for n, l, _, _ in front)
+    print(f"combined Pareto frontier: {front_str}")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
     plt.close(fig)
