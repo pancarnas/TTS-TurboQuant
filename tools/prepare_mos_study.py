@@ -12,6 +12,11 @@ Runs on the box where the wavs live (grid pl0 output) + ground-truth audio.
       --audio-dir models/VALL-E-X/benchmarks/outputs/grid_pl0 \
       --data-dir data --n-sentences 12 --out mos_study
 
+A sentence is only selected if all 6 clips exist (ground truth + 5 systems),
+so the design stays balanced. After auditioning the output, rerun with
+--exclude-idx N [N ...] to swap out sentences whose fp16/natural clip has a
+defect unrelated to quantization; the next-cleanest candidates fill in.
+
 Notes / caveats written into mos_study/README:
   * pl0 audio (deployment config); seed 0.
   * natural anchor = LibriSpeech test-clean recording (16 kHz), resampled to
@@ -62,15 +67,32 @@ def _gen_path(audio_dir: str, idx: int, config: str) -> str:
                         f"vallex_{GROUP}_{idx}_sampling_s0_{config}.wav")
 
 
-def _select_sentences(scores: str, n: int) -> list[int]:
-    """Clean, medium-length sentence idxs: low fp16 CER, 4-9 s."""
+def _select_sentences(scores: str, n: int, exclude: set[int],
+                      complete) -> list[int]:
+    """Clean, medium-length sentence idxs: low fp16 CER, 4-9 s.
+
+    Walks the candidates cleanest-first and only accepts a sentence when every
+    clip (ground truth + all 5 generated systems) exists, so the design stays
+    balanced. `exclude` drops sentences rejected during manual audition.
+    """
     d = pd.read_csv(scores)
     fp = d[(d["group"] == GROUP) & (d["config"].astype(str).str.lower() == "fp16")]
     fp = fp[(fp["dur_s"] >= 4.0) & (fp["dur_s"] <= 9.0)]
     fp = fp.sort_values("cer")  # cleanest first
-    idxs = fp["idx"].astype(int).tolist()[:n]
+    idxs, skipped = [], []
+    for idx in fp["idx"].astype(int):
+        if idx in exclude:
+            continue
+        if not complete(idx):
+            skipped.append(idx)
+            continue
+        idxs.append(idx)
+        if len(idxs) == n:
+            break
+    if skipped:
+        print(f"skipped {len(skipped)} candidates with missing clips: {skipped}")
     if len(idxs) < n:
-        raise SystemExit(f"only {len(idxs)} clean sentences found; lower --n-sentences")
+        raise SystemExit(f"only {len(idxs)} usable sentences found; lower --n-sentences")
     return sorted(idxs)
 
 
@@ -81,11 +103,25 @@ def main() -> None:
                     default="models/VALL-E-X/benchmarks/outputs/grid_pl0")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--n-sentences", type=int, default=12)
+    ap.add_argument("--exclude-idx", type=int, nargs="*", default=[],
+                    help="sentence idxs to skip (e.g. rejected during "
+                         "manual audition); the next-cleanest fill in")
     ap.add_argument("--out", default="mos_study")
     args = ap.parse_args()
 
-    idxs = _select_sentences(args.scores, args.n_sentences)
     items = iter_eval_items([GROUP], None, args.data_dir)
+
+    def _complete(idx: int) -> bool:
+        if idx >= len(items):
+            return False
+        gt = getattr(items[idx], "ground_truth_audio", None)
+        if not gt or not os.path.exists(gt):
+            return False
+        return all(os.path.exists(_gen_path(args.audio_dir, idx, s))
+                   for s in SYSTEMS if s != "natural")
+
+    idxs = _select_sentences(args.scores, args.n_sentences,
+                             set(args.exclude_idx), _complete)
     scores = pd.read_csv(args.scores)
 
     clips_dir = os.path.join(args.out, "clips")
