@@ -86,3 +86,7 @@ nltk_data/
 results/
 *.json
 *.gz
+
+# local thesis drafts — never commit
+docs/thesis_roadmap.md
+docs/limitations.md
