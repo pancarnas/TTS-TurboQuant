@@ -37,16 +37,18 @@ DEFAULT_CFGS="$DEFAULT_CFGS,both:K4V4@0,both:K4V4@64,both:K4V4@128,both:K3V3@128
 CFGS="${5:-$DEFAULT_CFGS}"
 # arg 6: protected layers (default 2). arg 7: output subdir — REQUIRED when
 # rerunning the same configs at a different pl, since wav names don't encode pl
-# (else the pl=0 run overwrites the pl=2 wavs).
+# (else the pl=0 run overwrites the pl=2 wavs). arg 8: seeds (default 0) —
+# e.g. "0,1,2" for multi-seed error bars (each seed is a paired draw per config).
 PL="${6:-2}"
 SUBDIR="${7:-}"
+SEEDS="${8:-0}"
 
 for i in $(seq 0 $((N - 1))); do
   python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
     --groups "$EVAL_GROUPS" --max-per-group "$MAXPG" \
     --data-dir data --no-quality --configs "$CFGS" \
     --protected-layers "$PL" ${SUBDIR:+--output-subdir "$SUBDIR"} \
-    --seeds 0 --decode sampling \
+    --seeds "$SEEDS" --decode sampling \
     --num-shards "$N" --shard-id "$i" --run-tag "$TAG" \
     > "logs/${TAG}_shard$i.log" 2>&1 &
 done
