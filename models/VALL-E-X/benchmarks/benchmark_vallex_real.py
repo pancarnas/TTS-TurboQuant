@@ -1135,7 +1135,14 @@ def _vallex_sweep_arm(
                         trial_fh,
                         device,
                         deterministic,
-                        save_wav=(seed == seeds[0] and temp == temps[0]),
+                        # With inline metrics, one sample wav per config (first
+                        # seed) is enough. With --no-quality we score post-hoc,
+                        # so EVERY seed's wav must be saved (multi-seed error
+                        # bars). Filenames carry the seed, so no collision.
+                        save_wav=(
+                            temp == temps[0]
+                            and (metrics is None or seed == seeds[0])
+                        ),
                     )
         _vallex_print_group_averages(results_fh, metrics, group_name, group_results)
         summary[group_name] = group_results
