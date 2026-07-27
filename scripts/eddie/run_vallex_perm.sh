@@ -48,6 +48,9 @@ PRESET="${9:-librispeech_1.npz}"
 # arg 10: "div" to also record attention divergence during generation (one pass
 # -> wavs + attention metrics; per-shard divergence CSV). Anything else = off.
 RECDIV="${10:-}"
+# arg 11: voice mode "preset" (default) or "clone" (per-item reference — the
+# standard zero-shot protocol; needs items with ref_audio, e.g. librispeech_pc).
+VOICE_MODE="${11:-preset}"
 
 for i in $(seq 0 $((N - 1))); do
   DIV_ARGS=""
@@ -58,7 +61,8 @@ for i in $(seq 0 $((N - 1))); do
     --groups "$EVAL_GROUPS" --max-per-group "$MAXPG" \
     --data-dir data --no-quality --configs "$CFGS" \
     --protected-layers "$PL" ${SUBDIR:+--output-subdir "$SUBDIR"} \
-    --seeds "$SEEDS" --decode sampling --preset "$PRESET" $DIV_ARGS \
+    --seeds "$SEEDS" --decode sampling --preset "$PRESET" \
+    --voice-mode "$VOICE_MODE" $DIV_ARGS \
     --num-shards "$N" --shard-id "$i" --run-tag "$TAG" \
     > "logs/${TAG}_shard$i.log" 2>&1 &
 done

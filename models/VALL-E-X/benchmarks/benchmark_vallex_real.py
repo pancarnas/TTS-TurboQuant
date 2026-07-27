@@ -229,6 +229,10 @@ TURBOQUANT_CONFIGS = build_turboquant_configs(128)
 _DIV_WRITER = None
 _DIV_FH = None
 _DIV_STRIDE = 16
+# Voice prompt source (set in main): "preset" (fixed .npz) or "clone" (per-item
+# reference from item.ref_audio — the standard zero-shot protocol).
+_VOICE_MODE = "preset"
+_REF_MAX_SEC = 10.0
 _DIV_COLUMNS = [
     "group", "idx", "layer", "pos", "key_bits", "value_bits", "rw",
     "protected_layers",
@@ -642,26 +646,52 @@ def decode_audio(codec, vocos, codes, device):
     return codec.decode([(codes, None)]).squeeze().cpu().numpy()
 
 
-def prepare_text_and_prompt(text: str, language: str, preset_path: str):
-    """Tokenize the text and load the voice preset — the model-input front
-    half of run_generation, shared with the teacher-forced PPL/divergence
-    diagnostic (vallex_ppl_divergence.py). Returns CPU tensors; callers move
-    ``audio_prompts`` to their device.
+def prepare_text_and_prompt(text: str, language: str, preset_path: str,
+                            codec=None, ref_audio=None, ref_text=None,
+                            ref_max_sec: float = 10.0):
+    """Tokenize the text and build the voice prompt.
+
+    Two prompt sources:
+      * PRESET (default): load audio_tokens/text_tokens/lang_code from a .npz.
+      * PER-ITEM CLONE (ref_audio given, needs ``codec``): encode the item's own
+        reference clip (EnCodec) + its ref_text, exactly like utils.make_prompt
+        but in-memory and skipping Whisper (we already have ref_text). This is
+        the standard zero-shot protocol — each sentence cloned from its own
+        reference speaker. Reference audio is capped to ``ref_max_sec``.
+    Returns CPU tensors; callers move ``audio_prompts`` to their device.
     """
     text_tokenizer = PhonemeBpeTokenizer(
         tokenizer_path=os.path.join(_VALLEX_DIR, "utils", "g2p", "bpe_69.json")
     )
     text_collater = get_text_token_collater()
-
-    prompt_data = np.load(preset_path)
-    audio_prompts = torch.tensor(prompt_data["audio_tokens"]).int()
-    text_prompts = torch.tensor(prompt_data["text_tokens"]).int()
-    lang_pr = {0: "zh", 1: "ja", 2: "en"}[int(prompt_data["lang_code"])]
-    enroll_x_lens = text_prompts.shape[-1]
-
     lang_token = lang2token[language]
-    formatted_text = lang_token + text + lang_token
 
+    if ref_audio is not None:
+        # --- per-item clone: build the prompt from the item's reference ---
+        import torchaudio
+        from data.tokenizer import tokenize_audio
+        wav_pr, sr = torchaudio.load(ref_audio)
+        if wav_pr.size(0) > 1:                      # stereo -> mono
+            wav_pr = wav_pr.mean(0, keepdim=True)
+        max_len = int(ref_max_sec * sr)
+        if wav_pr.size(-1) > max_len:               # cap prompt length
+            wav_pr = wav_pr[:, :max_len]
+        enc = tokenize_audio(codec, (wav_pr, sr))
+        audio_prompts = enc[0][0].transpose(2, 1).int().cpu()   # (1, T, n_q)
+        ref_wrapped = lang_token + (ref_text or "") + lang_token
+        ref_phones, _ = text_tokenizer.tokenize(text=f"{ref_wrapped}".strip())
+        text_prompts, _ = text_collater([ref_phones])
+        text_prompts = text_prompts.int()
+        lang_pr = language
+    else:
+        # --- fixed preset ---
+        prompt_data = np.load(preset_path)
+        audio_prompts = torch.tensor(prompt_data["audio_tokens"]).int()
+        text_prompts = torch.tensor(prompt_data["text_tokens"]).int()
+        lang_pr = {0: "zh", 1: "ja", 2: "en"}[int(prompt_data["lang_code"])]
+
+    enroll_x_lens = text_prompts.shape[-1]
+    formatted_text = lang_token + text + lang_token
     phone_tokens, langs = text_tokenizer.tokenize(text=f"_{formatted_text}".strip())
     text_tokens, text_tokens_lens = text_collater([phone_tokens])
     text_tokens = torch.cat([text_prompts, text_tokens], dim=-1)
@@ -682,6 +712,9 @@ def run_generation(
     seed=None,
     decode_params=None,
     deterministic=False,
+    ref_audio=None,
+    ref_text=None,
+    ref_max_sec=10.0,
 ):
     """Run one generation end-to-end.
 
@@ -691,7 +724,8 @@ def run_generation(
     ``seed`` (if given) is applied via set_global_seed right before inference so
     baseline and every compressed config share the same random draw for this
     (sentence, seed) — the paired-comparison control. ``decode_params`` overrides
-    top_k/temperature (greedy vs sampling arm).
+    top_k/temperature (greedy vs sampling arm). If ``ref_audio`` is given the
+    voice prompt is cloned per-item from it (else the fixed preset is used).
     """
     dp = {"top_k": -100, "temperature": 1.0}
     if decode_params:
@@ -703,7 +737,9 @@ def run_generation(
         enroll_x_lens,
         lang_pr,
         langs,
-    ) = prepare_text_and_prompt(text, language, preset_path)
+    ) = prepare_text_and_prompt(text, language, preset_path, codec=codec,
+                                ref_audio=ref_audio, ref_text=ref_text,
+                                ref_max_sec=ref_max_sec)
     audio_prompts = audio_prompts.to(device)
 
     if _is_cuda(device):
@@ -916,6 +952,11 @@ def _vallex_sweep_sentence_seed(
                 seed=seed,
                 decode_params=decode_params,
                 deterministic=deterministic,
+                ref_audio=(getattr(item, "ref_audio", None)
+                           if _VOICE_MODE == "clone" else None),
+                ref_text=(getattr(item, "ref_text", None)
+                          if _VOICE_MODE == "clone" else None),
+                ref_max_sec=_REF_MAX_SEC,
             )
             # Stream this config's divergence rows (bounded RAM: written +
             # cleared per config). Prepend sentence/config columns.
@@ -1316,6 +1357,13 @@ def benchmark_vallex(args):
 
     active_groups = getattr(args, "active_groups", available_groups())
     max_per_group = getattr(args, "max_per_group", None)
+
+    # Voice-prompt source for this run.
+    global _VOICE_MODE, _REF_MAX_SEC
+    _VOICE_MODE = getattr(args, "voice_mode", "preset")
+    _REF_MAX_SEC = getattr(args, "ref_max_sec", 10.0)
+    if _VOICE_MODE == "clone":
+        _tee(results_fh, f"Voice mode: CLONE per-item reference (cap {_REF_MAX_SEC}s)")
 
     # Open the divergence CSV if recording during generation.
     global _DIV_WRITER, _DIV_FH, _DIV_STRIDE
@@ -1796,6 +1844,16 @@ def main():
         "runs whose config labels would collide with an existing sweep's wav "
         "names (e.g. a --protected-layers 0 rerun of a config already "
         "generated at pl=2 — pl is not part of the wav filename).",
+    )
+    parser.add_argument(
+        "--voice-mode", default="preset", choices=["preset", "clone"],
+        help="'preset' = fixed --preset voice for all sentences; 'clone' = "
+        "per-item reference from the item's own ref_audio (standard zero-shot "
+        "protocol; items without a reference fall back to the preset).",
+    )
+    parser.add_argument(
+        "--ref-max-sec", type=float, default=10.0,
+        help="Cap the cloned reference clip length (VALL-E-X prompt).",
     )
     parser.add_argument(
         "--record-divergence", action="store_true",
