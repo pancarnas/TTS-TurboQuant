@@ -11,6 +11,7 @@ set -euo pipefail
 
 N="${1:-4}"
 PRESET="${2:-librispeech_1.npz}"
+VOICE_MODE="${3:-preset}"   # 'preset' or 'clone' (per-item reference)
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4
 mkdir -p logs results
 
@@ -20,11 +21,11 @@ DIV="results/${TAG}_div.csv"
 SCORES="results/${TAG}_scores.csv"
 CFGS="fp16,K4V4@0,K4V2@0,K3V3@0,K2V2@0"
 
-echo "### 1/3  generate + divergence  (preset=$PRESET, $N sents x 5 configs x 2 seeds) ###"
+echo "### 1/3  generate + divergence  (preset=$PRESET, voice_mode=$VOICE_MODE, $N sents x 5 configs x 2 seeds) ###"
 python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
   --groups librispeech_pc --max-per-group "$N" --data-dir data --no-quality \
   --configs "$CFGS" --protected-layers 0 --output-subdir "$SUB" \
-  --seeds 0,1 --decode sampling --preset "$PRESET" \
+  --seeds 0,1 --decode sampling --preset "$PRESET" --voice-mode "$VOICE_MODE" \
   --record-divergence --divergence-out "$DIV" --divergence-stride 16 \
   --num-shards 1 --shard-id 0 --run-tag "$TAG"
 
