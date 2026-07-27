@@ -25,9 +25,10 @@ import pandas as pd  # noqa: E402
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--div", required=True)
-    ap.add_argument("--scores", required=True)
-    ap.add_argument("--wavdir", required=True)
+    ap.add_argument("--div", default="results/smoke_full_div.csv")
+    ap.add_argument("--scores", default="results/smoke_full_scores.csv")
+    ap.add_argument("--wavdir",
+                    default="models/VALL-E-X/benchmarks/outputs/smoke_full")
     ap.add_argument("--n", type=int, default=4, help="sentences per group")
     args = ap.parse_args()
 
