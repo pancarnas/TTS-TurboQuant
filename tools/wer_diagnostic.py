@@ -31,6 +31,8 @@ def main() -> None:
     ap.add_argument("--config", default="fp16", help="which config's transcripts")
     ap.add_argument("--group", default="librispeech_pc")
     ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--audio-dir", default="models/VALL-E-X/benchmarks/outputs/seed_pl0",
+                    help="dir the wavs live in (to print a listen path per sentence)")
     ap.add_argument("--n", type=int, default=12, help="worst-N sentences to print")
     args = ap.parse_args()
 
@@ -54,11 +56,13 @@ def main() -> None:
         hyp_raw = "" if pd.isna(r.get("transcript")) else str(r["transcript"])
         rn, hn = norm(ref_raw), norm(hyp_raw)
         recomputed = float(jiwer_wer(rn, hn)) if rn else 0.0
+        wav = "" if pd.isna(r.get("wav")) else str(r["wav"])
         recs.append({
             "idx": idx, "wer": float(r["wer"]), "cer": float(r["cer"]),
             "recomputed_wer": recomputed,
             "ref_norm": rn, "hyp_norm": hn,
             "ref_words": len(rn.split()), "hyp_words": len(hn.split()),
+            "wav": wav,
         })
     df = pd.DataFrame(recs)
 
@@ -80,6 +84,8 @@ def main() -> None:
               f"({int(r.ref_words)}->{int(r.hyp_words)} words)")
         print(f"  REF: {r.ref_norm}")
         print(f"  HYP: {r.hyp_norm}")
+        if r.wav:
+            print(f"  AUDIO: {os.path.join(args.audio_dir, r.wav)}")
 
 
 if __name__ == "__main__":
