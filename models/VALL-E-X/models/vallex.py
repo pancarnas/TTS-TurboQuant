@@ -530,6 +530,11 @@ class VALLE(VALLF):
             from turboquant_cache import TurboQuantValleCache
             tq_cache_manager = TurboQuantValleCache(turboquant_config, n_layers=12)
             self._tq_cache_manager = tq_cache_manager
+            # Optional divergence recording DURING generation: a caller can set
+            # model._divergence_recorder to a DivergenceRecorder; the cache then
+            # keeps a shadow exact K/V copy and the attention hook logs quantized
+            # -vs-exact stats per (layer, step). None = no recording (no cost).
+            tq_cache_manager.recorder = getattr(self, "_divergence_recorder", None)
             use_kv_caching = False  # TurboQuant manages the cache directly
 
         sum_logprobs = torch.zeros(best_of, device=y.device)  # implement batch decoding here

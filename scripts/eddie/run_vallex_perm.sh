@@ -45,13 +45,20 @@ SEEDS="${8:-0}"
 # arg 9: voice preset. DEFAULT IS NOW librispeech_1.npz (English) — alan.npz is
 # Japanese and synthesizes English text cross-lingually, which inflated WER ~5x.
 PRESET="${9:-librispeech_1.npz}"
+# arg 10: "div" to also record attention divergence during generation (one pass
+# -> wavs + attention metrics; per-shard divergence CSV). Anything else = off.
+RECDIV="${10:-}"
 
 for i in $(seq 0 $((N - 1))); do
+  DIV_ARGS=""
+  if [ "$RECDIV" = "div" ]; then
+    DIV_ARGS="--record-divergence --divergence-out results/${TAG}_div_shard$i.csv"
+  fi
   python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
     --groups "$EVAL_GROUPS" --max-per-group "$MAXPG" \
     --data-dir data --no-quality --configs "$CFGS" \
     --protected-layers "$PL" ${SUBDIR:+--output-subdir "$SUBDIR"} \
-    --seeds "$SEEDS" --decode sampling --preset "$PRESET" \
+    --seeds "$SEEDS" --decode sampling --preset "$PRESET" $DIV_ARGS \
     --num-shards "$N" --shard-id "$i" --run-tag "$TAG" \
     > "logs/${TAG}_shard$i.log" 2>&1 &
 done

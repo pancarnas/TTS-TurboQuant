@@ -145,7 +145,7 @@ from macros import (
 from data.tokenizer import AudioTokenizer
 from data.collation import get_text_token_collater
 from utils.g2p import PhonemeBpeTokenizer
-from turboquant_cache import TurboQuantConfig
+from turboquant_cache import DivergenceRecorder, TurboQuantConfig
 
 from turboquant.bench_common import (
     TRIAL_COLUMNS,
@@ -222,6 +222,17 @@ def build_turboquant_configs(residual_window: int = 128) -> list:
 
 # Default sweep (rw=128); main() rebuilds from --residual-window before consumers.
 TURBOQUANT_CONFIGS = build_turboquant_configs(128)
+
+# Optional attention-divergence recording during generation (set in main()).
+# One generation pass then yields wavs AND per-(layer, step) quantized-vs-exact
+# attention stats — no separate teacher-forced divergence run needed.
+_DIV_WRITER = None
+_DIV_FH = None
+_DIV_STRIDE = 16
+_DIV_COLUMNS = [
+    "group", "idx", "layer", "pos", "key_bits", "value_bits", "rw",
+    "protected_layers",
+] + DivergenceRecorder.METRICS
 
 
 # Same token grammar as the Qwen divergence experiment — K<kb>V<vb>@<rw> or
@@ -866,6 +877,7 @@ def _vallex_sweep_sentence_seed(
     device,
     deterministic,
     save_wav,
+    record_div=False,
 ):
     """Run all configs for one (sentence, seed, temperature), paired on the same draw."""
     text = item.text
@@ -875,6 +887,14 @@ def _vallex_sweep_sentence_seed(
         key_bits, value_bits, residual_window = config_bits(
             tq_config.primary if tq_config is not None else None
         )
+        # Attach a divergence recorder for this config's AR generation (only
+        # when enabled, this is the recorded seed, and the config has an AR
+        # cache). fp16 has no cache -> nothing to record.
+        rec = None
+        if (_DIV_WRITER is not None and record_div and tq_config is not None
+                and tq_config.ar is not None):
+            rec = DivergenceRecorder(tq_config.ar.residual_window, _DIV_STRIDE)
+        model._divergence_recorder = rec
         try:
             (
                 wav,
@@ -897,6 +917,16 @@ def _vallex_sweep_sentence_seed(
                 decode_params=decode_params,
                 deterministic=deterministic,
             )
+            # Stream this config's divergence rows (bounded RAM: written +
+            # cleared per config). Prepend sentence/config columns.
+            if rec is not None and rec.rows:
+                for row in rec.rows:
+                    _DIV_WRITER.writerow(
+                        [group_name, idx, row[0], row[1], key_bits, value_bits,
+                         residual_window, (tq_config.ar.protected_layers
+                                           if tq_config.ar else "")] + row[2:]
+                    )
+                _DIV_FH.flush()
             audio_duration = len(wav) / SAMPLE_RATE
             rtf = elapsed / audio_duration if audio_duration > 0 else float("inf")
             ar_rtf = (
@@ -1143,6 +1173,8 @@ def _vallex_sweep_arm(
                             temp == temps[0]
                             and (metrics is None or seed == seeds[0])
                         ),
+                        # record divergence once per config: first seed/temp only
+                        record_div=(seed == seeds[0] and temp == temps[0]),
                     )
         _vallex_print_group_averages(results_fh, metrics, group_name, group_results)
         summary[group_name] = group_results
@@ -1285,6 +1317,18 @@ def benchmark_vallex(args):
     active_groups = getattr(args, "active_groups", available_groups())
     max_per_group = getattr(args, "max_per_group", None)
 
+    # Open the divergence CSV if recording during generation.
+    global _DIV_WRITER, _DIV_FH, _DIV_STRIDE
+    if getattr(args, "record_divergence", False):
+        import csv as _csv
+        os.makedirs(os.path.dirname(args.divergence_out) or ".", exist_ok=True)
+        _DIV_FH = open(args.divergence_out, "w", newline="", encoding="utf-8")
+        _DIV_WRITER = _csv.writer(_DIV_FH)
+        _DIV_WRITER.writerow(_DIV_COLUMNS)
+        _DIV_STRIDE = args.divergence_stride
+        _tee(results_fh, f"Recording attention divergence -> {args.divergence_out} "
+             f"(stride {_DIV_STRIDE})")
+
     for arm in arms:
         summary = _vallex_sweep_arm(
             model,
@@ -1309,6 +1353,9 @@ def benchmark_vallex(args):
         _vallex_print_arm_summaries(results_fh, metrics, arm, active_groups, summary)
 
     trial_fh.close()
+    if _DIV_FH is not None:
+        _DIV_FH.close()
+        _tee(results_fh, f"Attention divergence CSV: {args.divergence_out}")
     _tee(results_fh, f"\nOutput audio saved to: {output_dir}/")
     _tee(results_fh, f"Per-trial CSV (source of truth): {trial_path}")
     results_fh.close()
@@ -1749,6 +1796,20 @@ def main():
         "runs whose config labels would collide with an existing sweep's wav "
         "names (e.g. a --protected-layers 0 rerun of a config already "
         "generated at pl=2 — pl is not part of the wav filename).",
+    )
+    parser.add_argument(
+        "--record-divergence", action="store_true",
+        help="Also record per-(layer,step) quantized-vs-exact attention "
+        "divergence DURING generation, into --divergence-out. One pass then "
+        "yields wavs + attention metrics (no separate teacher-forced run).",
+    )
+    parser.add_argument(
+        "--divergence-out", default="results/vallex_gen_divergence.csv",
+        help="CSV path for --record-divergence output.",
+    )
+    parser.add_argument(
+        "--divergence-stride", type=int, default=16,
+        help="Record divergence every Nth decode step (bounds CSV size).",
     )
     parser.add_argument(
         "--protected-layers",
