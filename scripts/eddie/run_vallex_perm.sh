@@ -42,13 +42,16 @@ CFGS="${5:-$DEFAULT_CFGS}"
 PL="${6:-2}"
 SUBDIR="${7:-}"
 SEEDS="${8:-0}"
+# arg 9: voice preset. DEFAULT IS NOW librispeech_1.npz (English) — alan.npz is
+# Japanese and synthesizes English text cross-lingually, which inflated WER ~5x.
+PRESET="${9:-librispeech_1.npz}"
 
 for i in $(seq 0 $((N - 1))); do
   python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
     --groups "$EVAL_GROUPS" --max-per-group "$MAXPG" \
     --data-dir data --no-quality --configs "$CFGS" \
     --protected-layers "$PL" ${SUBDIR:+--output-subdir "$SUBDIR"} \
-    --seeds "$SEEDS" --decode sampling \
+    --seeds "$SEEDS" --decode sampling --preset "$PRESET" \
     --num-shards "$N" --shard-id "$i" --run-tag "$TAG" \
     > "logs/${TAG}_shard$i.log" 2>&1 &
 done
