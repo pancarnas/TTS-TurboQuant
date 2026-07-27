@@ -35,7 +35,7 @@ python tools/score_wav_dir.py \
 
 echo -e "\n### 3/3  validate ###"
 python3 - "$DIV" "$SCORES" "models/VALL-E-X/benchmarks/outputs/$SUB" "$N" <<'PY'
-import sys, glob, os, pandas as pd
+import sys, glob, os, re, pandas as pd
 div, sc, wavdir, N = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 ok = True
 def check(name, cond):
@@ -45,8 +45,9 @@ def check(name, cond):
 # --- wavs ---
 nwav = len(glob.glob(os.path.join(wavdir, "*.wav")))
 check(f"wav count == {N}x5x2 ({N*10})", nwav == N*10)
-seeds = {int(f.split('_s')[1].split('_')[0]) for f in glob.glob(os.path.join(wavdir,'*.wav'))}
-check("both seeds saved (0 and 1)", {0,1} <= seeds)
+seeds = {int(m.group(1)) for f in glob.glob(os.path.join(wavdir, "*.wav"))
+         if (m := re.search(r"_s(\d+)_", os.path.basename(f)))}
+check("both seeds saved (0 and 1)", {0, 1} <= seeds)
 
 # --- divergence correctness (both bit axes) ---
 d = pd.read_csv(div)
