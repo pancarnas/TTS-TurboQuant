@@ -32,6 +32,10 @@ env/
 *.ogg
 *.flac
 
+# Exception: MOS listening-study clips hosted via GitHub Pages
+!docs/mos_clips/
+!docs/mos_clips/*.wav
+
 # Benchmark outputs
 **/benchmarks/outputs/
 
