@@ -79,6 +79,39 @@ def _load24k(path: str, max_sec: float | None = None) -> np.ndarray:
     return wav
 
 
+def _trim_onset(wav: np.ndarray, sr: int) -> np.ndarray:
+    """Remove the VALL-E-X onset burst + leading silence from a synthesized clip.
+
+    VALL-E-X emits a brief high-energy burst at the very start followed by a
+    stretch of silence before the speech. This detects the speech onset (first
+    sustained-energy region preceded by quiet, so the burst is not mistaken for
+    speech), trims to ~200 ms before it (always at least 150 ms so any burst is
+    removed; speech never starts that early), and applies a 20 ms raised-cosine
+    fade-in. Natural/reference clips are real recordings and must NOT be trimmed.
+    """
+    w = np.asarray(wav, dtype=np.float64)
+    win = int(0.010 * sr)
+    nf = len(w) // win
+    if nf < 6:
+        return wav
+    e = np.array([np.sqrt(np.mean(w[i * win:(i + 1) * win] ** 2)) for i in range(nf)])
+    thr = 0.10 * (e[20:].max() if nf > 20 else e.max())
+    onset = -1
+    for i in range(2, nf):
+        if e[i] > thr and np.mean(e[i:i + 8] > thr) >= 0.6:
+            pre = e[max(0, i - 14):max(1, i - 2)]
+            if len(pre) == 0 or np.mean(pre < thr) >= 0.7:
+                onset = i * 10  # ms
+                break
+    trim_ms = max(150, onset - 200) if onset > 0 else 150
+    cut = min(int(trim_ms / 1000 * sr), max(0, len(wav) - sr))  # keep >=1 s
+    nw = np.asarray(wav[cut:], dtype=np.float64)
+    nfade = int(0.020 * sr)
+    if len(nw) > nfade:
+        nw[:nfade] *= 0.5 * (1 - np.cos(np.pi * np.arange(nfade) / nfade))
+    return nw
+
+
 def _select_sentences(scores: str, n: int, exclude: set[int],
                       complete) -> list[int]:
     """Clean, medium-length sentence idxs: low fp16 CER, 4-9 s, cleanest first.
@@ -201,7 +234,10 @@ def main() -> None:
                    if system == "natural" else _gen_path(args.audio_dir, idx, system))
             if not src or not os.path.exists(src):
                 missing.append((idx, system)); continue
-            _write(cid, _load24k(src))
+            wav = _load24k(src)
+            if system != "natural":          # trim VALL-E onset artifact on synth only
+                wav = _trim_onset(wav, TARGET_SR)
+            _write(cid, wav)
             cer, wer = _cer_wer(idx, system)
             manifest.append({
                 "clip_id": cid, "block": b, "role": "stimulus", "system": system,
