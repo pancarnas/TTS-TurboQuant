@@ -172,6 +172,13 @@ def main() -> None:
     )
     ap.add_argument("--preset", default="alan.npz")
     ap.add_argument(
+        "--voice-mode", default="preset", choices=["preset", "clone"],
+        help="'preset' = fixed --preset voice for all items; 'clone' = per-item "
+        "reference from item.ref_audio (the standard zero-shot protocol; needs "
+        "items that carry ref_audio, e.g. librispeech_pc). --preset is the "
+        "fallback for items without a reference.",
+    )
+    ap.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     ap.add_argument("--out", default="results/vallex_ppl.csv")
@@ -235,7 +242,14 @@ def main() -> None:
                 enroll_x_lens,
                 lang_pr,
                 langs,
-            ) = prepare_text_and_prompt(item.text, "en", preset_path)
+            ) = prepare_text_and_prompt(
+                item.text, "en", preset_path,
+                codec=codec if args.voice_mode == "clone" else None,
+                ref_audio=(getattr(item, "ref_audio", None)
+                           if args.voice_mode == "clone" else None),
+                ref_text=(getattr(item, "ref_text", None)
+                          if args.voice_mode == "clone" else None),
+            )
             common = dict(
                 x=text_tokens.to(args.device),
                 x_lens=text_tokens_lens.to(args.device),
