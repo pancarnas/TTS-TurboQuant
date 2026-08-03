@@ -233,6 +233,20 @@ _DIV_STRIDE = 16
 # reference from item.ref_audio — the standard zero-shot protocol).
 _VOICE_MODE = "preset"
 _REF_MAX_SEC = 10.0
+_ALLOWED_IDXS = None  # None = all sentences; else a set of idxs to keep (--idx-file)
+
+
+def _load_idx_file(path):
+    """One integer idx per line ('#' comments ok) -> set; None if path is falsy."""
+    if not path:
+        return None
+    allowed = set()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                allowed.add(int(line))
+    return allowed
 _DIV_COLUMNS = [
     "group", "idx", "layer", "pos", "key_bits", "value_bits", "rw",
     "protected_layers",
@@ -1175,6 +1189,8 @@ def _vallex_sweep_arm(
         _tee(results_fh, f"{'=' * 110}")
         group_results = _vallex_empty_group_results()
         for i, item in enumerate(items):
+            if _ALLOWED_IDXS is not None and i not in _ALLOWED_IDXS:
+                continue
             text = item.text
             shash = sentence_hash(text)
             preview = text[:50] + "..." if len(text) > 50 else text
@@ -1364,6 +1380,15 @@ def benchmark_vallex(args):
     _REF_MAX_SEC = getattr(args, "ref_max_sec", 10.0)
     if _VOICE_MODE == "clone":
         _tee(results_fh, f"Voice mode: CLONE per-item reference (cap {_REF_MAX_SEC}s)")
+
+    # Optional sentence-idx restriction (speaker-diverse MOS subset etc.).
+    global _ALLOWED_IDXS
+    _ALLOWED_IDXS = _load_idx_file(getattr(args, "idx_file", None))
+    if _ALLOWED_IDXS is not None:
+        # idx = position in the FULL eval list, so never pre-slice with max_per_group
+        # (it would drop any idx beyond the cap before the filter sees it).
+        max_per_group = None
+        _tee(results_fh, f"Restricting to {len(_ALLOWED_IDXS)} idxs from {args.idx_file}")
 
     # Open the divergence CSV if recording during generation.
     global _DIV_WRITER, _DIV_FH, _DIV_STRIDE
@@ -1793,6 +1818,14 @@ def main():
         type=int,
         default=None,
         help="Cap sentences per group (useful for smoke tests; default: run all).",
+    )
+    parser.add_argument(
+        "--idx-file",
+        default=None,
+        help="Path to a file with one sentence idx per line ('#' comments ok). When "
+        "set, only those idxs are generated (idx = position in the eval list, so "
+        "filenames/scoring stay aligned). Used to target a specific speaker-diverse "
+        "sentence set without generating the whole corpus.",
     )
     parser.add_argument(
         "--data-dir",

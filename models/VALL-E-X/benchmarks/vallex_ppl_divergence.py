@@ -155,6 +155,13 @@ def main() -> None:
         "(librispeech_pc does; seedtts_en/ellav_hard do not).",
     )
     ap.add_argument("--max-per-group", type=int, default=50)
+    ap.add_argument(
+        "--idx-file",
+        default=None,
+        help="File with one sentence idx per line ('#' comments ok); when set, only "
+        "those idxs are scored (idx = position in the eval list). Use the same file "
+        "as the generation run so PPL covers the same sentence set.",
+    )
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--configs", default="K4V4@64,K4V3@64,K3V3@64,K3V3@128")
     ap.add_argument("--protected-layers", type=int, default=2)
@@ -190,6 +197,15 @@ def main() -> None:
 
     specs = parse_specs(args.configs)
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    allowed_idxs = None
+    if args.idx_file:
+        allowed_idxs = set()
+        with open(args.idx_file, encoding="utf-8") as _fh:
+            for _line in _fh:
+                _line = _line.strip()
+                if _line and not _line.startswith("#"):
+                    allowed_idxs.add(int(_line))
+        print(f"restricting to {len(allowed_idxs)} idxs from {args.idx_file}")
     preset_path = os.path.join(_VALLEX_DIR, "presets", args.preset)
 
     model, codec, _vocos = load_vallex_model(args.device)
@@ -216,8 +232,13 @@ def main() -> None:
 
     skipped_no_gt = 0
     for group in groups:
-        items = iter_eval_items([group], args.max_per_group, args.data_dir)
+        # idx = position in the FULL eval list; when an idx-file is given, load the
+        # whole list (max_per_group would otherwise pre-slice and drop idxs > cap).
+        _mpg = None if allowed_idxs is not None else args.max_per_group
+        items = iter_eval_items([group], _mpg, args.data_dir)
         for idx, item in enumerate(items):
+            if allowed_idxs is not None and idx not in allowed_idxs:
+                continue
             gt = getattr(item, "ground_truth_audio", None)
             if not gt or not os.path.exists(gt):
                 skipped_no_gt += 1

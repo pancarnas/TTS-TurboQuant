@@ -163,12 +163,18 @@ def _select_sentences(scores: str, n: int, exclude: set[int], complete,
                   "adjust --strata or check feasibility")
         return idxs, band_of
 
-    # cleanest-first fallback (original behaviour), sorted on the chosen metric
+    # cleanest-first fallback (original behaviour), sorted on the chosen metric.
+    # n <= 0 means "take ALL complete sentences" (used when the audio dir was already
+    # built to the exact target set, e.g. the speaker-diverse MOS campaign).
     order = fp.sort_values(metric)
-    picked, skipped = _take([int(x) for x in order["idx"]], n)
+    cand = [int(x) for x in order["idx"]]
+    take_all = n <= 0
+    picked, skipped = _take(cand, len(cand) if take_all else n)
     if skipped:
         print(f"skipped {len(skipped)} candidates with missing clips: {skipped}")
-    if len(picked) < n:
+    if take_all:
+        print(f"selected all {len(picked)} complete sentences")
+    elif len(picked) < n:
         raise SystemExit(f"only {len(picked)} usable sentences found; lower --n-sentences")
     return picked, {}
 
