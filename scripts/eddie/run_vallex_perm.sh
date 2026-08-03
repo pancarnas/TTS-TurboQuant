@@ -51,6 +51,9 @@ RECDIV="${10:-}"
 # arg 11: voice mode "preset" (default) or "clone" (per-item reference — the
 # standard zero-shot protocol; needs items with ref_audio, e.g. librispeech_pc).
 VOICE_MODE="${11:-preset}"
+# arg 12: optional idx-file — restrict generation to the listed sentence idxs
+# (idx = eval-list position). When set, --max-per-group is ignored by the runner.
+IDX_FILE="${12:-}"
 
 for i in $(seq 0 $((N - 1))); do
   DIV_ARGS=""
@@ -62,7 +65,7 @@ for i in $(seq 0 $((N - 1))); do
     --data-dir data --no-quality --configs "$CFGS" \
     --protected-layers "$PL" ${SUBDIR:+--output-subdir "$SUBDIR"} \
     --seeds "$SEEDS" --decode sampling --preset "$PRESET" \
-    --voice-mode "$VOICE_MODE" $DIV_ARGS \
+    --voice-mode "$VOICE_MODE" $DIV_ARGS ${IDX_FILE:+--idx-file "$IDX_FILE"} \
     --num-shards "$N" --shard-id "$i" --run-tag "$TAG" \
     > "logs/${TAG}_shard$i.log" 2>&1 &
 done
