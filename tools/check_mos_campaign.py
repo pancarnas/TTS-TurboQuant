@@ -47,8 +47,11 @@ def _read_idx_file(path: str) -> set[int]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--audio-dir", required=True)
-    ap.add_argument("--idx-file", default="mos_idx_list.txt")
+    ap.add_argument("--audio-dir", default=None,
+                    help="dir of generated wavs; omit for a metrics-only check "
+                         "(then only --scores is used, e.g. locally)")
+    ap.add_argument("--idx-file", default=None,
+                    help="expected idxs; omit to use whatever idxs are present")
     ap.add_argument("--configs", default=CONFIGS_28,
                     help="comma list of configs each idx should have")
     ap.add_argument("--group", default="librispeech_pc")
@@ -57,73 +60,80 @@ def main() -> None:
     ap.add_argument("--short-sec", type=float, default=1.0)
     args = ap.parse_args()
 
-    want_idxs = _read_idx_file(args.idx_file)
     want_cfgs = [c.strip() for c in args.configs.split(",") if c.strip()]
+    have_dir = bool(args.audio_dir) and os.path.isdir(args.audio_dir)
 
     # --- 1. FILES ---
     present: dict[int, set[str]] = defaultdict(set)
     paths: dict[tuple[int, str], str] = {}
     foreign = 0
     n_wav = 0
-    for fn in os.listdir(args.audio_dir):
-        if not fn.endswith(".wav"):
-            continue
-        n_wav += 1
-        m = _WAV_RE.match(fn)
-        if not m or m["group"] != args.group:
-            foreign += 1
-            continue
-        idx, cfg = int(m["idx"]), m["config"]
-        present[idx].add(cfg)
-        paths[(idx, cfg)] = os.path.join(args.audio_dir, fn)
-    all_cfgs = sorted({c for cfgs in present.values() for c in cfgs})
     print("=== 1. FILES ===")
-    print(f"  wavs: {n_wav} ({foreign} foreign/unparseable)")
-    print(f"  distinct idxs present: {len(present)}  (idx-file wants {len(want_idxs)})")
-    print(f"  distinct configs present: {len(all_cfgs)}  (want {len(want_cfgs)})")
+    if have_dir:
+        for fn in os.listdir(args.audio_dir):
+            if not fn.endswith(".wav"):
+                continue
+            n_wav += 1
+            m = _WAV_RE.match(fn)
+            if not m or m["group"] != args.group:
+                foreign += 1
+                continue
+            idx, cfg = int(m["idx"]), m["config"]
+            present[idx].add(cfg)
+            paths[(idx, cfg)] = os.path.join(args.audio_dir, fn)
+        all_cfgs = sorted({c for cfgs in present.values() for c in cfgs})
+        print(f"  wavs: {n_wav} ({foreign} foreign/unparseable)")
+        print(f"  distinct idxs present: {len(present)}")
+        print(f"  distinct configs present: {len(all_cfgs)}  (want {len(want_cfgs)})")
+    else:
+        print("  (no --audio-dir; skipping file/completeness/duration checks)")
+
+    # expected idxs: explicit file, else whatever is present
+    want_idxs = _read_idx_file(args.idx_file) if args.idx_file else set(present)
 
     # --- 2. COMPLETENESS ---
-    print("=== 2. COMPLETENESS (idx x config) ===")
-    missing_pairs = []
-    complete_idxs = 0
-    for idx in sorted(want_idxs):
-        have = present.get(idx, set())
-        miss = [c for c in want_cfgs if c not in have]
-        if not miss:
-            complete_idxs += 1
-        else:
-            missing_pairs += [(idx, c) for c in miss]
-    idxs_absent = sorted(i for i in want_idxs if i not in present)
-    print(f"  fully-complete idxs: {complete_idxs}/{len(want_idxs)}")
-    print(f"  missing (idx,config) pairs: {len(missing_pairs)}")
-    if idxs_absent:
-        print(f"  idxs with ZERO wavs ({len(idxs_absent)}): {idxs_absent[:20]}")
-    if missing_pairs:
-        print(f"  examples: {missing_pairs[:10]}")
+    if have_dir:
+        print("=== 2. COMPLETENESS (idx x config) ===")
+        missing_pairs = []
+        complete_idxs = 0
+        for idx in sorted(want_idxs):
+            have = present.get(idx, set())
+            miss = [c for c in want_cfgs if c not in have]
+            if not miss:
+                complete_idxs += 1
+            else:
+                missing_pairs += [(idx, c) for c in miss]
+        idxs_absent = sorted(i for i in want_idxs if i not in present)
+        print(f"  fully-complete idxs: {complete_idxs}/{len(want_idxs)}")
+        print(f"  missing (idx,config) pairs: {len(missing_pairs)}")
+        if idxs_absent:
+            print(f"  idxs with ZERO wavs ({len(idxs_absent)}): {idxs_absent[:20]}")
+        if missing_pairs:
+            print(f"  examples: {missing_pairs[:10]}")
 
     # --- 3. DURATION ---
-    print("=== 3. DURATION ===")
-    try:
-        import soundfile as sf
-        durs = []
-        short = []
-        for (idx, cfg), p in paths.items():
-            try:
-                info = sf.info(p)
-                d = info.frames / info.samplerate
-            except Exception:
-                d = 0.0
-            durs.append(d)
-            if d < args.short_sec:
-                short.append((idx, cfg, round(d, 2)))
-        if durs:
-            print(f"  n={len(durs)}  min={min(durs):.2f}s  "
-                  f"mean={sum(durs)/len(durs):.2f}s  max={max(durs):.2f}s")
-        print(f"  suspiciously short (<{args.short_sec}s): {len(short)}")
-        if short:
-            print(f"    examples: {short[:10]}")
-    except ImportError:
-        print("  (soundfile not importable — skipped)")
+    if have_dir:
+        print("=== 3. DURATION ===")
+        try:
+            import soundfile as sf
+            durs, short = [], []
+            for (idx, cfg), p in paths.items():
+                try:
+                    info = sf.info(p)
+                    d = info.frames / info.samplerate
+                except Exception:
+                    d = 0.0
+                durs.append(d)
+                if d < args.short_sec:
+                    short.append((idx, cfg, round(d, 2)))
+            if durs:
+                print(f"  n={len(durs)}  min={min(durs):.2f}s  "
+                      f"mean={sum(durs)/len(durs):.2f}s  max={max(durs):.2f}s")
+            print(f"  suspiciously short (<{args.short_sec}s): {len(short)}")
+            if short:
+                print(f"    examples: {short[:10]}")
+        except ImportError:
+            print("  (soundfile not importable — skipped)")
 
     # --- 4. SPEAKERS ---
     print("=== 4. SPEAKERS ===")
@@ -136,8 +146,14 @@ def main() -> None:
                    or getattr(items[i], "ground_truth_audio", None))
             return os.path.basename(ref).split("-")[0] if ref else str(i)
 
+        # idx source: generated wavs if scanned, else the idxs in the scores CSV
+        spk_idxs = set(present)
+        if not spk_idxs and args.scores and os.path.exists(args.scores):
+            import pandas as pd
+            sc = pd.read_csv(args.scores)
+            spk_idxs = {int(i) for i in sc[sc["group"] == args.group]["idx"].unique()}
         per_spk = defaultdict(int)
-        for i in present:
+        for i in spk_idxs:
             if i < len(items):
                 per_spk[spk(i)] += 1
         print(f"  distinct speakers among generated idxs: {len(per_spk)}")
