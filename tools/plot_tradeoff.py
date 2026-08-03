@@ -139,10 +139,13 @@ def main() -> None:
     ax.set_xlabel("KV-cache compression ratio  (× vs fp16, protected layers incl.)")
     ax.set_ylabel(label)
     pack = "ideal sub-byte packing" if args.ideal else "as-implemented (8//bits) packing"
-    _sub = ("lower-right is better" if args.no_frontier
-            else "lower-right is better; black line = combined Pareto frontier")
-    ax.set_title(f"{label} vs KV-cache compression\n{_sub}  [{pack}]",
-                 fontsize=11, fontweight="bold")
+    if args.no_frontier:
+        ax.set_title(f"{label} vs KV-cache compression  [{pack}]",
+                     fontsize=11, fontweight="bold")
+    else:
+        ax.set_title(f"{label} vs KV-cache compression\n"
+                     "lower-right is better; black line = combined Pareto frontier"
+                     f"  [{pack}]", fontsize=11, fontweight="bold")
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=9)
     if front:
