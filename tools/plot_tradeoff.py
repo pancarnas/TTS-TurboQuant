@@ -95,6 +95,9 @@ def main() -> None:
     ap.add_argument("--ideal", action="store_true",
                     help="ideal sub-byte packing instead of the 8//bits as-run cost")
     ap.add_argument("--out", default="results/figures/tradeoff.png")
+    ap.add_argument("--no-frontier", action="store_true",
+                    help="omit the Pareto frontier line (its leftmost point can "
+                    "be single-seed noise under 8//bits packing)")
     args = ap.parse_args()
 
     excl = [g.strip() for g in args.exclude_groups.split(",") if g.strip()]
@@ -123,24 +126,28 @@ def main() -> None:
         ax.annotate(f"{name} fp16 ({fp16:.3f})", (1.0, fp16),
                     textcoords="offset points", xytext=(4, 3), fontsize=7, color=col)
 
-    # Combined Pareto frontier (higher ratio + lower metric dominates).
-    def dominated(p):
-        return any((q[2] >= p[2] and q[3] <= p[3])
-                   and (q[2] > p[2] or q[3] < p[3]) for q in allpts)
-    front = sorted([p for p in allpts if not dominated(p)], key=lambda p: p[2])
-    ax.plot([p[2] for p in front], [p[3] for p in front],
-            color="black", lw=2, alpha=0.7, zorder=2, label="Pareto frontier")
+    front = []
+    if not args.no_frontier:
+        # Combined Pareto frontier (higher ratio + lower metric dominates).
+        def dominated(p):
+            return any((q[2] >= p[2] and q[3] <= p[3])
+                       and (q[2] > p[2] or q[3] < p[3]) for q in allpts)
+        front = sorted([p for p in allpts if not dominated(p)], key=lambda p: p[2])
+        ax.plot([p[2] for p in front], [p[3] for p in front],
+                color="black", lw=2, alpha=0.7, zorder=2, label="Pareto frontier")
 
     ax.set_xlabel("KV-cache compression ratio  (× vs fp16, protected layers incl.)")
     ax.set_ylabel(label)
     pack = "ideal sub-byte packing" if args.ideal else "as-implemented (8//bits) packing"
-    ax.set_title(f"{label} vs KV-cache compression\n"
-                 f"lower-right is better; black line = combined Pareto frontier  [{pack}]",
+    _sub = ("lower-right is better" if args.no_frontier
+            else "lower-right is better; black line = combined Pareto frontier")
+    ax.set_title(f"{label} vs KV-cache compression\n{_sub}  [{pack}]",
                  fontsize=11, fontweight="bold")
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=9)
-    front_str = " > ".join(f"{n}:{l}" for n, l, _, _ in front)
-    print(f"combined Pareto frontier: {front_str}")
+    if front:
+        front_str = " > ".join(f"{n}:{l}" for n, l, _, _ in front)
+        print(f"combined Pareto frontier: {front_str}")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
     plt.close(fig)
