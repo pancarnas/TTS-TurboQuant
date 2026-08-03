@@ -5,20 +5,24 @@ ref_clip_id, ...) and a hosting base URL, and writes a .txt that Qualtrics
 imports (Survey -> Tools -> Import/Export -> Import Survey, "Advanced Format").
 Clips are expected at <base-url>/<clip_id>.wav.
 
-Per block it emits, for every stimulus, a 5-point naturalness (MOS) question,
-and for every synthesized stimulus a 5-point speaker-similarity (SMOS) question
-that plays the sentence's reference clip beside it. Question IDs are
-``nat_<clip>`` / ``sim_<clip>`` so the export joins straight back to the manifest.
+One block per group. Each stimulus is its own page: a 5-point naturalness (MOS)
+question first, then - for synthesized systems - a 5-point speaker-similarity
+(SMOS) question on the same page that reveals the sentence's reference clip and
+asks about "the clip above" (naturalness-first ordering limits reference
+anchoring). Pages are separated by a page break. Question IDs are ``nat_<clip>`` /
+``sim_<clip>`` so the export joins straight back to the manifest.
 
   python tools/make_qualtrics.py \
       --manifest mos_study_clone/manifest.csv \
       --base-url https://YOUR_HOST/mos_clips \
       --out mos_study_clone/qualtrics_import.txt
 
-After import: enable per-block question randomisation, and in Survey Flow add a
-Randomizer that presents 1 of the 2 blocks per respondent (evenly, with
-"Evenly Present Elements"). Attention checks are the natural clips (should score
-high) and the K2V2@0 clips (should score low) - identify them via the manifest.
+Stimulus order is already shuffled + anonymized at build time, so DO NOT enable
+per-question randomisation (it would split each naturalness/similarity pair across
+pages). In Survey Flow add a Randomizer that presents 1 of the N blocks per
+respondent (evenly, with "Evenly Present Elements"). Attention checks are the
+natural clips (should score high) and the K2V2@0 clips (should score low) -
+identify them via the manifest.
 """
 
 from __future__ import annotations
@@ -65,41 +69,41 @@ def main() -> None:
         sub = stim[stim["block"] == block]
         letter = chr(65 + int(block))
 
-        # --- naturalness (MOS): its own block, every stimulus ---
-        lines += [f"[[Block:Block {letter} - Naturalness]]", ""]
+        # one merged block per group; each stimulus is its own page (naturalness,
+        # then similarity for SMOS systems), separated by a page break.
+        lines += [f"[[Block:Block {letter}]]", ""]
         for _, r in sub.iterrows():
-            url = f"{base}/{r['clip_id']}.wav"
+            # --- naturalness (MOS): every stimulus, rated first ---
+            surl = f"{base}/{r['clip_id']}.wav"
             lines += [
                 "[[Question:MC:SingleAnswer]]",
                 f"[[ID:nat_{r['clip_id']}]]",
-                f"{_audio(url)}<br><br>Rate the overall quality and naturalness "
+                f"{_audio(surl)}<br><br>Rate the overall quality and naturalness "
                 "of this speech.",
                 "[[Choices]]", *NAT_CHOICES, "",
             ]
             n_nat += 1
 
-        # --- similarity (SMOS): its own block, chosen synthesized systems ---
-        lines += [f"[[Block:Block {letter} - Similarity]]", ""]
-        for _, r in sub.iterrows():
-            if r["system"] == "natural" and not args.natural_similarity:
-                continue
-            if sim_set and r["system"] not in sim_set:
-                continue
+            # --- similarity (SMOS): same page, reference revealed after ---
             ref = r.get("ref_clip_id")
-            if not isinstance(ref, str) or not ref:
-                continue
-            surl = f"{base}/{r['clip_id']}.wav"
-            rurl = f"{base}/{ref}.wav"
-            lines += [
-                "[[Question:MC:SingleAnswer]]",
-                f"[[ID:sim_{r['clip_id']}]]",
-                f"Reference voice:<br>{_audio(rurl)}<br><br>"
-                f"This clip:<br>{_audio(surl)}<br><br>"
-                "How similar is the speaker in <b>this clip</b> to the "
-                "<b>reference voice</b>?",
-                "[[Choices]]", *SIM_CHOICES, "",
-            ]
-            n_sim += 1
+            emit_sim = isinstance(ref, str) and bool(ref)
+            if r["system"] == "natural" and not args.natural_similarity:
+                emit_sim = False
+            if sim_set and r["system"] not in sim_set:
+                emit_sim = False
+            if emit_sim:
+                rurl = f"{base}/{ref}.wav"
+                lines += [
+                    "[[Question:MC:SingleAnswer]]",
+                    f"[[ID:sim_{r['clip_id']}]]",
+                    f"Reference voice:<br>{_audio(rurl)}<br><br>"
+                    "How similar is the speaker in the clip <b>above</b> to this "
+                    "<b>reference voice</b>?",
+                    "[[Choices]]", *SIM_CHOICES, "",
+                ]
+                n_sim += 1
+
+            lines += ["[[PageBreak]]", ""]
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:

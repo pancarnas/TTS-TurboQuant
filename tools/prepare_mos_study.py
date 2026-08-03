@@ -11,10 +11,16 @@ sentence / system / block plus the objective CER/WER.
 Runs on the box where the wavs live (clone grid pl0 output) + the LibriSpeech
 ground-truth/reference audio.
 
-  python tools/prepare_mos_study.py --with-similarity --blocks 2 \
-      --n-sentences 20 --scores results/grid_cl_pl0_scores.csv \
+  python tools/prepare_mos_study.py --with-similarity --unique-speakers \
+      --stratify-by wer --strata "0:0.05:15,0.05:0.15:10,0.15:0.30:5" --blocks 2 \
+      --scores results/grid_cl_pl0_scores.csv \
       --audio-dir models/VALL-E-X/benchmarks/outputs/grid_cl_pl0 \
       --data-dir data --out mos_study_clone
+
+Sentences are WER-stratified (fp16 word-error bands) so the set spans the model's
+easy/medium/hard range rather than only its cleanest outputs, giving the analysis a
+real error-rate spread; --unique-speakers keeps every reference speaker distinct.
+Omit --strata to fall back to cleanest-first on --stratify-by, up to --n-sentences.
 
 A sentence is only selected if all 6 clips exist (ground truth + 5 systems), so
 the design stays balanced; --with-similarity additionally needs the item's
@@ -79,33 +85,92 @@ def _load24k(path: str, max_sec: float | None = None) -> np.ndarray:
     return wav
 
 
-def _select_sentences(scores: str, n: int, exclude: set[int],
-                      complete) -> list[int]:
-    """Clean, medium-length sentence idxs: low fp16 CER, 4-9 s, cleanest first.
+DEFAULT_STRATA = [(0.0, 0.05, 15), (0.05, 0.15, 10), (0.15, 0.30, 5)]
 
-    Only accepts a sentence when every required clip exists, so the design stays
-    balanced. Returns idxs ordered by fp16 CER (cleanest first) so the caller can
-    assign balanced blocks.
+
+def _parse_strata(spec: str) -> list[tuple[float, float, int]]:
+    """'lo:hi:quota,lo:hi:quota,...' -> [(lo, hi, quota), ...] on the fp16 metric."""
+    bands = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, hi, quota = part.split(":")
+        bands.append((float(lo), float(hi), int(quota)))
+    return bands
+
+
+def _select_sentences(scores: str, n: int, exclude: set[int], complete,
+                      speaker_of=None, unique_speakers: bool = False,
+                      stratify_by: str = "wer",
+                      strata: list[tuple[float, float, int]] | None = None):
+    """Choose 4-9 s sentence idxs, WER-stratified when `strata` is given.
+
+    fp16 rows are filtered to 4-9 s. With `strata` (bands (lo, hi, quota) on the
+    `stratify_by` metric), each band is filled with its lowest-metric *complete*
+    sentences; a single used-speaker set is shared across bands when
+    `unique_speakers`, so no speaker repeats anywhere. Without `strata` this falls
+    back to the old cleanest-first behaviour on `stratify_by` (cer/wer), up to `n`.
+
+    Returns (idxs, band_of) where band_of maps idx -> "lo-hi" band label ("" in the
+    cleanest-first fallback) so the caller can record it in the manifest.
     """
     d = pd.read_csv(scores)
     fp = d[(d["group"] == GROUP) & (d["config"].astype(str).str.lower() == "fp16")]
     fp = fp[(fp["dur_s"] >= 4.0) & (fp["dur_s"] <= 9.0)]
-    fp = fp.sort_values("cer")  # cleanest first
-    idxs, skipped = [], []
-    for idx in fp["idx"].astype(int):
-        if idx in exclude:
-            continue
-        if not complete(idx):
-            skipped.append(idx)
-            continue
-        idxs.append(idx)
-        if len(idxs) == n:
-            break
+    metric = stratify_by if stratify_by in ("wer", "cer") else "cer"
+
+    used_spk: set = set()
+
+    def _take(cands: list[int], quota: int) -> tuple[list[int], list[int]]:
+        """Up to `quota` complete, (optionally) fresh-speaker idxs, in `cands` order."""
+        picked, skipped_missing = [], []
+        for idx in cands:
+            if idx in exclude:
+                continue
+            if not complete(idx):
+                skipped_missing.append(idx)
+                continue
+            if unique_speakers and speaker_of is not None:
+                spk = speaker_of(idx)
+                if spk in used_spk:
+                    continue
+                used_spk.add(spk)
+            picked.append(idx)
+            if len(picked) == quota:
+                break
+        return picked, skipped_missing
+
+    if strata:
+        idxs: list[int] = []
+        band_of: dict[int, str] = {}
+        all_missing: list[int] = []
+        for lo, hi, quota in strata:
+            band = fp[(fp[metric] >= lo) & (fp[metric] < hi)].sort_values(metric)
+            picked, missing = _take([int(x) for x in band["idx"]], quota)
+            all_missing += missing
+            label = f"{lo:g}-{hi:g}"
+            for idx in picked:
+                band_of[idx] = label
+            idxs += picked
+            tag = "" if len(picked) == quota else "  <-- SHORT"
+            print(f"{metric} band [{lo:g},{hi:g}): {len(picked)}/{quota}{tag}")
+        if all_missing:
+            print(f"skipped {len(all_missing)} candidates with missing clips: "
+                  f"{all_missing[:12]}")
+        if len(idxs) < n:
+            print(f"WARNING: {len(idxs)}/{n} sentences selected (bands underfilled); "
+                  "adjust --strata or check feasibility")
+        return idxs, band_of
+
+    # cleanest-first fallback (original behaviour), sorted on the chosen metric
+    order = fp.sort_values(metric)
+    picked, skipped = _take([int(x) for x in order["idx"]], n)
     if skipped:
         print(f"skipped {len(skipped)} candidates with missing clips: {skipped}")
-    if len(idxs) < n:
-        raise SystemExit(f"only {len(idxs)} usable sentences found; lower --n-sentences")
-    return idxs  # cleanest-first order
+    if len(picked) < n:
+        raise SystemExit(f"only {len(picked)} usable sentences found; lower --n-sentences")
+    return picked, {}
 
 
 def main() -> None:
@@ -114,7 +179,17 @@ def main() -> None:
     ap.add_argument("--audio-dir",
                     default="models/VALL-E-X/benchmarks/outputs/grid_cl_pl0")
     ap.add_argument("--data-dir", default="data")
-    ap.add_argument("--n-sentences", type=int, default=20)
+    ap.add_argument("--n-sentences", type=int, default=20,
+                    help="sentence count for cleanest-first selection; ignored when "
+                         "--strata is given (N = sum of band quotas)")
+    ap.add_argument("--stratify-by", choices=["wer", "cer", "none"], default="wer",
+                    help="fp16 metric to rank/stratify sentences by (default wer)")
+    ap.add_argument("--strata", default="",
+                    help="WER/CER bands 'lo:hi:quota,...' e.g. "
+                         "'0:0.05:15,0.05:0.15:10,0.15:0.30:5'; enables stratified "
+                         "selection and sets N = sum of quotas")
+    ap.add_argument("--unique-speakers", action="store_true",
+                    help="never reuse a reference speaker across selected sentences")
     ap.add_argument("--with-similarity", action="store_true",
                     help="also emit each sentence's reference/cloning-prompt clip "
                          "so the survey can pair reference + stimulus (SMOS)")
@@ -143,8 +218,19 @@ def main() -> None:
         return all(os.path.exists(_gen_path(args.audio_dir, idx, s))
                    for s in SYSTEMS if s != "natural")
 
-    idxs = _select_sentences(args.scores, args.n_sentences,
-                             set(args.exclude_idx), _complete)
+    def _speaker(idx: int) -> str:
+        if idx >= len(items):
+            return str(idx)
+        ref = (getattr(items[idx], "ref_audio", None)
+               or getattr(items[idx], "ground_truth_audio", None))
+        return os.path.basename(ref).split("-")[0] if ref else str(idx)
+
+    strata = _parse_strata(args.strata) if args.strata else None
+    n_sent = sum(q for _, _, q in strata) if strata else args.n_sentences
+    idxs, band_of = _select_sentences(
+        args.scores, n_sent, set(args.exclude_idx), _complete,
+        speaker_of=_speaker, unique_speakers=args.unique_speakers,
+        stratify_by=args.stratify_by, strata=strata)
     scores = pd.read_csv(args.scores)
 
     # balanced blocks: round-robin over the cleanest-first order
@@ -182,6 +268,7 @@ def main() -> None:
                 "clip_id": rid, "block": block_of[idx], "role": "reference",
                 "system": "reference", "sentence_idx": idx, "ref_clip_id": "",
                 "text": items[idx].text, "orig_cer": "", "orig_wer": "",
+                "wer_band": band_of.get(idx, ""),
             })
 
     # stimuli — shuffled within each block, then anonymized c001..cNNN
@@ -207,10 +294,11 @@ def main() -> None:
                 "clip_id": cid, "block": b, "role": "stimulus", "system": system,
                 "sentence_idx": idx, "ref_clip_id": ref_id.get(idx, ""),
                 "text": items[idx].text, "orig_cer": cer, "orig_wer": wer,
+                "wer_band": band_of.get(idx, ""),
             })
 
     cols = ["clip_id", "block", "role", "system", "sentence_idx", "ref_clip_id",
-            "text", "orig_cer", "orig_wer"]
+            "text", "orig_cer", "orig_wer", "wer_band"]
     with open(os.path.join(args.out, "manifest.csv"), "w", newline="",
               encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
