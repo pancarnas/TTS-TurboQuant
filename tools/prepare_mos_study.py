@@ -104,15 +104,17 @@ def _parse_strata(spec: str) -> list[tuple[float, float, int]]:
 def _select_sentences(scores: str, n: int, exclude: set[int], complete,
                       speaker_of=None, unique_speakers: bool = False,
                       max_per_speaker: int | None = None,
+                      max_speakers: int | None = None,
                       stratify_by: str = "wer",
                       strata: list[tuple[float, float, int]] | None = None):
     """Choose 4-9 s sentence idxs, WER-stratified when `strata` is given.
 
     fp16 rows are filtered to 4-9 s. With `strata` (bands (lo, hi, quota) on the
     `stratify_by` metric), each band is filled with its lowest-metric *complete*
-    sentences. A per-speaker cap can be applied (shared across bands): explicit
-    `max_per_speaker`, else 1 when `unique_speakers`, else no cap. Without `strata`
-    this falls back to cleanest-first on `stratify_by` (cer/wer), up to `n`.
+    sentences. Two speaker limits can be applied (shared across bands): a per-speaker
+    cap (`max_per_speaker`, else 1 when `unique_speakers`) and a cap on the *number*
+    of distinct speakers (`max_speakers`). Without `strata` this falls back to
+    cleanest-first on `stratify_by` (cer/wer), up to `n`.
 
     Returns (idxs, band_of) where band_of maps idx -> "lo-hi" band label ("" in the
     cleanest-first fallback) so the caller can record it in the manifest.
@@ -124,10 +126,10 @@ def _select_sentences(scores: str, n: int, exclude: set[int], complete,
 
     # per-speaker cap: explicit --max-per-speaker, else 1 for --unique-speakers, else off
     cap = max_per_speaker if max_per_speaker is not None else (1 if unique_speakers else None)
-    spk_count: Counter = Counter()
+    spk_count: Counter = Counter()  # keys = speakers already accepted
 
     def _take(cands: list[int], quota: int) -> tuple[list[int], list[int]]:
-        """Up to `quota` complete idxs (respecting the per-speaker cap), in order."""
+        """Up to `quota` complete idxs, respecting per-speaker + speaker-count caps."""
         picked, skipped_missing = [], []
         for idx in cands:
             if idx in exclude:
@@ -135,9 +137,14 @@ def _select_sentences(scores: str, n: int, exclude: set[int], complete,
             if not complete(idx):
                 skipped_missing.append(idx)
                 continue
-            if cap is not None and speaker_of is not None:
+            if speaker_of is not None and (cap is not None or max_speakers is not None):
                 spk = speaker_of(idx)
-                if spk_count[spk] >= cap:
+                # cap on NUMBER of distinct speakers: reject a new speaker once full
+                if (max_speakers is not None and spk not in spk_count
+                        and len(spk_count) >= max_speakers):
+                    continue
+                # cap on sentences PER speaker
+                if cap is not None and spk_count[spk] >= cap:
                     continue
                 spk_count[spk] += 1
             picked.append(idx)
@@ -204,6 +211,9 @@ def main() -> None:
     ap.add_argument("--max-per-speaker", type=int, default=None,
                     help="cap sentences per reference speaker (e.g. 3); overrides "
                          "--unique-speakers when both are given")
+    ap.add_argument("--max-speakers", type=int, default=None,
+                    help="cap the NUMBER of distinct reference speakers (e.g. 5); "
+                         "combine with --max-per-speaker for K speakers x M sentences")
     ap.add_argument("--with-similarity", action="store_true",
                     help="also emit each sentence's reference/cloning-prompt clip "
                          "so the survey can pair reference + stimulus (SMOS)")
@@ -244,7 +254,7 @@ def main() -> None:
     idxs, band_of = _select_sentences(
         args.scores, n_sent, set(args.exclude_idx), _complete,
         speaker_of=_speaker, unique_speakers=args.unique_speakers,
-        max_per_speaker=args.max_per_speaker,
+        max_per_speaker=args.max_per_speaker, max_speakers=args.max_speakers,
         stratify_by=args.stratify_by, strata=strata)
     scores = pd.read_csv(args.scores)
 
