@@ -94,3 +94,7 @@ results/
 # local thesis drafts — never commit
 docs/thesis_roadmap.md
 docs/limitations.md
+
+# local-only planning docs (keep off the remote)
+docs/mos_full_factorial_experiment.md
+docs/presentation_plan.md
