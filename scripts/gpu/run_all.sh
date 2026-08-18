@@ -10,6 +10,7 @@ cd "$(dirname "$0")/../.."
 mkdir -p logs
 
 bash scripts/gpu/01_fetch_data.sh
+bash scripts/gpu/02_smoke.sh          # aborts the campaign if validation fails
 bash scripts/gpu/10_vallex_grid.sh
 bash scripts/gpu/11_vallex_seeds.sh
 bash scripts/gpu/12_vallex_ppl.sh

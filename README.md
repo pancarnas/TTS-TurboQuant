@@ -6,11 +6,44 @@ Based on the [TurboQuant reference implementation](https://github.com/0xSero/tur
 
 ## Results
 
-### Real-weights benchmark (Qwen3-TTS 1.7B, bfloat16, CUDA)
+### Main campaign — VALL-E-X, zero-shot voice cloning (LibriSpeech-PC)
 
-22 sentences: 10 short (~7 words), 7 medium (~24 words), 5 long (~76 words). Quality measured with Whisper CER and WavLM speaker cosine similarity.
+39 held-out speakers × 5 sentences = 195 sentences, per-item reference voice
+(`--voice-mode clone`), seeds 0/1/2, no protected layers (pl0). Objective
+metrics: Whisper large-v3 CER/WER vs ground-truth text, WavLM speaker cosine
+vs the same sentence's fp16 output. Mean ± std across seeds; full 28-config
+grid (K,V ∈ {4,3,2} × residual window {0,64,128}) in the thesis tables.
 
-**Averaged results:**
+| Config | KV bits | CER | WER | SpkSim |
+|--------|---------|-----|-----|--------|
+| fp16 baseline | 16 | 0.056 ± 0.005 | 0.104 ± 0.010 | — |
+| K3V4@0 | 3.5 | 0.061 ± 0.008 | 0.107 ± 0.011 | 0.954 |
+| K4V4@0 | 4 | 0.063 ± 0.008 | 0.114 ± 0.010 | 0.955 |
+| **K3V3@0** | **3** | **0.067 ± 0.003** | **0.118 ± 0.004** | **0.951** |
+| K4V2@0 | 3 | 0.084 ± 0.006 | 0.147 ± 0.014 | 0.948 |
+| K2V2@0 | 2 | 0.127 ± 0.004 | 0.209 ± 0.007 | 0.946 |
+
+Key findings:
+
+- **3-bit KV is free** — K4V4/K3V3/K3V4 overlap the fp16 baseline within ~1
+  seed-std; the floor is **2-bit keys** (K2V2 ≈ 2× baseline WER, but degrades
+  gracefully — no collapse).
+- **Cross-model contrast** — at matched bits and near-identical KV
+  reconstruction (cos_k: K4 .996 / K3 .984 / K2 .942 on both models), Qwen3-TTS
+  (GQA) collapses on 54–100% of sentences while VALL-E-X (MHA) collapses on ~0%.
+  The mechanism is the attention response (Qwen layer-5 attn_js hotspot vs
+  VALL-E flat), not reconstruction error.
+- **Damage accumulates** — teacher-forced perplexity barely moves at K2V2 while
+  free-running WER doubles: per-step error is tiny, the autoregressive loop
+  compounds it.
+- **Timbre survives** — speaker similarity stays ~0.95 across all configs, even
+  where CER breaks (right voice, wrong words).
+
+Reproduce end to end with [`scripts/gpu/README.md`](scripts/gpu/README.md).
+
+### Earlier integration benchmark — Qwen3-TTS 1.7B custom-voice (22 sentences)
+
+10 short / 7 medium / 5 long sentences, preset voice, single seed.
 
 | Config | Bits | CER (short) | CER (med) | CER (long) | Speaker Sim | Attn Sim | Speed (long) |
 |--------|------|-------------|-----------|------------|-------------|----------|--------------|
@@ -19,17 +52,6 @@ Based on the [TurboQuant reference implementation](https://github.com/0xSero/tur
 | **K3/V3** | **3** | **0.65%** | **0.37%** | **5.28%** | **0.99** | **0.99** | **1.4x** |
 | K3/V2 | 2.5 | 0.00% | 0.77% | 4.20% | 0.99 | 0.97 | 1.4x |
 | K2/V2 | 2 | 0.00% | 0.81% | 72.1% | 0.97 | 0.95 | 1.5x |
-
-**Attention similarity (KV reconstruction cosine similarity):**
-
-| Config | Attn Sim |
-|--------|----------|
-| **K3/V3** | **0.9855** |
-| K4/V2 | 0.9726 |
-| K3/V2 | 0.9674 |
-| K2/V2 | 0.9492 |
-
-Note: attention similarity is input-agnostic by design — random rotation makes the per-coordinate distribution uniform regardless of sentence content.
 
 ## Project structure
 

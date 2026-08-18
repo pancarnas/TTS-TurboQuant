@@ -30,9 +30,14 @@ Qwen3-TTS-1.7B, Whisper large-v3, WavLM x-vector (~15 GB total, cached in
 ```bash
 git clone <this-repo> && cd TTS-TurboQuant
 bash scripts/gpu/00_setup.sh                       # once
+bash scripts/gpu/01_fetch_data.sh
+bash scripts/gpu/02_smoke.sh                       # pre-flight: MUST print PASS
 nohup bash scripts/gpu/run_all.sh > logs/run_all.log 2>&1 &   # everything else
 tail -f logs/run_all.log
 ```
+
+`run_all.sh` re-runs the (idempotent) data fetch and smoke itself, so launching
+it directly is fine too — it aborts before the heavy stages if the smoke fails.
 
 Results land in `results/` (CSV/markdown tables) and `results/figures/` (PNGs).
 
@@ -45,6 +50,7 @@ a single A100-40GB with `NSHARDS=3` — halve/double to taste.
 |---|---|---|---|---|
 | 0 | `00_setup.sh` | venv, sox, project packages, metrics deps, cu124 torch | `.venv/` | 10 min |
 | 1 | `01_fetch_data.sh` | seed-tts-eval + ellav_hard + **LibriSpeech-PC** (the clone-mode set) + validation | `data/` | 10 min |
+| 1.5 | `02_smoke.sh` | **pre-flight smoke**: unit tests → tiny clone-mode generate+score+auto-validate (PASS/FAIL) → Qwen generation check. Run before anything heavy. | `results/smoke_full_*.csv` | 20–40 min |
 | 2 | `10_vallex_grid.sh` | VALL-E-X **28-config grid** (K,V∈{4,3,2} × rw∈{0,64,128} + fp16), clone mode, seed 0, at pl0 **and** pl2; records attention divergence in the same pass | `outputs/grid_cl_pl{0,2}/`, `results/grid_cl_pl{0,2}_div_shard*.csv` | 12–24 h/pl |
 | 3 | `11_vallex_seeds.sh` | 5 headline configs (fp16, K4V4@0, K4V2@0, K3V3@0, K2V2@0) × **seeds 0,1,2**, pl0 + pl2 → error bars | `outputs/seed_cl_pl{0,2}/`, `results/seed_cl_pl{0,2}_div_shard*.csv` | 6–12 h/pl |
 | 4 | `12_vallex_ppl.sh` | teacher-forced NLL/PPL/KL/top1-agree over ground-truth EnCodec tokens, 9 rw0 configs (mechanism: per-step damage vs free-running collapse) | `results/vallex_ppl_cl.csv`, `results/vallex_ppl_div_cl.csv` | 2–4 h |
