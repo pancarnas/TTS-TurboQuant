@@ -15,7 +15,7 @@ for the config grid, seeds 0/1/2 for the headline runs.
 
 | | requirement |
 |---|---|
-| GPU | 1× NVIDIA, **24 GB VRAM recommended** (16 GB works with `NSHARDS=1`) |
+| GPU | 1× NVIDIA, **24 GB VRAM recommended** (16 GB works with the default `NSHARDS=1`) |
 | CUDA | driver for CUDA 12.x (`nvidia-smi` to check; scripts install cu124 torch) |
 | Disk | ~150 GB free (wavs dominate: grid ≈ 2×5600 clips, seeds ≈ 2×1500) |
 | OS | Linux with `apt` (Ubuntu/Debian images on Lambda/RunPod/vast.ai are fine) |
@@ -77,9 +77,10 @@ a single A100-40GB with `NSHARDS=3` — halve/double to taste.
 
 Environment variables read by the generation scripts:
 
-- `NSHARDS` (default 2) — parallel workers sharing the one GPU. 3–4 on a
-  40 GB card, 1 if you hit CUDA OOM. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-  is already set by the runner to curb fragmentation.
+- `NSHARDS` (default 1) — parallel workers sharing the one GPU. Raise to 2 on
+  a 24 GB card or 3–4 on 40 GB+ to cut wall-clock roughly proportionally.
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is already set by the
+  runner to curb fragmentation.
 - `MAXPG` (default 100) — sentences drawn from LibriSpeech-PC per group.
   Sentence draws are **paired across configs and seeds**, so rerunning with a
   larger `MAXPG` regenerates the earlier wavs byte-identically and adds new ones.

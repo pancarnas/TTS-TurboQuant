@@ -12,7 +12,7 @@ cd "$(dirname "$0")/../.."
 source .venv/bin/activate 2>/dev/null || true
 mkdir -p logs results
 
-NSHARDS="${NSHARDS:-2}"
+NSHARDS="${NSHARDS:-1}"
 MAXPG="${MAXPG:-100}"
 CFGS="fp16,K4V4@0,K4V2@0,K3V3@0,K2V2@0"
 

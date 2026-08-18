@@ -7,8 +7,8 @@
 #
 #   bash scripts/gpu/10_vallex_grid.sh
 #
-# Knobs (env): NSHARDS=2 parallel workers on the one GPU (raise to 3-4 on
-# 40GB+ cards, drop to 1 if you OOM), MAXPG=100 sentences from librispeech_pc.
+# Knobs (env): NSHARDS=1 worker by default (raise to 2-4 on 24-40GB+ cards to
+# parallelize on the one GPU), MAXPG=100 sentences from librispeech_pc.
 # Outputs: models/VALL-E-X/benchmarks/outputs/grid_cl_pl{0,2}/*.wav
 #          results/grid_cl_pl{0,2}_div_shard*.csv, logs/grid_cl_pl{0,2}_shard*.log
 set -euo pipefail
@@ -16,7 +16,7 @@ cd "$(dirname "$0")/../.."
 source .venv/bin/activate 2>/dev/null || true
 mkdir -p logs results
 
-NSHARDS="${NSHARDS:-2}"
+NSHARDS="${NSHARDS:-1}"
 MAXPG="${MAXPG:-100}"
 
 GRID="fp16"
