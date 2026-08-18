@@ -89,7 +89,7 @@ source .venv/bin/activate
 uv pip install -e .
 uv pip install -e models/Qwen3-TTS/
 uv pip install -e models/VALL-E-X/
-uv pip install openai-whisper jiwer soundfile librosa pandas scipy
+uv pip install openai-whisper jiwer soundfile librosa pandas scipy matplotlib pytest
 
 # CUDA torch installed last (matched cu124 build)
 uv pip install --reinstall torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
@@ -191,7 +191,7 @@ sudo apt-get install -y sox libsox-dev
 pip install -e .                          # turboquant
 pip install -e models/Qwen3-TTS/          # Qwen3-TTS
 pip install -e models/VALL-E-X/           # VALL-E-X
-pip install openai-whisper jiwer          # quality metrics
+pip install openai-whisper jiwer pytest   # quality metrics + tests
 # Optional: remove tensorflow to fix WavLM on SageMaker
 pip uninstall -y tensorflow tensorflow-cpu tf-keras 2>/dev/null; true
 ```
@@ -204,7 +204,7 @@ brew install sox
 pip install -e .
 pip install -e models/Qwen3-TTS/
 pip install -e models/VALL-E-X/
-pip install openai-whisper jiwer
+pip install openai-whisper jiwer pytest
 ```
 
 #### CPU only
