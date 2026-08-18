@@ -29,17 +29,21 @@ for K in 4 3 2; do for V in 4 3 2; do for RW in 0 64 128; do
   GRID="$GRID,K${K}V${V}@${RW}"
 done; done; done
 
-IDXFILE="$(mktemp)"
-echo "$IDX" > "$IDXFILE"
+if [ -z "${SKIP_GEN:-}" ]; then
+  IDXFILE="$(mktemp)"
+  echo "$IDX" > "$IDXFILE"
 
-echo "### generating sentence idx=$IDX under 28 configs (pl=$PL, clone mode) ###"
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
-  --groups librispeech_pc --data-dir data --no-quality \
-  --configs "$GRID" --protected-layers "$PL" --output-subdir "$SUB" \
-  --seeds 0 --decode sampling --preset librispeech_1.npz --voice-mode clone \
-  --idx-file "$IDXFILE" --num-shards 1 --shard-id 0 --run-tag "$SUB"
-rm -f "$IDXFILE"
+  echo "### generating sentence idx=$IDX under 28 configs (pl=$PL, clone mode) ###"
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  python models/VALL-E-X/benchmarks/benchmark_vallex_real.py --device cuda \
+    --groups librispeech_pc --data-dir data --no-quality \
+    --configs "$GRID" --protected-layers "$PL" --output-subdir "$SUB" \
+    --seeds 0 --decode sampling --preset librispeech_1.npz --voice-mode clone \
+    --idx-file "$IDXFILE" --num-shards 1 --shard-id 0 --run-tag "$SUB"
+  rm -f "$IDXFILE"
+else
+  echo "### SKIP_GEN set — packaging existing wavs from outputs/$SUB ###"
+fi
 
 echo "### packaging $LISTEN_DIR ###"
 python - "$IDX" "models/VALL-E-X/benchmarks/outputs/$SUB" "$LISTEN_DIR" <<'EOF'
@@ -49,11 +53,23 @@ idx, wavdir, out = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 sys.path.insert(0, os.getcwd())
 from turboquant.eval_sentences import load_librispeech_pc
 
+def cp(src, dst):
+    # LibriSpeech files are mode 444; shutil.copy would propagate that and
+    # break re-runs. Overwrite-safe copy that leaves dst writable.
+    if os.path.exists(dst):
+        os.chmod(dst, 0o644)
+        os.remove(dst)
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o644)
+
 item = load_librispeech_pc("data")[idx]
 os.makedirs(out, exist_ok=True)
-shutil.copy(item.ref_audio, os.path.join(out, "00_reference_prompt.wav"))
+ref_name = "00_reference_prompt" + os.path.splitext(item.ref_audio)[1]
+cp(item.ref_audio, os.path.join(out, ref_name))
+gt_name = None
 if item.ground_truth_audio and os.path.exists(item.ground_truth_audio):
-    shutil.copy(item.ground_truth_audio, os.path.join(out, "00_ground_truth.wav"))
+    gt_name = "00_ground_truth" + os.path.splitext(item.ground_truth_audio)[1]
+    cp(item.ground_truth_audio, os.path.join(out, gt_name))
 
 pat = re.compile(rf"vallex_librispeech_pc_{idx}_sampling_s0(?:_t[\d.]+)?_(.+)\.wav$")
 copied = []
@@ -61,17 +77,18 @@ for f in sorted(glob.glob(os.path.join(wavdir, "*.wav"))):
     m = pat.search(os.path.basename(f))
     if m:
         cfg = m.group(1)
-        shutil.copy(f, os.path.join(out, f"{cfg}.wav"))
+        cp(f, os.path.join(out, f"{cfg}.wav"))
         copied.append(cfg)
 
 with open(os.path.join(out, "listen.txt"), "w", encoding="utf-8") as fh:
     fh.write(f"Sentence idx {idx} (LibriSpeech-PC, zero-shot clone)\n\n")
     fh.write(f"TARGET TEXT   : {item.text}\n")
     fh.write(f"REFERENCE TEXT: {item.ref_text}\n\n")
-    fh.write("00_reference_prompt.wav = the real voice being cloned\n")
-    fh.write("00_ground_truth.wav     = the real recording of the target text\n")
-    fh.write("fp16.wav                = uncompressed VALL-E-X baseline\n")
-    fh.write("K<k>V<v>@<rw>.wav       = key/value bits + residual window\n\n")
+    fh.write(f"{ref_name} = the real voice being cloned\n")
+    if gt_name:
+        fh.write(f"{gt_name} = the real recording of the target text\n")
+    fh.write("fp16.wav = uncompressed VALL-E-X baseline\n")
+    fh.write("K<k>V<v>@<rw>.wav = key/value bits + residual window\n\n")
     fh.write(f"configs generated ({len(copied)}): {', '.join(copied)}\n")
 
 print(f"{out}/: {len(copied)} config wavs + reference + ground truth + listen.txt")
