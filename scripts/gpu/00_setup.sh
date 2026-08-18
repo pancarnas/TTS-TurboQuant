@@ -29,8 +29,8 @@ pip install -e .
 pip install -e models/Qwen3-TTS/
 pip install -e models/VALL-E-X/
 
-# objective metrics + analysis
-pip install openai-whisper jiwer soundfile librosa pandas scipy matplotlib
+# objective metrics + analysis + tests
+pip install openai-whisper jiwer soundfile librosa pandas scipy matplotlib pytest
 
 # CUDA torch LAST so nothing downgrades it (matched cu124 build; if your driver
 # is older check `nvidia-smi` and switch the index-url to cu121/cu118)

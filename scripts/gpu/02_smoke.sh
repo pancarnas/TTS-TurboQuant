@@ -20,6 +20,7 @@ source .venv/bin/activate 2>/dev/null || true
 mkdir -p logs results
 
 echo "### 1/3 unit tests ###"
+python -c "import pytest" 2>/dev/null || pip install -q pytest
 python -m pytest models/Qwen3-TTS/tests/ -q
 
 echo "### 2/3 VALL-E-X end-to-end smoke (generate -> score -> validate) ###"
