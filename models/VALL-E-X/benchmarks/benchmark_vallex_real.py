@@ -1180,21 +1180,32 @@ def _vallex_sweep_arm(
     for group_name in active_groups:
         items = iter_eval_items([group_name], max_per_group, data_dir)
         n = len(items)
+        if _ALLOWED_IDXS is not None:
+            n_sel = sum(1 for i in range(n) if i in _ALLOWED_IDXS)
+            count_note = f"{n_sel} of {n} sentences via --idx-file"
+        else:
+            n_sel = n
+            count_note = f"{n} sentences"
         _tee(results_fh, f"\n{'=' * 110}")
         _tee(
             results_fh,
             f"[{arm}] Group: {group_name} "
-            f"({n} sentences × {len(seeds)} seeds × {len(temps)} temps)",
+            f"({count_note} × {len(seeds)} seeds × {len(temps)} temps)",
         )
         _tee(results_fh, f"{'=' * 110}")
         group_results = _vallex_empty_group_results()
+        n_done = 0
         for i, item in enumerate(items):
             if _ALLOWED_IDXS is not None and i not in _ALLOWED_IDXS:
                 continue
+            n_done += 1
             text = item.text
             shash = sentence_hash(text)
             preview = text[:50] + "..." if len(text) > 50 else text
-            _tee(results_fh, f'\n  [{i + 1}/{n}] "{preview}"')
+            if _ALLOWED_IDXS is not None:
+                _tee(results_fh, f'\n  [{n_done}/{n_sel} | idx {i}] "{preview}"')
+            else:
+                _tee(results_fh, f'\n  [{i + 1}/{n}] "{preview}"')
             for seed in seeds:
                 for temp in temps:
                     this_cell = cell_idx
