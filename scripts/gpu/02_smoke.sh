@@ -20,19 +20,36 @@ source .venv/bin/activate 2>/dev/null || true
 mkdir -p logs results
 
 echo "### 0/3 environment preflight ###"
-# torchaudio >= 2.8 delegates audio I/O to the separate torchcodec package;
-# the pinned stack (torchaudio 2.6.0 from 00_setup.sh) does not need it.
-if ! python - <<'EOF'
+# Functional audio-I/O probe: torchaudio >= 2.8 delegates decoding to the
+# separate torchcodec package (which itself needs FFmpeg shared libraries);
+# the pinned stack (torchaudio 2.6.0 from 00_setup.sh) needs neither. An
+# import check is not enough — probe an actual load.
+audio_ok() {
+  python - <<'EOF'
+import os, tempfile
+import numpy as np, soundfile as sf
+p = os.path.join(tempfile.mkdtemp(), "probe.wav")
+sf.write(p, np.zeros(1600, dtype="float32"), 16000)
 import torchaudio
-v = tuple(int(x) for x in torchaudio.__version__.split("+")[0].split(".")[:2])
-if v >= (2, 8):
-    import torchcodec  # noqa: F401
+wav, sr = torchaudio.load(p)
+assert sr == 16000 and wav.numel() == 1600
 print(f"audio I/O ok (torchaudio {torchaudio.__version__})")
 EOF
-then
-  echo "installing torchcodec (required by torchaudio >= 2.8), keeping torch pinned"
+}
+if ! audio_ok; then
+  echo "torchaudio.load is broken — trying torchcodec (keeping torch pinned)"
   TORCH_V=$(python -c 'import torch; print(torch.__version__.split("+")[0])')
-  pip install torchcodec "torch==${TORCH_V}"
+  pip install torchcodec "torch==${TORCH_V}" || true
+  if ! audio_ok; then
+    cat >&2 <<'MSG'
+FATAL: audio decoding is still broken. Converge on the tested stack:
+  pip install --force-reinstall torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+      --index-url https://download.pytorch.org/whl/cu124
+If you must keep a newer torch, torchcodec also needs FFmpeg libraries:
+  conda install -y -c conda-forge 'ffmpeg<8'   # or: sudo apt-get install -y ffmpeg
+MSG
+    exit 1
+  fi
 fi
 python -c "import pytest" 2>/dev/null || pip install -q pytest
 

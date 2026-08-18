@@ -282,14 +282,23 @@ nvidia-smi | head -3  # check CUDA version
 pip install torch torchaudio --force-reinstall --index-url https://download.pytorch.org/whl/cu124
 ```
 
-### `ModuleNotFoundError: No module named 'torchcodec'`
-torchaudio ≥ 2.8 moved audio decoding into the separate `torchcodec` package.
-Either install it without letting pip upgrade torch:
+### `torchcodec` errors from `torchaudio.load`
+(`ModuleNotFoundError: No module named 'torchcodec'` or `TorchCodec is
+required for load_with_torchcodec`.) torchaudio ≥ 2.8 moved audio decoding
+into the separate `torchcodec` package, which additionally needs FFmpeg
+shared libraries. The reliable fix is the tested stack:
+```bash
+pip install --force-reinstall torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu124
+```
+To keep a newer torch instead, install torchcodec without letting pip upgrade
+torch, plus FFmpeg:
 ```bash
 pip install torchcodec "torch==$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+conda install -y -c conda-forge 'ffmpeg<8'   # or: sudo apt-get install -y ffmpeg
 ```
-or reinstall the tested stack (torch/torchaudio **2.6.0**, see the setup
-commands above). `scripts/gpu/02_smoke.sh` applies this fix automatically.
+`scripts/gpu/02_smoke.sh` probes a real decode in its preflight and applies
+the torchcodec route automatically before failing with these instructions.
 
 ### `sox: not found`
 ```bash
