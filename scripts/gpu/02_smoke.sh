@@ -19,8 +19,24 @@ cd "$(dirname "$0")/../.."
 source .venv/bin/activate 2>/dev/null || true
 mkdir -p logs results
 
-echo "### 1/3 unit tests ###"
+echo "### 0/3 environment preflight ###"
+# torchaudio >= 2.8 delegates audio I/O to the separate torchcodec package;
+# the pinned stack (torchaudio 2.6.0 from 00_setup.sh) does not need it.
+if ! python - <<'EOF'
+import torchaudio
+v = tuple(int(x) for x in torchaudio.__version__.split("+")[0].split(".")[:2])
+if v >= (2, 8):
+    import torchcodec  # noqa: F401
+print(f"audio I/O ok (torchaudio {torchaudio.__version__})")
+EOF
+then
+  echo "installing torchcodec (required by torchaudio >= 2.8), keeping torch pinned"
+  TORCH_V=$(python -c 'import torch; print(torch.__version__.split("+")[0])')
+  pip install torchcodec "torch==${TORCH_V}"
+fi
 python -c "import pytest" 2>/dev/null || pip install -q pytest
+
+echo "### 1/3 unit tests ###"
 python -m pytest models/Qwen3-TTS/tests/ -q
 
 echo "### 2/3 VALL-E-X end-to-end smoke (generate -> score -> validate) ###"

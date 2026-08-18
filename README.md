@@ -282,6 +282,15 @@ nvidia-smi | head -3  # check CUDA version
 pip install torch torchaudio --force-reinstall --index-url https://download.pytorch.org/whl/cu124
 ```
 
+### `ModuleNotFoundError: No module named 'torchcodec'`
+torchaudio ≥ 2.8 moved audio decoding into the separate `torchcodec` package.
+Either install it without letting pip upgrade torch:
+```bash
+pip install torchcodec "torch==$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+```
+or reinstall the tested stack (torch/torchaudio **2.6.0**, see the setup
+commands above). `scripts/gpu/02_smoke.sh` applies this fix automatically.
+
 ### `sox: not found`
 ```bash
 sudo apt-get install -y sox libsox-dev   # Ubuntu/Debian

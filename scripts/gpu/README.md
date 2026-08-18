@@ -113,6 +113,12 @@ Environment variables read by the generation scripts:
 - **`sox: not found`** — `sudo apt-get install -y sox libsox-dev`.
 - **torchaudio/libcudart mismatch** — reinstall torch matching your driver:
   `pip install --force-reinstall torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124`.
+- **`ModuleNotFoundError: No module named 'torchcodec'`** — your torchaudio is
+  ≥ 2.8, which moved audio decoding into the separate `torchcodec` package.
+  Either `pip install torchcodec` (keep your torch version: add
+  `"torch==<your version>"` to the same command so pip doesn't upgrade it), or
+  reinstall the tested stack (torch/torchaudio 2.6.0, as in `00_setup.sh`).
+  `02_smoke.sh` attempts this fix automatically in its preflight.
 - **HF download failures** — make sure `HF_HUB_OFFLINE` is unset; rerun the
   stage (everything resumes).
 - Machine much smaller than an A100? Cut scope first via `MAXPG=50`, and drop
