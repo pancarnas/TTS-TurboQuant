@@ -57,6 +57,7 @@ a single A100-40GB with `NSHARDS=3` — halve/double to taste.
 | 5 | `13_qwen_divergence.sh` | Qwen3-TTS counterfactual divergence + wavs, 6 configs × seeds 0,1,2 (the cross-model contrast) | `results/qwen_div_seed{0,1,2}.csv`, Qwen wavs | 4–8 h/seed |
 | 6 | `20_score.sh` | **objective metrics** on every wav: Whisper large-v3 CER + WER vs ground-truth text, WavLM speaker cosine vs the same sentence's fp16 wav | `results/*_scores.csv` | 4–8 h |
 | 7 | `30_analyze.sh` | tables + stats + figures (CPU-only; also runs on a laptop given the CSVs) | see below | 10–30 min |
+| — | `40_demo_samples.sh` | **optional listening demo**: one sentence cloned under all 28 configs, packaged with the reference prompt, ground truth and a `listen.txt` — for human evaluation (e.g. the supervisor). `IDX=<n>` picks the sentence. | `demo_listen_idx<n>/` | 10–25 min |
 
 ### What `30_analyze.sh` produces
 

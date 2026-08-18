@@ -144,6 +144,10 @@ bash scripts/gpu/20_score.sh
 
 # 5. tables, statistics and figures (CPU-only, also runs on a laptop)
 bash scripts/gpu/30_analyze.sh
+
+# optional: listening demo — ONE sentence cloned under all 28 configs,
+# packaged with reference + ground truth (for human/supervisor evaluation)
+IDX=0 bash scripts/gpu/40_demo_samples.sh
 ```
 
 Or run everything unattended (aborts automatically if the smoke fails):
