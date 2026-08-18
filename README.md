@@ -110,6 +110,15 @@ make profile-qwen     # torch.profiler on Qwen3-TTS
 Running on the Eddie cluster (Grid Engine + shared conda env): see
 [`docs/EDDIE.md`](docs/EDDIE.md).
 
+Reproducing the **full experiment campaign on a plain single-GPU machine**
+(generation → objective metrics → tables/figures, no cluster needed): see
+[`scripts/gpu/README.md`](scripts/gpu/README.md).
+
+```bash
+bash scripts/gpu/00_setup.sh                                # once
+nohup bash scripts/gpu/run_all.sh > logs/run_all.log 2>&1 &  # everything else
+```
+
 ### Individual install targets (if you only want part of the stack)
 
 ```bash
