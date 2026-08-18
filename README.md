@@ -118,7 +118,44 @@ On SageMaker, you may additionally need to remove tensorflow to avoid a cuDNN AB
 pip uninstall -y tensorflow tensorflow-cpu tf-keras 2>/dev/null; true
 ```
 
-### Then run a benchmark
+### Run the experiment pipeline
+
+Full campaign on a single GPU machine, from raw data to the thesis tables and
+figures. Run the stages in order (each is restartable on its own):
+
+```bash
+source .venv/bin/activate
+
+# 1. evaluation data: seed-tts-eval + ellav_hard + LibriSpeech-PC (~400 MB)
+bash scripts/gpu/01_fetch_data.sh
+
+# 2. pre-flight smoke — unit tests + tiny generate→score→validate round trip.
+#    MUST print PASS before launching anything heavy (~20-40 min).
+bash scripts/gpu/02_smoke.sh
+
+# 3. generation
+bash scripts/gpu/10_vallex_grid.sh       # VALL-E-X 28-config K×V×rw grid, pl0+pl2
+bash scripts/gpu/11_vallex_seeds.sh      # 5 headline configs × seeds 0/1/2
+bash scripts/gpu/12_vallex_ppl.sh        # teacher-forced PPL/KL (mechanism)
+bash scripts/gpu/13_qwen_divergence.sh   # Qwen cross-model arm, 3 seeds
+
+# 4. objective metrics: Whisper large-v3 CER/WER + WavLM speaker similarity
+bash scripts/gpu/20_score.sh
+
+# 5. tables, statistics and figures (CPU-only, also runs on a laptop)
+bash scripts/gpu/30_analyze.sh
+```
+
+Or run everything unattended (aborts automatically if the smoke fails):
+
+```bash
+nohup bash scripts/gpu/run_all.sh > logs/run_all.log 2>&1 &
+```
+
+Knobs (`NSHARDS`, `MAXPG`), per-stage runtimes, resume behaviour and
+troubleshooting: [`scripts/gpu/README.md`](scripts/gpu/README.md).
+
+### Quick single-model checks (Makefile)
 
 ```bash
 make run              # Qwen3-TTS 22-sentence sweep
@@ -131,15 +168,6 @@ make profile-qwen     # torch.profiler on Qwen3-TTS
 
 Running on the Eddie cluster (Grid Engine + shared conda env): see
 [`docs/EDDIE.md`](docs/EDDIE.md).
-
-Reproducing the **full experiment campaign on a plain single-GPU machine**
-(generation → objective metrics → tables/figures, no cluster needed): see
-[`scripts/gpu/README.md`](scripts/gpu/README.md).
-
-```bash
-bash scripts/gpu/00_setup.sh                                # once
-nohup bash scripts/gpu/run_all.sh > logs/run_all.log 2>&1 &  # everything else
-```
 
 ### Individual install targets (if you only want part of the stack)
 
@@ -215,6 +243,10 @@ print(cache.memory_report())
 ```
 
 ## Benchmarks
+
+For the full experiment campaign (smoke → generation → objective metrics →
+analysis) see [Run the experiment pipeline](#run-the-experiment-pipeline)
+above and [`scripts/gpu/README.md`](scripts/gpu/README.md).
 
 ```bash
 make run                  # run benchmark with quality metrics
