@@ -76,5 +76,14 @@ for CELL in $CELLS; do
 done
 
 echo "### summary ###"
-python tools/summarize_keyfix.py --results results --out results/keyfix_summary.md || true
+# 'plain' baseline: this run's own cell if CELLS had one, else the seed-0
+# outputs of 13_qwen_divergence.sh when they are on this box (restricted to the
+# same groups/seeds by the summariser).
+PLAIN=""
+if [[ " $CELLS " != *" plain "* ]]; then
+  [ -f results/qwen_div_seed0.csv ] && PLAIN="$PLAIN --plain-div results/qwen_div_seed0.csv"
+  [ -f results/qwen_seed_scores.csv ] && PLAIN="$PLAIN --plain-scores results/qwen_seed_scores.csv"
+fi
+# shellcheck disable=SC2086
+python tools/summarize_keyfix.py --results results --out results/keyfix_summary.md $PLAIN || true
 echo "keyfix done — see results/keyfix_summary.md"

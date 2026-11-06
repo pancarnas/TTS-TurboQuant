@@ -55,17 +55,29 @@ def main() -> None:
 
     lines = ["# Key-fix experiment summary (Qwen3-TTS)", ""]
 
+    def _match_plain(df, others):
+        """Restrict an external 'plain' baseline (13_qwen_divergence.sh output,
+        all groups and seeds) to the groups/seeds the key-fix cells ran on."""
+        for col in ("group", "seed"):
+            vals = {v for o in others if col in o.columns for v in o[col].unique()}
+            if vals and col in df.columns:
+                df = df[df[col].isin(vals)]
+        return df
+
     # --- objective scores -------------------------------------------------
     score_rows = []
+    cell_scores = {}
     for cell in CELLS:
         p = os.path.join(args.results, f"qwen_keyfix_{cell}_scores.csv")
         if cell == "plain" and args.plain_scores:
             p = args.plain_scores
-        if not os.path.exists(p):
-            continue
-        s = pd.read_csv(p)
+        if os.path.exists(p):
+            cell_scores[cell] = pd.read_csv(p)
+    for cell, s in cell_scores.items():
         if "config" not in s.columns or "cer" not in s.columns:
             continue
+        if cell == "plain" and args.plain_scores:
+            s = _match_plain(s, [v for k, v in cell_scores.items() if k != "plain"])
         s = s[s.config != "fp16"] if cell != "plain" else s
         for cfg, g in s.groupby("config"):
             score_rows.append({
@@ -94,6 +106,9 @@ def main() -> None:
                     d[c] = 0
             d["cell"] = cell
             div_frames.append(d)
+    if args.plain_div and div_frames:
+        others = [f for f in div_frames if f.cell.iloc[0] != "plain"]
+        div_frames = [_match_plain(f, others) if f.cell.iloc[0] == "plain" else f for f in div_frames]
     if div_frames:
         d = pd.concat(div_frames, ignore_index=True)
         d["config"] = [_label(*r) for r in zip(d.key_bits, d.value_bits, d.rw, d.key_group, d.pre_rope)]
