@@ -70,16 +70,23 @@ FP16_PL = -1
 
 _WAV_RE = re.compile(
     r"^qwen_(?P<group>.+)_(?P<idx>\d+)_sampling_s(?P<seed>\d+)_t(?P<temp>[0-9.]+)"
-    r"_(?:K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)_pl=(?P<pl>\d+)|fp16)\.wav$"
+    r"_(?:K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)_pl=(?P<pl>\d+)"
+    r"(?:_g=(?P<kg>\d+))?(?P<pre>_pre)?|fp16)\.wav$"
 )
 
 # VALL-E-X benchmark naming (benchmark_vallex_real.py --configs runs). The
-# optional -nar/-both suffix marks which decoder stage was quantized.
+# optional -nar/-both suffix marks which decoder stage was quantized; the
+# optional +g<N> marks group key scaling (--key-group).
 _VALLEX_WAV_RE = re.compile(
     r"^vallex_(?P<group>.+)_(?P<idx>\d+)_(?P<arm>[a-z]+)_s(?P<seed>\d+)"
     r"(?:_t(?P<temp>[0-9.]+))?"
-    r"_(?:K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+)(?P<stage>-nar|-both)?|fp16)\.wav$"
+    r"_(?:K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+)(?P<kg>\+g\d+)?(?P<stage>-nar|-both)?|fp16)\.wav$"
 )
+
+
+def _keyfix_suffix(kg, pre) -> str:
+    """Config-label suffix for the key-fix flags: '+g32', '+pre', '+g32+pre'."""
+    return (f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "")
 
 
 def parse_wav_name(name: str) -> dict | None:
@@ -102,7 +109,9 @@ def parse_wav_name(name: str) -> dict | None:
             "value_bits": "" if fp16 else int(d["vb"]),
             "rw": "" if fp16 else int(d["rw"]),
             "pl": FP16_PL if fp16 else int(d["pl"]),
-            "config": BASELINE if fp16 else f"K{d['kb']}V{d['vb']}@{d['rw']}",
+            "config": BASELINE
+            if fp16
+            else f"K{d['kb']}V{d['vb']}@{d['rw']}" + _keyfix_suffix(d["kg"], d["pre"]),
             "wav": name,
         }
     m = _VALLEX_WAV_RE.match(name)
@@ -112,7 +121,7 @@ def parse_wav_name(name: str) -> dict | None:
         config = (
             BASELINE
             if fp16
-            else f"K{d['kb']}V{d['vb']}@{d['rw']}" + (d["stage"] or "")
+            else f"K{d['kb']}V{d['vb']}@{d['rw']}" + (d["kg"] or "") + (d["stage"] or "")
         )
         return {
             "group": d["group"],

@@ -35,7 +35,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from turboquant.config import TurboQuantConfig
-from turboquant.compressors_v3 import TurboQuantV3
+from turboquant.compressors_v3 import TurboQuantV3, compressed_bytes_per_token
 
 
 # Initial buffer capacity (tokens). Grows by doubling on overflow.
@@ -169,6 +169,7 @@ class NARQuantizer:
                 protected_bits=self.config.protected_bits,
                 seed=self.config.seed,
                 device=str(device),
+                key_group=self.config.key_group,
             )
         return self._compressors[layer_idx]
 
@@ -290,6 +291,7 @@ class TurboQuantValleCache:
                 protected_bits=self.config.protected_bits,
                 seed=self.config.seed,
                 device=str(device),
+                key_group=self.config.key_group,
             )
         return self._compressors[layer_idx]
 
@@ -302,6 +304,10 @@ class TurboQuantValleCache:
         compressed blobs around for memory_report. Each token is quantized
         exactly once — at the step it ages out of the window — and the
         reconstruction persists in the buffer from then on.
+
+        With ``config.key_group`` > 0 the span is rounded DOWN to a multiple of
+        the group so every compressed block is a whole group aligned to
+        position 0; the partial tail stays fp16 until its group fills.
         """
         rw = self.config.residual_window
         if new_total_len <= rw:
@@ -316,6 +322,9 @@ class TurboQuantValleCache:
             already_compressed += c["span"]
 
         want_compressed_upper = new_total_len - rw
+        g = self.config.key_group
+        if g > 0:
+            want_compressed_upper = already_compressed + ((want_compressed_upper - already_compressed) // g) * g
         if want_compressed_upper <= already_compressed:
             return
 
@@ -457,15 +466,11 @@ class TurboQuantValleCache:
             rw = min(self.config.residual_window, cur_len)
             compressed_tokens = max(cur_len - rw, 0)
 
-            def _compressed_bytes_per_token(bits: int) -> int:
-                indices_per_byte = 8 // bits
-                idx_bytes = math.ceil(D / indices_per_byte)
-                norm_bytes = 2  # fp16 vec norm
-                return idx_bytes + norm_bytes
-
-            sim_k = (compressed_tokens * _compressed_bytes_per_token(kb)
+            # Shared formula (turboquant.compressors_v3) — keys carry the
+            # group min/scale metadata when key_group > 0, values never do.
+            sim_k = (compressed_tokens * compressed_bytes_per_token(D, kb, self.config.key_group)
                      + rw * D * 2) * B * H
-            sim_v = (compressed_tokens * _compressed_bytes_per_token(vb)
+            sim_v = (compressed_tokens * compressed_bytes_per_token(D, vb)
                      + rw * D * 2) * B * H
             simulated += sim_k + sim_v
 

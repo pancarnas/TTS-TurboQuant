@@ -16,6 +16,11 @@ moves the talker's attention map and KV vectors:
 
 Rows carry a ``protected_layers`` column and wavs a ``_pl=<n>`` name segment, so
 runs with different ``--protected-layers`` never conflate (also keys --resume).
+Likewise the key-fix flags (docs/keyfix_experiment.md): ``--key-group N``
+(per-group min-max key scaling, OmniKVQuant-style) adds a ``key_group`` column
+and a ``_g=<N>`` wav segment; ``--pre-rope-keys`` (quantize keys before RoPE)
+adds a ``pre_rope`` column and a ``_pre`` wav segment. Both are run-wide, like
+``--protected-layers``: one invocation = one experimental cell.
 
 Configs are given as ``--configs "K4V4@24,K4V3@24,K4V2@24,K3V3@24,K4V4@0"``
 (K<key_bits>V<value_bits>@<residual_window>). The special token ``fp16`` is
@@ -50,6 +55,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import qwen_tts.core.models.modeling_qwen3_tts as modeling  # noqa: E402
+from qwen_tts.core.models.turboquant_kv_cache import rope_keys  # noqa: E402
 
 from benchmark_qwen3tts_real import (  # noqa: E402 - needs sys.path tweak above
     Qwen3TTSModel,
@@ -72,6 +78,8 @@ COLUMNS = [
     "value_bits",
     "rw",
     "protected_layers",
+    "key_group",
+    "pre_rope",
     "attn_js",
     "attn_tv",
     "attn_top1",
@@ -82,7 +90,8 @@ COLUMNS = [
     "relmse_k",
     "relmse_v",
 ]
-_METRICS = COLUMNS[8:]
+_N_ID = 10  # id/config columns before the metrics
+_METRICS = COLUMNS[_N_ID:]
 
 _CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
 
@@ -111,7 +120,14 @@ def config_label(kb, vb, rw) -> str:
     return "fp16" if kb is None else f"K{kb}V{vb}@{rw}"
 
 
-def make_config(kb: int, vb: int, rw: int, protected_layers: int = 2) -> TurboQuantConfig:
+def make_config(
+    kb: int,
+    vb: int,
+    rw: int,
+    protected_layers: int = 2,
+    key_group: int = 0,
+    pre_rope_keys: bool = False,
+) -> TurboQuantConfig:
     """A config with REAL on-path compression (track_only=False).
 
     Default track_only=True makes attention read pristine fp16 KV — generation
@@ -119,6 +135,7 @@ def make_config(kb: int, vb: int, rw: int, protected_layers: int = 2) -> TurboQu
 
     ``protected_layers`` = first/last N layers kept at protected_bits; 0 disables
     layer-adaptive protection (uniform bits everywhere, matching the reference impl).
+    ``key_group`` / ``pre_rope_keys``: the key-fix experiment flags (see module doc).
     """
     return TurboQuantConfig(
         key_bits=kb,
@@ -126,6 +143,8 @@ def make_config(kb: int, vb: int, rw: int, protected_layers: int = 2) -> TurboQu
         residual_window=rw,
         protected_layers=protected_layers,
         track_only=False,
+        key_group=key_group,
+        pre_rope_keys=pre_rope_keys,
     )
 
 
@@ -178,7 +197,8 @@ def compressed_attention(query, rk, num_kv_groups, attention_mask, scaling):
 class DivergenceRecorder:
     """Per-(layer, pos, config) attention + KV divergence during one fp16 pass."""
 
-    def __init__(self, specs, n_layers, prot_layers, prot_bits, stride):
+    def __init__(self, specs, n_layers, prot_layers, prot_bits, stride,
+                 key_group: int = 0, pre_rope: bool = False):
         self.specs = specs  # list of (key_bits, value_bits, rw)
         self.n_layers, self.pl, self.pb, self.stride = (
             n_layers,
@@ -186,12 +206,17 @@ class DivergenceRecorder:
             prot_bits,
             stride,
         )
+        self.key_group = int(key_group)
+        self.pre_rope = bool(pre_rope)
         self.active = False
         self.rows: list[tuple] = []
         self.errors = 0
         self.first_error: str | None = None
         self.group = self.idx = None
         self._cache: dict = {}
+        # pre_rope: per-attention-class running copy of the raw rotary tables
+        # (cos, sin) for every position seen so far in the current generation.
+        self._rope_buf: dict = {}
 
     def _comp(self, layer, kb, vb, rw, head_dim, device):
         key = (layer, kb, vb, rw)
@@ -207,8 +232,32 @@ class DivergenceRecorder:
                 protected_bits=self.pb,
                 seed=42,
                 device=str(device),
+                key_group=self.key_group,
             )
         return self._cache[key]
+
+    def _rope_tables(self, module, pos):
+        """Raw (cos, sin) for positions [0, pos) of this module's sequence.
+
+        The attention layer stashes this step's tables on ``module._tq_rope``
+        (see modeling_qwen3_tts). They are accumulated per attention CLASS
+        (talker vs code predictor run different sequences); a step whose
+        tables do not extend the buffer to exactly ``pos`` is a protocol error.
+        """
+        cos, sin = module._tq_rope
+        name = type(module).__name__
+        buf = self._rope_buf.get(name)
+        n_new = cos.shape[-2]
+        if buf is None or buf[0].shape[-2] >= pos or buf[0].shape[-2] + n_new != pos:
+            if n_new != pos:  # (re)start: this step must cover the whole sequence
+                raise RuntimeError(
+                    f"pre_rope: rotary tables cover {n_new} of {pos} positions for {name}"
+                )
+            buf = (cos, sin)
+        else:
+            buf = (torch.cat([buf[0], cos], dim=-2), torch.cat([buf[1], sin], dim=-2))
+        self._rope_buf[name] = buf
+        return buf
 
     def record(self, module, query, key, value, attention_mask, scaling):
         pos = key.shape[2]
@@ -220,12 +269,26 @@ class DivergenceRecorder:
         # identical K then gives exactly 0 divergence (the eager output is cast
         # to bf16 after softmax, which would floor JS/TV at rounding noise).
         af = compressed_attention(query, key, groups, attention_mask, scaling)
+        rope = None
+        if self.pre_rope:
+            cos, sin = self._rope_tables(module, pos)
+            rs = getattr(module, "rope_scaling", None) or {}
+            rope = dict(
+                cos=cos, sin=sin,
+                mrope_section=rs.get("mrope_section") if cos.dim() == 4 else None,
+                interleaved=bool(rs.get("interleaved", False)),
+            )
+            key_in = rope_keys(key, inverse=True, **rope)
+        else:
+            key_in = key
         for kb, vb, rw in self.specs:
             if kb is None:  # fp16 baseline: audio-only, zero divergence by construction
                 continue
             comp = self._comp(module.layer_idx, kb, vb, rw, head_dim, key.device)
-            ck, cv = comp.compress_kv(key, value)
+            ck, cv = comp.compress_kv(key_in, value)
             rk, rv = comp.decompress_kv(ck, cv)
+            if rope is not None:  # back to post-RoPE space for the attention map
+                rk = rope_keys(rk.to(key.dtype), inverse=False, **rope)
             ac = compressed_attention(query, rk, groups, attention_mask, scaling)
             o_fp16 = torch.matmul(af, modeling.repeat_kv(value, groups).float())
             o_comp = torch.matmul(ac, modeling.repeat_kv(rv, groups).float())
@@ -252,6 +315,8 @@ class DivergenceRecorder:
                     vb,
                     rw,
                     self.pl,
+                    self.key_group,
+                    int(self.pre_rope),
                     js_divergence(af, ac),
                     total_variation(af, ac),
                     top1_agreement(af, ac),
@@ -329,10 +394,10 @@ def force_eager(model) -> None:
 def accumulate_running(running: dict, rows: list) -> None:
     """Fold streamed rows into per-config running sums (bounded memory)."""
     for r in rows:
-        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw); r[7] = protected_layers
+        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw); r[7..9] = pl, key_group, pre_rope
         d = running.setdefault(cfg, dict({"_n": 0}, **{m: 0.0 for m in _METRICS}))
         d["_n"] += 1
-        for m, v in zip(_METRICS, r[8:]):
+        for m, v in zip(_METRICS, r[_N_ID:]):
             d[m] += float(v)
 
 
@@ -356,38 +421,52 @@ def running_frame(running: dict) -> pd.DataFrame:
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     """Offline: per-config means from a streamed CSV."""
-    return (
-        df.groupby(["key_bits", "value_bits", "rw", "protected_layers"])[_METRICS]
-        .mean()
-        .sort_index()
-    )
+    keys = ["key_bits", "value_bits", "rw", "protected_layers"]
+    keys += [c for c in ("key_group", "pre_rope") if c in df.columns]
+    return df.groupby(keys)[_METRICS].mean().sort_index()
 
 
-def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl):
-    # fp16 carries no _pl segment: protection doesn't apply to uncompressed
-    # generation, so runs at different --protected-layers share one baseline wav.
-    cfg = "fp16" if kb is None else f"K{kb}_V{vb}_rw={rw}_pl={pl}"
+def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group=0, pre_rope=False):
+    # fp16 carries no _pl/_g/_pre segment: none of them apply to uncompressed
+    # generation, so runs at different settings share one baseline wav.
+    if kb is None:
+        cfg = "fp16"
+    else:
+        cfg = f"K{kb}_V{vb}_rw={rw}_pl={pl}"
+        if key_group:
+            cfg += f"_g={key_group}"
+        if pre_rope:
+            cfg += "_pre"
     return os.path.join(out_dir, f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_{cfg}.wav")
 
 
-def load_done(out_path: str, protected_layers: int) -> set:
+def load_done(out_path: str, protected_layers: int, key_group: int = 0, pre_rope: bool = False) -> set:
     """(group, idx) pairs already recorded in a divergence CSV (for --resume).
 
-    Only rows recorded under the SAME ``protected_layers`` count as done — a CSV
-    can hold runs at different protection settings without --resume skipping the
-    wrong ones. Reads only the id columns, so it stays cheap even on multi-GB
-    CSVs. A missing/empty file (or one with only a header) yields an empty set.
+    Only rows recorded under the SAME ``protected_layers`` (and, when the CSV
+    has the columns, the same ``key_group`` / ``pre_rope``) count as done — a
+    CSV can hold runs at different settings without --resume skipping the wrong
+    ones. Reads only the id columns, so it stays cheap even on multi-GB CSVs.
+    A missing/empty file (or one with only a header) yields an empty set.
     """
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         return set()
     try:
-        df = pd.read_csv(out_path, usecols=["group", "idx", "protected_layers"])
+        header = pd.read_csv(out_path, nrows=0).columns
+        cols = ["group", "idx", "protected_layers"] + [
+            c for c in ("key_group", "pre_rope") if c in header
+        ]
+        df = pd.read_csv(out_path, usecols=cols)
     except ValueError as exc:
         raise SystemExit(
             f"{out_path} has no protected_layers column (pre-fix CSV) — cannot "
             "--resume into it; start a fresh --out"
         ) from exc
     df = df[df["protected_layers"] == protected_layers]
+    if "key_group" in df.columns:
+        df = df[df["key_group"] == key_group]
+    if "pre_rope" in df.columns:
+        df = df[df["pre_rope"] == int(pre_rope)]
     return set(zip(df["group"].astype(str), df["idx"].astype(int)))
 
 
@@ -396,10 +475,10 @@ def pending_items(items: list, done: set) -> list:
     return [t for t in items if (str(t[0]), int(t[1])) not in done]
 
 
-def audio_done(out_dir, group, idx, seed, temp, specs, pl) -> bool:
+def audio_done(out_dir, group, idx, seed, temp, specs, pl, key_group=0, pre_rope=False) -> bool:
     """True iff every config's wav for this sentence already exists (audio resume)."""
     return all(
-        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl))
+        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group, pre_rope))
         for kb, vb, rw in specs
     )
 
@@ -442,11 +521,14 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     args.temperature,
                     specs,
                     args.protected_layers,
+                    args.key_group,
+                    args.pre_rope_keys,
                 )
             ]
         else:
             items = pending_items(
-                items, load_done(args.out, args.protected_layers)
+                items,
+                load_done(args.out, args.protected_layers, args.key_group, args.pre_rope_keys),
             )
         print(f"resume: skipping {n0 - len(items)} done, running {len(items)}")
 
@@ -476,7 +558,11 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     item.text,
                     "English",
                     speaker,
-                    None if kb is None else make_config(kb, vb, rw, args.protected_layers),
+                    None
+                    if kb is None
+                    else make_config(
+                        kb, vb, rw, args.protected_layers, args.key_group, args.pre_rope_keys
+                    ),
                     seed=args.seed,
                     gen_overrides=decode_overrides(
                         "sampling", temperature=args.temperature
@@ -495,6 +581,8 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                         vb,
                         rw,
                         args.protected_layers,
+                        args.key_group,
+                        args.pre_rope_keys,
                     ),
                     wavs[0],
                     sr,
@@ -559,6 +647,21 @@ def main() -> None:
         "protection: uniform key/value bits on every layer, matching the reference "
         "implementation. Default keeps the current behavior.",
     )
+    parser.add_argument(
+        "--key-group",
+        type=int,
+        default=0,
+        help="Key-fix E1: per-group min-max scaling of rotated keys over N consecutive "
+        "tokens (OmniKVQuant temporal range adaptation; paper uses 32). 0 = off. "
+        "Run-wide: wavs get a _g=<N> segment, rows a key_group column.",
+    )
+    parser.add_argument(
+        "--pre-rope-keys",
+        action="store_true",
+        help="Key-fix E2: quantize keys BEFORE rotary position embedding (RoPE "
+        "re-applied to the reconstruction). Run-wide: wavs get a _pre segment, "
+        "rows a pre_rope column.",
+    )
     parser.add_argument("--step-stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.9)
@@ -592,6 +695,13 @@ def main() -> None:
         f"protected_layers: {args.protected_layers}"
         + (" (no layer-adaptive protection)" if args.protected_layers == 0 else "")
     )
+    if args.key_group < 0:
+        raise SystemExit(f"--key-group must be >= 0, got {args.key_group}")
+    print(
+        f"key-fix: key_group={args.key_group} "
+        f"({'group min-max key scaling' if args.key_group else 'fixed codebook'}), "
+        f"pre_rope_keys={args.pre_rope_keys}"
+    )
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=args.device, dtype=dtype
     )
@@ -602,7 +712,8 @@ def main() -> None:
     print(f"talker n_layers = {n_layers}")
     d = TurboQuantConfig()  # for protected_bits (8-bit); protected_layers from CLI
     recorder = DivergenceRecorder(
-        specs, n_layers, args.protected_layers, d.protected_bits, args.step_stride
+        specs, n_layers, args.protected_layers, d.protected_bits, args.step_stride,
+        key_group=args.key_group, pre_rope=args.pre_rope_keys,
     )
 
     if args.no_divergence:  # audio-only: no eager-forcing, no patch, no recording

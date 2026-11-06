@@ -776,6 +776,9 @@ class Qwen3TTSTalkerAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
+        # Raw rotary tables for this step, read by the TurboQuant divergence
+        # recorder (pre-RoPE key quantization experiment). Cheap: references only.
+        self._tq_rope = (cos, sin)
         query_states, key_states = apply_multimodal_rotary_pos_emb(
             query_states, key_states, cos, sin, self.rope_scaling["mrope_section"], self.rope_scaling["interleaved"]
         )
@@ -931,6 +934,7 @@ class Qwen3TTSAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
+        self._tq_rope = (cos, sin)  # see Qwen3TTSTalkerAttention.forward
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
@@ -2275,6 +2279,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             talker_cache = TurboQuantKVCache(
                 turboquant_config,
                 n_layers=self.config.talker_config.num_hidden_layers,
+                rope_scaling=getattr(self.config.talker_config, "rope_scaling", None),
             )
         else:
             talker_cache = DynamicCache()

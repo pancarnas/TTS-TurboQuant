@@ -33,3 +33,14 @@ class TurboQuantConfig:
     # TurboQuant 7x slower than baseline on L4. Set to False to run the old
     # path (useful only for reconstruction-quality A/B tests).
     track_only: bool = True
+    # --- Key-fix experiments (OmniKVQuant follow-up, see docs/keyfix_experiment.md) ---
+    # key_group > 0: per-group min-max scaling of the ROTATED keys over
+    # `key_group` consecutive tokens before the (uniform) codebook, i.e. the
+    # "temporal range adaptation" of OmniKVQuant. Costs two fp16 scalars per
+    # coordinate per group (= 32/key_group bits per key element). 0 = off
+    # (fixed Lloyd-Max codebook, the current behaviour). Keys only.
+    key_group: int = 0
+    # pre_rope_keys: quantize keys BEFORE rotary position embedding and re-apply
+    # RoPE to the reconstruction. Only meaningful for RoPE models (Qwen3-TTS);
+    # VALL-E-X has additive sinusoidal positions and ignores it.
+    pre_rope_keys: bool = False

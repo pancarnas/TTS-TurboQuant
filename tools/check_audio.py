@@ -31,7 +31,8 @@ import soundfile as sf
 
 _NAME_RE = re.compile(
     r"qwen_(?P<group>.+)_(?P<idx>\d+)_sampling_s(?P<seed>\d+)_t(?P<temp>[\d.]+)"
-    r"_K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)(?:_pl=(?P<pl>\d+))?\.wav$"
+    r"_K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)(?:_pl=(?P<pl>\d+))?"
+    r"(?:_g=(?P<kg>\d+))?(?P<pre>_pre)?\.wav$"
 )
 
 # VALL-E-X benchmark naming (benchmark_vallex_real.py --configs runs):
@@ -41,7 +42,7 @@ _NAME_RE = re.compile(
 _VALLEX_RE = re.compile(
     r"vallex_(?P<group>.+)_(?P<idx>\d+)_(?P<arm>[a-z]+)_s(?P<seed>\d+)"
     r"(?:_t(?P<temp>[\d.]+))?"
-    r"_(?:(?P<fp>fp16)|K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+)(?P<stage>-nar|-both)?)\.wav$"
+    r"_(?:(?P<fp>fp16)|K(?P<kb>\d+)V(?P<vb>\d+)@(?P<rw>\d+)(?P<kg>\+g\d+)?(?P<stage>-nar|-both)?)\.wav$"
 )
 
 
@@ -57,6 +58,11 @@ def parse_wav_name(name: str) -> dict | None:
         config = f"K{d['kb']}V{d['vb']}@{d['rw']}" + (
             f" pl{pl}" if pl is not None else ""
         )
+        # key-fix flags (--key-group / --pre-rope-keys) are part of the config
+        if d["kg"]:
+            config += f"+g{int(d['kg'])}"
+        if d["pre"]:
+            config += "+pre"
         return {
             "group": d["group"],
             "idx": int(d["idx"]),
@@ -73,7 +79,7 @@ def parse_wav_name(name: str) -> dict | None:
             config, kb, vb, rw = "fp16", None, None, None
         else:
             kb, vb, rw = int(d["kb"]), int(d["vb"]), int(d["rw"])
-            config = f"K{kb}V{vb}@{rw}" + (d["stage"] or "")
+            config = f"K{kb}V{vb}@{rw}" + (d["kg"] or "") + (d["stage"] or "")
         return {
             "group": d["group"],
             "idx": int(d["idx"]),

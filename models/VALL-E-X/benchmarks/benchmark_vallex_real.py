@@ -258,13 +258,15 @@ _DIV_COLUMNS = [
 _CFG_RE = re.compile(r"(?:(ar|nar|both):)?[Kk](\d+)[Vv](\d+)@(\d+)$")
 
 
-def parse_configs_arg(spec: str, protected_layers: int) -> list:
+def parse_configs_arg(spec: str, protected_layers: int, key_group: int = 0) -> list:
     """'fp16,K4V4@64,nar:K4V4@64,both:K4V4@64' -> [(label, StageConfigs|None)].
 
     Stage prefix selects which decoder stage(s) get quantized K/V: 'ar:'
     (default — the AR KV cache), 'nar:' (per-pass NAR quantization), or
     'both:'. Labels carry a '-nar' / '-both' suffix so wav names and CSV
-    config columns stay distinct.
+    config columns stay distinct. ``key_group`` > 0 (the OmniKVQuant-style
+    group key scaling, --key-group) is applied to every TQ config and adds a
+    '+g<N>' label suffix before the stage suffix.
 
     Explicit-config runs are quality experiments by definition, so every TQ
     config is built with track_only=False (the lossy write-back path). The
@@ -278,6 +280,7 @@ def parse_configs_arg(spec: str, protected_layers: int) -> list:
             residual_window=rw,
             protected_layers=protected_layers,
             track_only=False,
+            key_group=key_group,
         )
 
     out = []
@@ -300,7 +303,7 @@ def parse_configs_arg(spec: str, protected_layers: int) -> list:
             ar=_make(kb, vb, rw) if stage in ("ar", "both") else None,
             nar=_make(kb, vb, rw) if stage in ("nar", "both") else None,
         )
-        suffix = "" if stage == "ar" else f"-{stage}"
+        suffix = (f"+g{key_group}" if key_group else "") + ("" if stage == "ar" else f"-{stage}")
         out.append((f"K{kb}V{vb}@{rw}{suffix}", entry))
     if not out:
         raise SystemExit("--configs given but no valid tokens parsed")
@@ -1831,6 +1834,14 @@ def main():
         help="Cap sentences per group (useful for smoke tests; default: run all).",
     )
     parser.add_argument(
+        "--key-group",
+        type=int,
+        default=0,
+        help="Key-fix E1: per-group min-max scaling of rotated keys over N consecutive "
+        "tokens (OmniKVQuant temporal range adaptation; paper uses 32). 0 = off. "
+        "With --configs the labels/wav names get a '+g<N>' suffix.",
+    )
+    parser.add_argument(
         "--idx-file",
         default=None,
         help="Path to a file with one sentence idx per line ('#' comments ok). When "
@@ -1963,11 +1974,14 @@ def main():
     if args.protected_layers < 0:
         parser.error(f"--protected-layers must be >= 0, got {args.protected_layers}")
     global TURBOQUANT_CONFIGS
+    if args.key_group < 0:
+        parser.error(f"--key-group must be >= 0, got {args.key_group}")
     if args.configs:
-        TURBOQUANT_CONFIGS = parse_configs_arg(args.configs, args.protected_layers)
+        TURBOQUANT_CONFIGS = parse_configs_arg(args.configs, args.protected_layers, args.key_group)
         print(
             f"[configs] explicit sweep: {[n for n, _ in TURBOQUANT_CONFIGS]} "
-            f"(protected_layers={args.protected_layers}, track_only=False forced)"
+            f"(protected_layers={args.protected_layers}, key_group={args.key_group}, "
+            "track_only=False forced)"
         )
     else:
         TURBOQUANT_CONFIGS = build_turboquant_configs(args.residual_window)
@@ -1976,6 +1990,7 @@ def main():
                 for cfg in (entry.ar, entry.nar):
                     if cfg is not None:
                         cfg.protected_layers = args.protected_layers
+                        cfg.key_group = args.key_group  # labels unchanged: use --output-subdir
 
     # Propagate track_only=False into every TurboQuantConfig if requested.
     if args.track_only_off:

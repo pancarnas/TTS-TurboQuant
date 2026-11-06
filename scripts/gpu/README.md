@@ -55,6 +55,8 @@ a single A100-40GB with `NSHARDS=3` — halve/double to taste.
 | 3 | `11_vallex_seeds.sh` | 5 headline configs (fp16, K4V4@0, K4V2@0, K3V3@0, K2V2@0) × **seeds 0,1,2**, pl0 + pl2 → error bars | `outputs/seed_cl_pl{0,2}/`, `results/seed_cl_pl{0,2}_div_shard*.csv` | 6–12 h/pl |
 | 4 | `12_vallex_ppl.sh` | teacher-forced NLL/PPL/KL/top1-agree over ground-truth EnCodec tokens, 9 rw0 configs (mechanism: per-step damage vs free-running collapse) | `results/vallex_ppl_cl.csv`, `results/vallex_ppl_div_cl.csv` | 2–4 h |
 | 5 | `13_qwen_divergence.sh` | Qwen3-TTS counterfactual divergence + wavs, 6 configs × seeds 0,1,2 (the cross-model contrast) | `results/qwen_div_seed{0,1,2}.csv`, Qwen wavs | 4–8 h/seed |
+| 5.1 | `03_smoke_keyfix.sh` | **key-fix pre-flight** (branch `exp/keyfix-group-prerope`): unit tests + 3 tiny cells + auto-validate. See `docs/keyfix_experiment.md`. | `results/smoke_keyfix_*.csv` | 10–25 min |
+| 5.2 | `14_qwen_keyfix.sh` | **key-fix experiment**: group key scaling (E1) / pre-RoPE keys (E2) cells on Qwen3-TTS, divergence + wavs + scoring + summary | `results/qwen_keyfix_*`, `results/keyfix_summary.md` | 3–6 h/cell |
 | 6 | `20_score.sh` | **objective metrics** on every wav: Whisper large-v3 CER + WER vs ground-truth text, WavLM speaker cosine vs the same sentence's fp16 wav | `results/*_scores.csv` | 4–8 h |
 | 7 | `30_analyze.sh` | tables + stats + figures (CPU-only; also runs on a laptop given the CSVs) | see below | 10–30 min |
 | — | `40_demo_samples.sh` | **optional listening demo**: one sentence cloned under all 28 configs, packaged with the reference prompt, ground truth and a `listen.txt` — for human evaluation (e.g. the supervisor). `IDX=<n>` picks the sentence. | `demo_listen_idx<n>/` | 10–25 min |

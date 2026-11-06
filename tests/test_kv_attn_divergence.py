@@ -38,6 +38,8 @@ COLS = [
     "value_bits",
     "rw",
     "protected_layers",
+    "key_group",
+    "pre_rope",
     "attn_js",
     "attn_tv",
     "attn_top1",
@@ -48,7 +50,25 @@ COLS = [
     "relmse_k",
     "relmse_v",
 ]
-_METRIC_NAMES = COLS[8:]
+_N_ID = 10
+_METRIC_NAMES = COLS[_N_ID:]
+
+# rope_keys lives in the Qwen cache module; load it by path (importing the
+# qwen_tts package would pull in the whole audio stack).
+_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models", "Qwen3-TTS", "qwen_tts", "core", "models", "turboquant_kv_cache.py",
+)
+
+
+def _load_rope_keys():
+    import importlib.util
+
+    pytest.importorskip("transformers")
+    spec = importlib.util.spec_from_file_location("turboquant_kv_cache_for_div", _CACHE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.rope_keys
 
 
 def _repeat_kv(hidden_states, n_rep):
@@ -81,6 +101,8 @@ def _block():
         "modeling": types.SimpleNamespace(repeat_kv=_repeat_kv),
         "TurboQuantV3": TurboQuantV3,
         "_kv_recon_errors": _kv_recon_errors,
+        "rope_keys": _load_rope_keys(),
+        "_N_ID": _N_ID,
     }
     exec(compile(_SRC[start:end], _PATH, "exec"), ns)
     return ns
@@ -161,14 +183,14 @@ def test_output_cosine():
 
 
 def test_streaming_aggregate_matches_means_and_diff():
-    acc = _single_func("accumulate_running", {"_METRICS": _METRIC_NAMES})
+    acc = _single_func("accumulate_running", {"_METRICS": _METRIC_NAMES, "_N_ID": _N_ID})
     frame = _single_func(
         "running_frame",
         {"_METRICS": _METRIC_NAMES, "pd": pd, "config_label": _config_label},
     )
 
-    def _row(kb, vb, rw, v):  # (group, idx, layer, pos, kb, vb, rw, pl, *9 metrics)
-        return ("g", 0, 0, 10, kb, vb, rw, 2) + tuple([v] * 9)
+    def _row(kb, vb, rw, v):  # (group, idx, layer, pos, kb, vb, rw, pl, key_group, pre_rope, *9 metrics)
+        return ("g", 0, 0, 10, kb, vb, rw, 2, 0, 0) + tuple([v] * 9)
 
     running: dict = {}
     acc(running, [_row(4, 4, 24, 0.01), _row(4, 4, 0, 0.20)])
@@ -184,15 +206,15 @@ def test_streaming_aggregate_matches_means_and_diff():
 def test_summarize_groups_by_config():
     summarize = _single_func("summarize", {"_METRICS": _METRIC_NAMES})
     rows = [
-        ("g", 0, 0, 10, 4, 4, 24, 2) + tuple([0.02] * 9),
-        ("g", 1, 0, 10, 4, 2, 24, 2) + tuple([0.20] * 9),
-        ("g", 1, 0, 10, 4, 2, 24, 0) + tuple([0.50] * 9),  # other pl -> own bucket
+        ("g", 0, 0, 10, 4, 4, 24, 2, 0, 0) + tuple([0.02] * 9),
+        ("g", 1, 0, 10, 4, 2, 24, 2, 0, 0) + tuple([0.20] * 9),
+        ("g", 1, 0, 10, 4, 2, 24, 0, 0, 0) + tuple([0.50] * 9),  # other pl -> own bucket
     ]
     df = pd.DataFrame(rows, columns=COLS)
     out = summarize(df)
-    assert abs(out.loc[(4, 4, 24, 2), "attn_js"] - 0.02) < 1e-9
-    assert abs(out.loc[(4, 2, 24, 2), "attn_js"] - 0.20) < 1e-9
-    assert abs(out.loc[(4, 2, 24, 0), "attn_js"] - 0.50) < 1e-9
+    assert abs(out.loc[(4, 4, 24, 2, 0, 0), "attn_js"] - 0.02) < 1e-9
+    assert abs(out.loc[(4, 2, 24, 2, 0, 0), "attn_js"] - 0.20) < 1e-9
+    assert abs(out.loc[(4, 2, 24, 0, 0, 0), "attn_js"] - 0.50) < 1e-9
 
 
 # --- force_eager (wrapper traversal) --------------------------------------
@@ -464,10 +486,10 @@ def test_load_done_reads_group_idx_pairs(tmp_path):
     p = tmp_path / "k.csv"
     assert load_done(str(p), 2) == set()  # missing -> empty
     rows = [
-        ("g", 0, 0, 10, 4, 4, 24, 2) + tuple([0.1] * 9),
-        ("g", 0, 1, 10, 4, 2, 24, 2) + tuple([0.2] * 9),  # same sentence, other config
-        ("g", 1, 0, 10, 4, 4, 24, 2) + tuple([0.3] * 9),
-        ("g", 2, 0, 10, 4, 4, 24, 0) + tuple([0.4] * 9),  # different protected_layers
+        ("g", 0, 0, 10, 4, 4, 24, 2, 0, 0) + tuple([0.1] * 9),
+        ("g", 0, 1, 10, 4, 2, 24, 2, 0, 0) + tuple([0.2] * 9),  # same sentence, other config
+        ("g", 1, 0, 10, 4, 4, 24, 2, 0, 0) + tuple([0.3] * 9),
+        ("g", 2, 0, 10, 4, 4, 24, 0, 0, 0) + tuple([0.4] * 9),  # different protected_layers
     ]
     pd.DataFrame(rows, columns=COLS).to_csv(p, index=False)
     # only rows recorded under the SAME protected_layers count as done
@@ -479,7 +501,7 @@ def test_load_done_refuses_prefix_csv_without_protected_layers(tmp_path):
     load_done = _single_func("load_done", {"pd": pd, "os": os})
     p = tmp_path / "old.csv"
     old_cols = [c for c in COLS if c != "protected_layers"]
-    rows = [("g", 0, 0, 10, 4, 4, 24) + tuple([0.1] * 9)]
+    rows = [("g", 0, 0, 10, 4, 4, 24, 0, 0) + tuple([0.1] * 9)]
     pd.DataFrame(rows, columns=old_cols).to_csv(p, index=False)
     with pytest.raises(SystemExit):
         load_done(str(p), 2)
