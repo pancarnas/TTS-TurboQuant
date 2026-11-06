@@ -37,6 +37,8 @@ source .venv/bin/activate            # same env as the campaign (00_setup.sh)
 
 # 1. smoke — MUST print "KEYFIX SMOKE PASS" (10-25 min)
 bash scripts/gpu/03_smoke_keyfix.sh
+# re-run ONE cell after a code fix (keeps the other cells' CSVs and wavs):
+CELLS="pre" bash scripts/gpu/03_smoke_keyfix.sh
 
 # 2. full run, Qwen, seed 0, three cells (9-18 h at MAXPG=100; see knobs)
 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix.log 2>&1 &
@@ -108,3 +110,17 @@ E2M1 plus one shared 8-bit exponent per 32 coordinates), i.e. 0.27 bits per key
 element; the paper's "bits/elem" figures (2.258 / 2.625) are the average over
 keys and values (keys 2.39 / 3.125, values 2.125). Our fp16 metadata is the
 best case for their method, which is what a mechanism test wants.
+
+## Smoke history
+
+- 2026-11-06, first run on the SageMaker box: `plain` and `g32` clean (115266
+  rows each); `pre` printed PASS but had 46397 skipped measurements and only
+  22472 rows. Cause: the divergence recorder kept one rotary-table buffer per
+  attention class and treated every layer's call as a new step, so on each
+  decode step only layer 0 was recorded. The cache's own `_record_rope` had
+  the per-layer guard; the recorder did not. Fixed (same-step tables are
+  reused; `--step-stride` no longer starves the buffer), the validator now
+  requires equal row counts across cells and zero measurement errors, and
+  `14_qwen_keyfix.sh` aborts a cell that reports measurement errors. The
+  `sox: not found` banner at start-up is torchaudio probing a backend it
+  does not use here; harmless.

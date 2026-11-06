@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import sys
 
 CELLS = {"plain": (0, 0), "g32": (32, 0), "pre": (0, 1)}
@@ -44,6 +45,8 @@ def main() -> None:
     ap.add_argument("--results", default="results")
     ap.add_argument("--wavdir", default="models/Qwen3-TTS/benchmarks/outputs/smoke_keyfix")
     ap.add_argument("--n", type=int, default=2, help="sentences per cell")
+    ap.add_argument("--logs", default="logs",
+                    help="dir with smoke_keyfix_<cell>.log (measurement-error scan; skipped if absent)")
     args = ap.parse_args()
 
     import pandas as pd
@@ -71,6 +74,24 @@ def main() -> None:
         check(f"{cell}: both K8V8 and K2V2 recorded",
               {8, 2} <= set(df.key_bits.unique()))
         check(f"{cell}: {args.n} sentences", df.idx.nunique() == args.n)
+
+    # A measurement error inside record() is caught and counted, not raised, so
+    # a cell can look fine while most of its rows are missing (first smoke run:
+    # the pre cell kept 22k of 115k rows). Every cell runs the same sentences,
+    # configs and steps, so the row counts must agree exactly.
+    if len(frames) == 3:
+        n_plain = len(frames["plain"])
+        for cell in ("g32", "pre"):
+            check(f"{cell}: same row count as plain ({len(frames[cell])} vs {n_plain})",
+                  len(frames[cell]) == n_plain)
+    for cell in CELLS:
+        lp = os.path.join(args.logs, f"smoke_keyfix_{cell}.log")
+        if not os.path.exists(lp):
+            continue
+        with open(lp, errors="replace") as fh:
+            m = re.search(r"WARNING: (\d+) measurement errors", fh.read())
+        n_err = int(m.group(1)) if m else 0
+        check(f"{cell}: no measurement errors in {lp} ({n_err})", n_err == 0)
 
     if len(frames) == 3:
         for cell, df in frames.items():

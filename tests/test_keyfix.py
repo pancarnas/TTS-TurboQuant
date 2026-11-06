@@ -366,6 +366,59 @@ def test_recorder_pre_rope_accumulates_tables_and_is_exact_at_8bit():
     assert rec._rope_buf["SimpleNamespace"][0].shape[-2] == 33
 
 
+def test_recorder_pre_rope_every_layer_sees_the_same_step():
+    """Regression: the model has 28 talker layers and each calls record() with
+    the SAME step's 1-position tables. The first smoke run raised 'rotary
+    tables cover 1 of N positions' on every layer but the first of every
+    decode step (46k skipped measurements)."""
+    ns = _recorder_ns()
+    D, groups, L = 64, 2, 3
+    rec = ns["DivergenceRecorder"](specs=[(8, 8, 0)], n_layers=4, prot_layers=0,
+                                   prot_bits=8, stride=1, pre_rope=True)
+    rec.group, rec.idx = "g", 0
+    torch.manual_seed(1)
+    q = torch.randn(1, 2 * groups, 1, D)
+    key = torch.randn(1, 2, 8, D)
+    for layer in range(L):  # prefill, all layers
+        rec.record(_talker_module(groups, 8, 0, D, layer), q, key, key, None, D**-0.5)
+    for step in range(3):  # three decode steps, all layers each
+        key = torch.cat([key, torch.randn(1, 2, 1, D)], dim=2)
+        pos = key.shape[2]
+        for layer in range(L):
+            rec.record(_talker_module(groups, 1, pos - 1, D, layer), q, key, key, None, D**-0.5)
+    assert rec.errors == 0 and len(rec.rows) == L * 4
+    assert rec._rope_buf["SimpleNamespace"][0].shape[-2] == 11
+    rows = [dict(zip(_cols(), r)) for r in rec.rows]
+    assert all(d["cos_k"] > 0.9999 and d["attn_js"] < 1e-4 for d in rows)
+    # a second sequence of the same class (e.g. next sentence) restarts cleanly
+    key = torch.randn(1, 2, 5, D)
+    for layer in range(L):
+        rec.record(_talker_module(groups, 5, 0, D, layer), q, key, key, None, D**-0.5)
+    assert rec._rope_buf["SimpleNamespace"][0].shape[-2] == 5
+    # a stale one-position table that matches neither extension nor repeat
+    bad = _talker_module(groups, 1, 2, D, 0)  # position 2 while buffer holds 5
+    with pytest.raises(RuntimeError, match="rotary tables cover"):
+        rec.record(bad, q, key, key, None, D**-0.5)
+
+
+def test_recorder_pre_rope_accumulates_across_strided_steps():
+    """--step-stride skips the measurement, not the table bookkeeping."""
+    ns = _recorder_ns()
+    D, groups = 64, 2
+    rec = ns["DivergenceRecorder"](specs=[(8, 8, 0)], n_layers=4, prot_layers=0,
+                                   prot_bits=8, stride=4, pre_rope=True)
+    rec.group, rec.idx = "g", 0
+    q = torch.randn(1, 2 * groups, 1, D)
+    key = torch.randn(1, 2, 4, D)
+    rec.record(_talker_module(groups, 4, 0, D), q, key, key, None, D**-0.5)
+    for _ in range(4):  # positions 5,6,7 are skipped by the stride, 8 is measured
+        key = torch.cat([key, torch.randn(1, 2, 1, D)], dim=2)
+        rec.record(_talker_module(groups, 1, key.shape[2] - 1, D), q, key, key, None, D**-0.5)
+    assert rec.errors == 0
+    assert [r[3] for r in rec.rows] == [4, 8]
+    assert rec._rope_buf["SimpleNamespace"][0].shape[-2] == 8
+
+
 def _cols():
     from tests.test_kv_attn_divergence import COLS
 

@@ -60,6 +60,12 @@ for CELL in $CELLS; do
       --audio-out-dir "$OUT_DIR" \
       --out "results/qwen_keyfix_${CELL}_seed${SEED}.csv" --resume $FLAGS \
       2>&1 | tee "logs/qwen_keyfix_${CELL}_seed${SEED}.log"
+    # record() swallows per-step errors so one bad step cannot kill a 5-hour
+    # run; but a cell with skipped measurements is NOT a result. Stop here.
+    if grep -q "measurement errors" "logs/qwen_keyfix_${CELL}_seed${SEED}.log"; then
+      echo "ABORT: cell=$CELL seed=$SEED had measurement errors — see the log above" >&2
+      exit 3
+    fi
   done
   if [ "$SCORE" = "1" ]; then
     echo "### scoring cell=$CELL (Whisper large-v3 CER/WER + WavLM spk_sim vs fp16) ###"

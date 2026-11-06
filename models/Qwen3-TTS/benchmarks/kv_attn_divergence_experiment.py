@@ -241,26 +241,34 @@ class DivergenceRecorder:
 
         The attention layer stashes this step's tables on ``module._tq_rope``
         (see modeling_qwen3_tts). They are accumulated per attention CLASS
-        (talker vs code predictor run different sequences); a step whose
-        tables do not extend the buffer to exactly ``pos`` is a protocol error.
+        (talker vs code predictor run different sequences). Every LAYER of a
+        class calls this with the same step's tables, so a step is appended
+        once (first layer) and reused by the others; a step whose tables
+        neither restart, extend nor repeat the buffer is a protocol error.
         """
         cos, sin = module._tq_rope
         name = type(module).__name__
         buf = self._rope_buf.get(name)
         n_new = cos.shape[-2]
-        if buf is None or buf[0].shape[-2] >= pos or buf[0].shape[-2] + n_new != pos:
-            if n_new != pos:  # (re)start: this step must cover the whole sequence
-                raise RuntimeError(
-                    f"pre_rope: rotary tables cover {n_new} of {pos} positions for {name}"
-                )
+        have = 0 if buf is None else buf[0].shape[-2]
+        if n_new == pos:  # prefill (or a sequence restart): full tables
             buf = (cos, sin)
-        else:
+        elif have + n_new == pos:  # first layer of a decode step: extend
             buf = (torch.cat([buf[0], cos], dim=-2), torch.cat([buf[1], sin], dim=-2))
+        elif have == pos and torch.equal(buf[0][..., -n_new:, :], cos):
+            pass  # another layer of the same step: already appended
+        else:
+            raise RuntimeError(
+                f"pre_rope: rotary tables cover {n_new} of {pos} positions for {name} "
+                f"(buffer holds {have})"
+            )
         self._rope_buf[name] = buf
         return buf
 
     def record(self, module, query, key, value, attention_mask, scaling):
         pos = key.shape[2]
+        if self.pre_rope:  # must see EVERY step, even the ones the stride skips
+            cos, sin = self._rope_tables(module, pos)
         if self.stride > 1 and (pos % self.stride) != 0:
             return
         head_dim = key.shape[-1]
@@ -271,7 +279,6 @@ class DivergenceRecorder:
         af = compressed_attention(query, key, groups, attention_mask, scaling)
         rope = None
         if self.pre_rope:
-            cos, sin = self._rope_tables(module, pos)
             rs = getattr(module, "rope_scaling", None) or {}
             rope = dict(
                 cos=cos, sin=sin,
