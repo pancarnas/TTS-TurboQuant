@@ -102,5 +102,9 @@ Group scaling stores two fp16 scalars per coordinate per 32 tokens, which is
 1.0 bit per key element on top of the packed codes. `memory_report()` and the
 `theoretical_ratio` column include it through the shared
 `compressed_bytes_per_token` helper, so a K2V2+g32 cache is reported at 3.125
-bits per key element, not 2. State this in the thesis; OmniKVQuant's own
-bits-per-element column appears to count only one scalar per group.
+bits per key element, not 2. State this in the thesis. OmniKVQuant's released
+code stores the same two scalars per coordinate per group but in MXFP4 (4-bit
+E2M1 plus one shared 8-bit exponent per 32 coordinates), i.e. 0.27 bits per key
+element; the paper's "bits/elem" figures (2.258 / 2.625) are the average over
+keys and values (keys 2.39 / 3.125, values 2.125). Our fp16 metadata is the
+best case for their method, which is what a mechanism test wants.

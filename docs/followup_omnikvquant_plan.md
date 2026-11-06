@@ -45,7 +45,8 @@ Code changes
   (not the Lloyd-Max centroids), store `min` and `scale` as fp16 next to the
   norms. Decompress reverses it. `memory_bytes` counts the metadata honestly:
   two fp16 scalars per coordinate per g tokens = 32/g bits per element (1.0 bit
-  at g = 32). Report that number; do not repeat the paper's undercount.
+  at g = 32). Report that number per key element; the paper's bits/elem
+  figures are K/V averages with MXFP4 metadata (keys 2.39, values 2.125).
 - Both caches (`models/VALL-E-X/turboquant_cache.py`,
   `models/Qwen3-TTS/.../turboquant_kv_cache.py`) `_legacy_compress_overflow`:
   round the compressed span end down to a multiple of `key_group` so groups are
