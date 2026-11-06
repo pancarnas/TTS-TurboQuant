@@ -62,6 +62,11 @@ def main() -> None:
             vals = {v for o in others if col in o.columns for v in o[col].unique()}
             if vals and col in df.columns:
                 df = df[df[col].isin(vals)]
+        # same sentences too (MAXPG=50 cells vs a 100-sentence baseline)
+        pairs = {(g, i) for o in others if {"group", "idx"} <= set(o.columns)
+                 for g, i in zip(o["group"], o["idx"])}
+        if pairs and {"group", "idx"} <= set(df.columns):
+            df = df[[(g, i) in pairs for g, i in zip(df["group"], df["idx"])]]
         return df
 
     # --- objective scores -------------------------------------------------
