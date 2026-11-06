@@ -43,6 +43,7 @@ for CELL in $CELLS; do
     plain) FLAGS="" ;;
     g32)   FLAGS="--key-group 32" ;;
     pre)   FLAGS="--pre-rope-keys" ;;
+    *) echo "unknown cell '$CELL' (plain|g32|pre) — check for curly quotes in CELLS=..." >&2; exit 2 ;;
   esac
   echo "--- cell $CELL ($FLAGS) ---"
   # shellcheck disable=SC2086
