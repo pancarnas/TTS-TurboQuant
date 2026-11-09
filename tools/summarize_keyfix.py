@@ -49,9 +49,9 @@ def main() -> None:
     ap.add_argument("--out", default="results/keyfix_summary.md")
     ap.add_argument("--plain-div", default=None, help="divergence CSV to use as the 'plain' cell")
     ap.add_argument("--plain-scores", default=None, help="scores CSV to use as the 'plain' cell")
-    ap.add_argument("--talker-min-pos", type=int, default=17,
+    ap.add_argument("--talker-min-pos", type=int, default=33,
                     help="divergence rows with pos < this are the code predictor (its sequence is "
-                         "at most num_code_groups=16 long) and are dropped; 0 keeps every row")
+                         "at most num_code_groups (16 here, 32 in the config default) long) and are dropped; 0 keeps every row")
     args = ap.parse_args()
 
     import pandas as pd
@@ -124,7 +124,7 @@ def main() -> None:
         # per talker step, its cache is never TurboQuant-compressed). Those
         # rows outnumber the talker's layers 0-4 rows 16:1 and are measuring
         # nothing we deploy. The code predictor's sequence never exceeds
-        # num_code_groups (16) positions; the talker's prompt alone is longer.
+        # num_code_groups positions (16 on this model; the row ratio is 16:1); the talker prompt alone is longer.
         if args.talker_min_pos > 0:
             before = d.groupby("layer").size()
             d = d[d.pos >= args.talker_min_pos]
