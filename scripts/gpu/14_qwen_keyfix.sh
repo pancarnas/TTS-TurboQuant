@@ -28,9 +28,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source .venv/bin/activate 2>/dev/null || true
-# pin the interpreter: a fresh shell after a box restart has no venv on PATH
-PY="${PYTHON:-}"; [ -z "$PY" ] && { [ -x .venv/bin/python ] && PY=.venv/bin/python || PY=python; }
-"$PY" -c "import pandas, torch" || { echo "venv broken: $PY lacks pandas/torch — run scripts/gpu/00_setup.sh" >&2; exit 2; }
+source scripts/gpu/_ensure_env.sh   # pins $PY, self-heals a stripped venv
 mkdir -p results logs
 unset HF_HUB_OFFLINE 2>/dev/null || true
 
