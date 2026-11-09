@@ -28,6 +28,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source .venv/bin/activate 2>/dev/null || true
+# pin the interpreter: a fresh shell after a box restart has no venv on PATH
+PY="${PYTHON:-}"; [ -z "$PY" ] && { [ -x .venv/bin/python ] && PY=.venv/bin/python || PY=python; }
+"$PY" -c "import pandas, torch" || { echo "venv broken: $PY lacks pandas/torch — run scripts/gpu/00_setup.sh" >&2; exit 2; }
 mkdir -p results logs
 unset HF_HUB_OFFLINE 2>/dev/null || true
 
@@ -53,7 +56,7 @@ for CELL in $CELLS; do
   for SEED in $SEEDS; do
     echo "### keyfix cell=$CELL seed=$SEED flags='$FLAGS' ###"
     # shellcheck disable=SC2086
-    python models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py \
+    "$PY" models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py \
       --data-dir data --groups librispeech_pc --max-per-group "$MAXPG" \
       --configs "$CFGS" --protected-layers 0 --seed "$SEED" \
       --voice-mode clone --device cuda \
@@ -69,7 +72,7 @@ for CELL in $CELLS; do
   done
   if [ "$SCORE" = "1" ]; then
     echo "### scoring cell=$CELL (Whisper large-v3 CER/WER + WavLM spk_sim vs fp16) ###"
-    python tools/score_wav_dir.py --audio-dir "$OUT_DIR" --data-dir data \
+    "$PY" tools/score_wav_dir.py --audio-dir "$OUT_DIR" --data-dir data \
       --device cuda --out "results/qwen_keyfix_${CELL}_scores.csv" --resume \
       2>&1 | tee "logs/qwen_keyfix_${CELL}_score.log"
   fi
@@ -85,5 +88,5 @@ if [[ " $CELLS " != *" plain "* ]]; then
   [ -f results/qwen_seed_scores.csv ] && PLAIN="$PLAIN --plain-scores results/qwen_seed_scores.csv"
 fi
 # shellcheck disable=SC2086
-python tools/summarize_keyfix.py --results results --out results/keyfix_summary.md $PLAIN || true
+"$PY" tools/summarize_keyfix.py --results results --out results/keyfix_summary.md $PLAIN || true
 echo "keyfix done — see results/keyfix_summary.md"

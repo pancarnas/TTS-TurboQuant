@@ -22,6 +22,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source .venv/bin/activate 2>/dev/null || true
+# pin the interpreter: a fresh shell after a box restart has no venv on PATH
+PY="${PYTHON:-}"; [ -z "$PY" ] && { [ -x .venv/bin/python ] && PY=.venv/bin/python || PY=python; }
+"$PY" -c "import pandas, torch" || { echo "venv broken: $PY lacks pandas/torch — run scripts/gpu/00_setup.sh" >&2; exit 2; }
 mkdir -p logs results
 unset HF_HUB_OFFLINE 2>/dev/null || true
 
@@ -31,8 +34,8 @@ ALL_CELLS="plain g32 pre"
 CELLS="${CELLS:-$ALL_CELLS}"
 
 echo "### 1/3 unit tests (key-fix + divergence driver + caches) ###"
-python -c "import pytest" 2>/dev/null || pip install -q pytest
-python -m pytest tests/test_keyfix.py tests/test_kv_attn_divergence.py \
+"$PY" -c "import pytest" 2>/dev/null || pip install -q pytest
+"$PY" -m pytest tests/test_keyfix.py tests/test_kv_attn_divergence.py \
   tests/test_turboquant_cache_readback.py tests/test_score_wav_dir.py \
   tests/test_check_audio.py models/Qwen3-TTS/tests/ -q
 
@@ -47,7 +50,7 @@ for CELL in $CELLS; do
   esac
   echo "--- cell $CELL ($FLAGS) ---"
   # shellcheck disable=SC2086
-  python models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py \
+  "$PY" models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py \
     --data-dir data --groups librispeech_pc --max-per-group 2 \
     --configs "$CFGS" --protected-layers 0 --seed 0 \
     --voice-mode clone --device cuda \
@@ -57,4 +60,4 @@ for CELL in $CELLS; do
 done
 
 echo "### 3/3 validate (all three cells, whichever were re-run) ###"
-python tools/validate_keyfix_smoke.py --results results --wavdir "$OUT_DIR" --n 2 --logs logs
+"$PY" tools/validate_keyfix_smoke.py --results results --wavdir "$OUT_DIR" --n 2 --logs logs
