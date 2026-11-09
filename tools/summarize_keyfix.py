@@ -49,6 +49,9 @@ def main() -> None:
     ap.add_argument("--out", default="results/keyfix_summary.md")
     ap.add_argument("--plain-div", default=None, help="divergence CSV to use as the 'plain' cell")
     ap.add_argument("--plain-scores", default=None, help="scores CSV to use as the 'plain' cell")
+    ap.add_argument("--talker-min-pos", type=int, default=17,
+                    help="divergence rows with pos < this are the code predictor (its sequence is "
+                         "at most num_code_groups=16 long) and are dropped; 0 keeps every row")
     args = ap.parse_args()
 
     import pandas as pd
@@ -116,10 +119,24 @@ def main() -> None:
         div_frames = [_match_plain(f, others) if f.cell.iloc[0] == "plain" else f for f in div_frames]
     if div_frames:
         d = pd.concat(div_frames, ignore_index=True)
+        # The recorder hooks eager_attention_forward, which also fires inside
+        # the code predictor (Qwen3TTSAttention, layer_idx 0-4, ~15 sub-steps
+        # per talker step, its cache is never TurboQuant-compressed). Those
+        # rows outnumber the talker's layers 0-4 rows 16:1 and are measuring
+        # nothing we deploy. The code predictor's sequence never exceeds
+        # num_code_groups (16) positions; the talker's prompt alone is longer.
+        if args.talker_min_pos > 0:
+            before = d.groupby("layer").size()
+            d = d[d.pos >= args.talker_min_pos]
+            after = d.groupby("layer").size()
+            lines += [f"Divergence rows restricted to the talker (pos >= {args.talker_min_pos}); "
+                      f"rows per layer before/after the filter, layers 0-4 vs 5: "
+                      + ", ".join(f"L{l}: {int(before.get(l, 0))}->{int(after.get(l, 0))}" for l in (0, 4, 5)),
+                      ""]
         d["config"] = [_label(*r) for r in zip(d.key_bits, d.value_bits, d.rw, d.key_group, d.pre_rope)]
         m = (d.groupby(["cell", "config"])[["attn_js", "attn_top1", "out_cos", "cos_k", "cos_v", "relmse_k"]]
              .mean().reset_index().sort_values(["config", "cell"]))
-        lines += ["## Attention / KV divergence (mean over layers, positions, sentences)", "",
+        lines += ["## Attention / KV divergence (talker layers; mean over layers, positions, sentences)", "",
                   _md(m, ".5f"), ""]
         k2 = d[(d.key_bits == 2) & (d.value_bits == 2) & (d.rw == 0)]
         if len(k2):
