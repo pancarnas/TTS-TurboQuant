@@ -124,3 +124,61 @@ best case for their method, which is what a mechanism test wants.
   `14_qwen_keyfix.sh` aborts a cell that reports measurement errors. The
   `sox: not found` banner at start-up is torchaudio probing a backend it
   does not use here; harmless.
+
+## Getting the results off the box
+
+The raw divergence CSVs are ~750 MB each (15 M rows) and the JupyterLab file
+browser truncates downloads at 24 MiB. Reduce first, then split:
+
+```
+$PY tools/reduce_keyfix_div.py            # -> results/keyfix_reduced/*_bysent.csv, *_bypos.csv
+ls results | grep keyfix | grep -v seed0 | sed s,^,results/, > keyfix_list.txt
+ls results/keyfix_reduced | sed s,^,results/keyfix_reduced/, >> keyfix_list.txt
+ls logs | grep keyfix | sed s,^,logs/, >> keyfix_list.txt
+tar czf keyfix_results.tgz -T keyfix_list.txt
+split -b 20m keyfix_results.tgz keyfix_part_
+```
+
+On the laptop: `cat keyfix_part_aa keyfix_part_ab > keyfix_results.tgz`,
+`tar xzf ... -C results/keyfix`, then
+`python tools/analyze_keyfix.py --root results/keyfix --out results/keyfix`
+writes `keyfix_analysis.md` and `keyfix_layers.{png,pdf}`.
+
+## Results, seed 0, 50 sentences (2026-11-10)
+
+Paired: same sentences and seed in all four cells, plain cell re-run under the
+same protocol and torch build (2.6.0+cu124).
+
+| config | plain | g32 | pre | g32pre |
+|---|---|---|---|---|
+| K2V2 collapse % | 100 | 100 | 100 | 100 |
+| K2V4 collapse % | 100 | 100 | 100 | 100 |
+| K3V3 collapse % | 100 | 28 | 100 | 6 |
+| K3V3 CER | 0.99 | 0.31 | 0.92 | 0.13 |
+| K3V3 spk_sim | 0.73 | 0.93 | 0.75 | 0.96 |
+| K2V2 talker attn_js | 0.232 | 0.078 | 0.236 | 0.061 |
+| K3V3 talker attn_js | 0.102 | 0.015 | 0.102 | 0.011 |
+
+What it says
+
+- Group scaling (E1) lowers attention divergence in 50/50 sentences at every
+  bit width (Wilcoxon p < 1e-14) and rescues 3-bit keys (28 % collapse vs
+  100 %), but 2-bit keys still collapse in every sentence. The paper's fix
+  transfers partially.
+- Pre-RoPE (E2) alone changes nothing: per-layer curves sit on top of plain.
+  RoPE is not the cause of the range drift.
+- g32 vs g32pre at K3V3: 14 vs 3 collapses, disjoint sentence sets (no sentence
+  collapses in both). Discordant-pair test p = 0.013, but the disjointness
+  says collapse at this operating point is a per-run sampling event, not a
+  sentence property. Needs seeds 1-2 before claiming the stack helps.
+- Within g32 K3V3, per-sentence mean attn_js does not separate collapsed from
+  surviving sentences (0.0146 vs 0.0149, p = 0.3; same at layer 5). The
+  collapse is not predicted by average divergence; it is a step event. A
+  per-step max/95th-percentile reduction would test that directly (raw CSVs
+  are still on the box).
+- Per-layer (talker only): plain peaks at layer 0 (0.66 at K2V2); g32 cuts
+  layer 0 by 11x but layer 5 by only 2.4x, so layer 5 (0.225) becomes the
+  peak of both g32 cells. Layer 5 is the group-scaling-resistant layer.
+- Along the sequence: plain divergence grows with decode position (layer 0:
+  0.26 at <64 steps to 0.47 at 512+), the drift signature; under g32 it falls
+  with position (0.020 to 0.007). Group scaling removes the length dependence.
