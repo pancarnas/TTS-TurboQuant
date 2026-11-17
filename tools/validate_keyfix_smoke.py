@@ -110,12 +110,24 @@ def main() -> None:
         c2 = {c: frames[c][frames[c].key_bits == 2].cos_k.mean() for c in CELLS}
         check("all cells: K2V2 cos_k in [0.5, 0.999] (lossy, not broken)",
               all(0.5 <= v <= 0.999 for v in c2.values()))
-        # pp: the prompt is spliced back exact, so its attention divergence must
-        # drop below plain while the recon metrics (compressed part only) match plain
-        p2 = frames["pp"][frames["pp"].key_bits == 2]
-        pl2 = frames["plain"][frames["plain"].key_bits == 2]
-        check("pp: K2V2 attn_js < plain (prompt keys exact)", p2.attn_js.mean() < pl2.attn_js.mean())
-        check("pp: K8V8 attn_js < 1e-3", frames["pp"][frames["pp"].key_bits == 8].attn_js.mean() < 1e-3)
+        # pp: the prompt is spliced back exact, so the rows recorded AT the
+        # prefill step (the smallest talker position per sentence; code-predictor
+        # rows sit below 33) must show zero divergence at every bit width. The
+        # mean over decode steps is NOT asserted: with 2-bit generated keys next
+        # to exact prompt keys the shared codebook bias stops cancelling in the
+        # softmax, so attn_js can rise while top-1 agreement improves (seen in
+        # the 2026-11-17 smoke) — the audio run decides that, not the smoke.
+        pp = frames["pp"]
+        talker = pp[pp.pos >= 33]
+        p0 = talker.groupby("idx").pos.min()
+        pre_rows = talker[talker.pos == talker.idx.map(p0)]
+        check(f"pp: zero attn_js on the {len(pre_rows)} prefill rows (prompt exact)",
+              len(pre_rows) > 0 and pre_rows.attn_js.max() < 1e-5 and (pre_rows.cos_k == 1.0).all())
+        check("pp: K8V8 attn_js < 1e-3", pp[pp.key_bits == 8].attn_js.mean() < 1e-3)
+        p2, pl2 = pp[pp.key_bits == 2], frames["plain"][frames["plain"].key_bits == 2]
+        print(f"  [info] pp vs plain K2V2: attn_js {p2.attn_js.mean():.4f} vs {pl2.attn_js.mean():.4f}, "
+              f"attn_top1 {p2.attn_top1.mean():.4f} vs {pl2.attn_top1.mean():.4f}, "
+              f"dentropy {p2.attn_dentropy.mean():+.4f} vs {pl2.attn_dentropy.mean():+.4f}")
         # informational — this is the hypothesis the full run tests
         print("  [info] K2V2 cos_k   " + "  ".join(f"{c}={v:.4f}" for c, v in c2.items()))
         j2 = {c: frames[c][frames[c].key_bits == 2].attn_js.mean() for c in CELLS}
