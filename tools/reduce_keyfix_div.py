@@ -7,6 +7,12 @@ to download from the GPU box.  This writes, per raw file:
   <out>/<stem>_bysent.csv  mean of every metric per
                            (group, idx, layer, config, talker) with a row count
   <out>/<stem>_bypos.csv   talker-only mean per (layer, config, pos_bin)
+  <out>/<stem>_bystep.csv  talker-only per (group, idx, layer, config): max of
+                           attn_js over steps, its 95th percentile (0.005 bins),
+                           and the fraction of steps with attn_js > 0.1 / 0.5
+  <out>/<stem>_bytime.csv  talker-only per (group, idx, config, pos_bin): mean
+                           and max of attn_js over layers and steps in the bin
+                           (the per-sentence time course)
 
 `talker` is pos >= --talker-min-pos (33), the same split tools/summarize_keyfix.py
 uses to drop code-predictor rows.  Both tables are exact means of the raw rows,
@@ -19,6 +25,7 @@ import argparse
 import glob
 import os
 
+import numpy as np
 import pandas as pd
 
 CFG = ["key_bits", "value_bits", "rw", "protected_layers", "key_group", "pre_rope"]
@@ -42,9 +49,42 @@ def _finish(parts, keys, metrics):
     return df
 
 
+N_BINS = 200  # attn_js histogram bins on [0, 1] -> 0.005 resolution for the percentile
+
+
+def _finish_steps(hist_parts, max_parts, keys):
+    """Per key: exact max, histogram-based p95, fraction of steps above thresholds."""
+    h = pd.concat(hist_parts, ignore_index=True).groupby(keys + ["bin"], sort=True)["cnt"].sum().reset_index()
+    mx = pd.concat(max_parts, ignore_index=True).groupby(keys, sort=True)["js_max"].max()
+    out = []
+    for key, g in h.groupby(keys, sort=True):
+        g = g.sort_values("bin")
+        cnt = g["cnt"].to_numpy()
+        edges = g["bin"].to_numpy()
+        total = cnt.sum()
+        cum = np.cumsum(cnt)
+        p95_bin = edges[np.searchsorted(cum, 0.95 * total)]
+        row = dict(zip(keys, key if isinstance(key, tuple) else (key,)))
+        row.update(js_p95=(p95_bin + 1) / N_BINS, n=int(total),
+                   js_frac_gt_0p1=float(cnt[edges >= 0.1 * N_BINS].sum() / total),
+                   js_frac_gt_0p5=float(cnt[edges >= 0.5 * N_BINS].sum() / total))
+        out.append(row)
+    df = pd.DataFrame(out)
+    df["js_max"] = mx.reindex(pd.MultiIndex.from_frame(df[keys]) if len(keys) > 1 else df[keys[0]]).to_numpy()
+    return df[keys + ["js_max", "js_p95", "js_frac_gt_0p1", "js_frac_gt_0p5", "n"]]
+
+
+def _finish_time(parts, keys):
+    df = pd.concat(parts, ignore_index=True).groupby(keys, sort=True).agg(
+        js_sum=("js_sum", "sum"), js_max=("js_max", "max"), top1_sum=("top1_sum", "sum"), n=("n", "sum")).reset_index()
+    df["attn_js"] = df["js_sum"] / df["n"]
+    df["attn_top1"] = df["top1_sum"] / df["n"]
+    return df[keys + ["attn_js", "js_max", "attn_top1", "n"]]
+
+
 def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
     stem = os.path.splitext(os.path.basename(path))[0]
-    by_sent, by_pos = [], []
+    by_sent, by_pos, hist, mx, by_time = [], [], [], [], []
     cfg = None
     for chunk in pd.read_csv(path, chunksize=chunksize):
         if cfg is None:
@@ -56,6 +96,17 @@ def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
         if len(t):
             t["pos_bin"] = (t["pos"] // pos_bin) * pos_bin
             _accumulate(by_pos, t, ["layer"] + cfg + ["pos_bin"], metrics)
+            skeys = ["group", "idx", "layer"] + cfg
+            t["bin"] = np.clip(np.floor(t["attn_js"].to_numpy() * N_BINS), 0, N_BINS - 1).astype(int)
+            hist.append(t.groupby(skeys + ["bin"], sort=False).size().rename("cnt").reset_index())
+            mx.append(t.groupby(skeys, sort=False)["attn_js"].max().rename("js_max").reset_index())
+            tkeys = ["group", "idx"] + cfg + ["pos_bin"]
+            g = t.groupby(tkeys, sort=False)
+            tt = g["attn_js"].sum().rename("js_sum").reset_index()
+            tt["js_max"] = g["attn_js"].max().to_numpy()
+            tt["top1_sum"] = g["attn_top1"].sum().to_numpy() if "attn_top1" in t.columns else 0.0
+            tt["n"] = g.size().to_numpy()
+            by_time.append(tt)
     if cfg is None:
         print(f"{path}: empty, skipped")
         return
@@ -64,7 +115,14 @@ def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
     b = _finish(by_pos, ["layer"] + cfg + ["pos_bin"], metrics)
     a.to_csv(os.path.join(out_dir, f"{stem}_bysent.csv"), index=False)
     b.to_csv(os.path.join(out_dir, f"{stem}_bypos.csv"), index=False)
-    print(f"{path}: {int(a['n'].sum())} raw rows -> {len(a)} by-sentence rows, {len(b)} by-position rows")
+    msg = f"{path}: {int(a['n'].sum())} raw rows -> {len(a)} by-sentence rows, {len(b)} by-position rows"
+    if hist:
+        c = _finish_steps(hist, mx, ["group", "idx", "layer"] + cfg)
+        d = _finish_time(by_time, ["group", "idx"] + cfg + ["pos_bin"])
+        c.to_csv(os.path.join(out_dir, f"{stem}_bystep.csv"), index=False)
+        d.to_csv(os.path.join(out_dir, f"{stem}_bytime.csv"), index=False)
+        msg += f", {len(c)} by-step rows, {len(d)} by-time rows"
+    print(msg)
 
 
 def main():

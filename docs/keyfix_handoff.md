@@ -35,9 +35,9 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
 
 ## Next steps, in order
 
-1. Per-step maximum. Extend `tools/reduce_keyfix_div.py` to also emit, per
-   (sentence, layer, config), the max and 95th percentile of `attn_js`, and a
-   per-(sentence, pos_bin) time course. Run on the box (CPU, minutes). Tests the
+1. Per-step maximum (done 2026-11-17: `tools/reduce_keyfix_div.py` now emits, per
+   (sentence, layer, config), `_bystep.csv` with max, p95 and threshold fractions, and
+   `_bytime.csv`, the per-sentence time course). Run on the box (CPU, minutes). Tests the
    "collapse is a single-step event" hypothesis.
 2. Seeds. On the box, ~5 GPU hours:
    `CELLS="g32 g32pre" CFGS="fp16,K3V3@0" SEEDS="1 2" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_seeds.log 2>&1 &`
