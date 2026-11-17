@@ -1,4 +1,4 @@
-# Key-fix experiment: handoff (2026-11-16)
+# Key-fix experiment: handoff (2026-11-17)
 
 Read this first when picking up `exp/keyfix-group-prerope` on a new machine.
 Run book with commands: `docs/keyfix_experiment.md`. Background and option
@@ -21,6 +21,17 @@ code-predictor artifact), g32 cuts layer 0 by 11x but layer 5 by only 2.4x,
 so layer 5 is the scaling-resistant layer. Plain divergence grows with decode
 position, g32 divergence does not (the drift signature).
 
+**Prompt protection (2026-11-17, cells pp / g32pp, same 50 sentences, seed 0,
+configs fp16/K2V2/K3V3):** keeping the prefill keys and values in fp16 and
+group-scaling the rest rescues 2-bit keys completely: g32pp K2V2 = 0/50
+collapses, CER 0.003, spk_sim 0.992 (fp16: CER 0.005); K3V3 the same. Neither
+fix alone does it (pp alone: K2V2 100%, K3V3 58% collapse; g32 alone: K2V2
+100%, K3V3 28%). Talker attn_js at K2V2: plain 0.248, g32 0.075, pp 0.164,
+g32pp 0.019; layer 5 falls from 0.225 (g32) to 0.036 (g32pp). Cost: the prefix
+is 44-67 keys and the sentences are 100-770 keys, so g32pp K2 is about 5 bits
+per key element pooled over this set (3.7 at 1000 keys). Full table and
+reading in `docs/keyfix_experiment.md`, "Results, prompt protection".
+
 ## Diagnostic results (15_qwen_keygauss.sh, 20 sentences, 2026-11-17)
 
 Table-1 analogue (32-token windows; Gaussian floor 96.9% / 0.215 / 0.149
@@ -41,8 +52,9 @@ Outputs on the box: results/keygauss_stats.csv, _layers.csv, _summary.md.
 ## Results on disk
 
 Laptop (not tracked by git): `results/keyfix/` = the downloaded archive
-(`results/qwen_keyfix_<cell>_scores.csv`, `results/keyfix_reduced/*_bysent.csv`
-and `*_bypos.csv`, `results/keyfix_summary.md`, `logs/`) plus the analysis
+(`results/qwen_keyfix_<cell>_scores.csv`, `results/keyfix_reduced/*_bysent.csv`,
+`*_bypos.csv`, `*_bystep.csv`, `*_bytime.csv`, `*_bylen.csv`,
+`results/keyfix_summary.md`, `logs/`) plus the analysis
 output `results/keyfix/keyfix_analysis.md` and `keyfix_layers.{png,pdf}` from
 `python tools/analyze_keyfix.py --root results/keyfix --out results/keyfix`.
 
@@ -69,19 +81,28 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
    `CELLS="g32 g32pre" CFGS="fp16,K3V3@0" SEEDS="1 2" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_seeds.log 2>&1 &`
    Settles whether g32pre's 6% is real. Then re-run the reducer, re-download,
    re-run `tools/analyze_keyfix.py`.
-2b. Prompt protection (implemented 2026-11-17: `TurboQuantConfig.protect_prefix`,
-   -1 = whole prefill; cells `pp` and `g32pp` in 03/14 scripts; wav segment
-   `_pp=prompt`, CSV column `protect_prefix`, config label `+pp`). Smoke:
-   `bash scripts/gpu/03_smoke_keyfix.sh` (all four cells, must PASS). Full:
-   `CELLS="pp g32pp" CFGS="fp16,K2V2@0,K3V3@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pp.log 2>&1 &`
-   Honest bit accounting: (P*16 + (S-P)*b)/S per element, P = 44-67 here.
+2b. Prompt protection: DONE 2026-11-17 (`TurboQuantConfig.protect_prefix`,
+   -1 = whole prefill, N > 0 fixed; cells `pp` and `g32pp` in 03/14 scripts;
+   wav segment `_pp=prompt` / `_pp=N`, CSV column `protect_prefix`, config
+   label `+pp` / `+ppN`). Result: g32pp rescues K2V2 completely (see "State").
+   Still to do for it: run the reducer on the box, download, rerun
+   `tools/analyze_keyfix.py` (section 8 = effective bits from `_bylen.csv`),
+   and listen to a few `keyfix_g32pp` wavs.
+2c. Prefix sweep (next GPU job, ~2 h per N): `protect_prefix` 4 / 16 / 32 with
+   g32 at K2V2 separates an attention-sink effect (N = 4 enough) from the
+   reference-audio keys (only the full prompt works) and finds the cheapest
+   rescue. Needs a `g32ppN` cell in `14_qwen_keyfix.sh` (one line each, copy
+   the `g32pp` case with `--protect-prefix N`); the wav suffix, scorer and
+   summariser already handle fixed N. Also a matched-budget control: plain
+   K4V2 and K4V4 at rw=0 from the main grid, so the thesis can say what
+   ~4-5 effective key bits buy without the mechanism.
 3. Query-aware key rotation (the 2-bit candidate, from OSCAR arXiv:2605.17757
    and NOVA-KV arXiv:2608.04074): calibrate the query second moment per
    (layer, KV head) on ~20 sentences, rotate keys into its eigenbasis instead
    of the random rotation. Needs an optional rotation override in
    `turboquant/compressors_v3.py` (ask before editing the library) and a
-   calibration tool. Also worth trying: keep the first 64 prompt tokens in
-   fp16 (sink protection) as a cheap cache-only change.
+   calibration tool. Lower priority now that g32pp rescues K2: its value is
+   a metadata-free alternative to protecting the prompt.
 4. Optional: VALL-E-X with `--key-group 32` to confirm it does not hurt the
    model that was already fine.
 

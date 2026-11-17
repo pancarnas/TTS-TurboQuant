@@ -141,7 +141,7 @@ The raw divergence CSVs are ~750 MB each (15 M rows) and the JupyterLab file
 browser truncates downloads at 24 MiB. Reduce first, then split:
 
 ```
-$PY tools/reduce_keyfix_div.py            # -> results/keyfix_reduced/*_bysent.csv, *_bypos.csv
+$PY tools/reduce_keyfix_div.py            # -> results/keyfix_reduced/*_bysent.csv, *_bypos.csv, *_bystep.csv, *_bytime.csv, *_bylen.csv
 ls results | grep keyfix | grep -v seed0 | sed s,^,results/, > keyfix_list.txt
 ls results/keyfix_reduced | sed s,^,results/keyfix_reduced/, >> keyfix_list.txt
 ls logs | grep keyfix | sed s,^,logs/, >> keyfix_list.txt
@@ -192,3 +192,57 @@ What it says
 - Along the sequence: plain divergence grows with decode position (layer 0:
   0.26 at <64 steps to 0.47 at 512+), the drift signature; under g32 it falls
   with position (0.020 to 0.007). Group scaling removes the length dependence.
+
+## Results, prompt protection, seed 0, 50 sentences (2026-11-17)
+
+Cells `pp` (whole prefill kept in fp16, `protect_prefix=-1`) and `g32pp`
+(same plus group scaling), configs fp16/K2V2/K3V3, same sentences and seed as
+above, so every comparison is paired.
+
+| config | plain | g32 | pp | g32pp |
+|---|---|---|---|---|
+| K2V2 collapse % | 100 | 100 | 100 | 0 |
+| K2V2 CER | 1.04 | 0.95 | 1.00 | 0.003 |
+| K2V2 spk_sim | 0.69 | 0.73 | 0.82 | 0.992 |
+| K3V3 collapse % | 100 | 28 | 58 | 0 |
+| K3V3 CER | 0.99 | 0.31 | 0.74 | 0.004 |
+| K3V3 spk_sim | 0.73 | 0.93 | 0.92 | 0.992 |
+| K2V2 talker attn_js | 0.248 | 0.075 | 0.164 | 0.019 |
+| K2V2 talker attn_top1 | 0.42 | 0.62 | 0.71 | 0.89 |
+| K3V3 talker attn_js | 0.110 | 0.014 | 0.073 | 0.003 |
+| K2V2 layer-5 attn_js | 0.546 | 0.225 | 0.440 | 0.036 |
+
+fp16 reference: CER 0.005. g32pp at K2V2 is indistinguishable from fp16 on
+every audio metric.
+
+What it says
+
+- Neither fix alone rescues 2-bit keys; the two together rescue them
+  completely (0/50 collapses, CER 0.003, spk_sim 0.992 at K2V2, and the same
+  at K3V3). Prompt protection alone is the weaker single fix (K3V3 collapse
+  58% vs 28% for g32).
+- The two fixes act on different keys. g32 repairs the generated keys (their
+  per-coordinate range drifts, section "Gaussianity diagnostic" in the
+  handoff); the prompt keys do not drift but carry 23-73% of the attention
+  mass, and a 2-bit code of them with the fixed codebook is what the g32 cells
+  were still missing. Layer 5, the g32-resistant layer, drops from 0.225 to
+  0.036 once the prompt is exact, which matches the diagnostic's reading that
+  its low-rank queries point at the prompt.
+- Mean divergence still does not predict collapse across cells: pp at K3V3
+  has lower attn_js than plain (0.073 vs 0.110) and higher top-1 agreement
+  (0.80 vs 0.58) yet collapses in 58% of sentences; g32 at K3V3 with top-1
+  0.79 collapses in 28%. Collapse remains a threshold event on something the
+  means do not capture.
+- Bit accounting (section 8 of `keyfix_analysis.md` once the `_bylen.csv`
+  files are reduced). The prefix is 44-67 keys and these LibriSpeech sentences
+  are short (100-770 keys in total), so at K2 the g32pp cell costs about 5
+  bits per key element pooled over the 50 sentences (2 code + 1 group metadata
+  + the fp16 prefix), falling toward 3.7 for 1000-key sequences. The honest
+  comparison is therefore against plain 4-bit keys at the same budget, and
+  the honest claim is a mechanism claim: the 2-bit failure lives in the prompt
+  keys plus the drift of the generated keys, not in the generated keys alone.
+- Next cells to separate "prompt" from "sink" and to shrink the cost:
+  `protect_prefix` 4 / 16 / 32 (fixed N) with g32 at K2V2. If N = 4 already
+  rescues, it is an attention-sink effect; if only the full prompt does, the
+  reference audio keys are the carrier.
+

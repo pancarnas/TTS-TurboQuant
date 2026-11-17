@@ -1,9 +1,10 @@
-"""Paired analysis of a 14_qwen_keyfix.sh run (plain / g32 / pre / g32pre cells).
+"""Paired analysis of a 14_qwen_keyfix.sh run (plain / g32 / pre / g32pre / pp / g32pp cells).
 
 Inputs (a downloaded archive, see docs/keyfix_experiment.md):
   <root>/results/qwen_keyfix_<cell>_scores.csv                 audio scores
   <root>/results/keyfix_reduced/qwen_keyfix_<cell>_seed*_bysent.csv
   <root>/results/keyfix_reduced/qwen_keyfix_<cell>_seed*_bypos.csv
+  <root>/results/keyfix_reduced/qwen_keyfix_<cell>_seed*_bylen.csv   (optional, bit accounting)
       (from tools/reduce_keyfix_div.py; talker-only rows are talker == 1)
 
 Outputs:
@@ -21,11 +22,15 @@ import numpy as np
 import pandas as pd
 from scipy.stats import binomtest, mannwhitneyu, wilcoxon
 
-CELLS = ["plain", "g32", "pre", "g32pre"]
-CELL_LABEL = {"plain": "plain", "g32": "g32", "pre": "pre-RoPE", "g32pre": "g32 + pre-RoPE"}
-# validated default categorical palette (dataviz skill), fixed order; markers = second encoding
+CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp"]
+CELL_LABEL = {"plain": "plain", "g32": "g32", "pre": "pre-RoPE", "g32pre": "g32 + pre-RoPE",
+              "pp": "prompt fp16", "g32pp": "g32 + prompt fp16"}
+# fixed categorical order; markers and line styles are the second encoding
 CELL_STYLE = {"plain": ("#2a78d6", "o", "-"), "g32": ("#eb6834", "s", "-"),
-              "pre": ("#1baf7a", "^", "--"), "g32pre": ("#eda100", "D", "--")}
+              "pre": ("#1baf7a", "^", "--"), "g32pre": ("#eda100", "D", "--"),
+              "pp": ("#8a5cf5", "v", ":"), "g32pp": ("#c8398a", "P", "-.")}
+PAIRS = [("plain", "g32"), ("plain", "pre"), ("plain", "pp"), ("g32", "g32pre"), ("pre", "g32pre"),
+         ("g32", "g32pp"), ("pp", "g32pp"), ("g32pre", "g32pp")]
 METRICS = ["attn_js", "attn_top1", "out_cos", "cos_k", "relmse_k"]
 
 
@@ -35,7 +40,7 @@ def wmean(g, cols):
 
 
 def load(root):
-    scores, div, pos = {}, {}, {}
+    scores, div, pos, lens = {}, {}, {}, {}
     for c in CELLS:
         p = os.path.join(root, "results", f"qwen_keyfix_{c}_scores.csv")
         if not os.path.exists(p):
@@ -51,7 +56,17 @@ def load(root):
             div[c] = div[c][div[c]["talker"] == 1]
         if bp:
             pos[c] = pd.concat([pd.read_csv(x) for x in bp], ignore_index=True)
-    return scores, div, pos
+        bl = sorted(glob.glob(os.path.join(root, "results", "keyfix_reduced", f"qwen_keyfix_{c}_seed*_bylen.csv")))
+        if bl:
+            lens[c] = pd.concat([pd.read_csv(x) for x in bl], ignore_index=True)
+    return scores, div, pos, lens
+
+
+def effective_bits(bits, meta_bits, prefix_fp16, P, S):
+    """Pooled bits per element over sentences: fp16 for the protected prefix, codes + metadata for the rest.
+    Ignores the per-vector fp16 norm (same in every cell)."""
+    P = np.minimum(P, S) if prefix_fp16 else np.zeros_like(S)
+    return float((16.0 * P.sum() + (bits + meta_bits) * (S - P).sum()) / S.sum())
 
 
 def cfg_label(kb, vb):
@@ -77,7 +92,7 @@ def main():
     ap.add_argument("--root", default="results/keyfix")
     ap.add_argument("--out", default="results/keyfix")
     args = ap.parse_args()
-    scores, div, pos = load(args.root)
+    scores, div, pos, lens = load(args.root)
     os.makedirs(args.out, exist_ok=True)
     L = []
 
@@ -99,7 +114,7 @@ def main():
           "| config | A | B | both | A only | B only | neither | p (two-sided binomial on A-only vs B-only) |", "|---|---|---|---|---|---|---|---|"]
     for base in sorted(S["base"].unique()):
         P = S[S["base"] == base].pivot(index="idx", columns="cell", values="collapse")
-        for a, b in [("plain", "g32"), ("plain", "pre"), ("g32", "g32pre"), ("pre", "g32pre")]:
+        for a, b in PAIRS:
             if a not in P or b not in P:
                 continue
             both = int(((P[a] == 1) & (P[b] == 1)).sum()); ao = int(((P[a] == 1) & (P[b] == 0)).sum())
@@ -151,17 +166,25 @@ def main():
         L.append(f"| {c} | {int(s.sum())} | {a.mean():.4f} | {b.mean():.4f} | {m5[s[s == 1].index].mean():.4f} | {m5[s[s == 0].index].mean():.4f} | {p:.3f} |")
     L.append("")
 
-    # ---- 6. per-sentence paired divergence plain vs g32 --------------------
-    if "plain" in div and "g32" in div:
-        L += ["## 6. Paired per-sentence attn_js, plain vs g32 (talker, all layers)", "", "| config | plain mean | g32 mean | sentences improved | Wilcoxon p |", "|---|---|---|---|---|"]
-        for (kb, vb) in sorted({(int(a), int(b)) for a, b in zip(div["plain"].key_bits, div["plain"].value_bits)}):
+    # ---- 6. per-sentence paired divergence between cells ------------------
+    L += ["## 6. Paired per-sentence attn_js between cells (talker, all layers)", "",
+          "| pair | config | A mean | B mean | sentences improved | Wilcoxon p |", "|---|---|---|---|---|---|"]
+    for a, b in [("plain", "g32"), ("plain", "pp"), ("g32", "g32pp"), ("pp", "g32pp"), ("g32pre", "g32pp")]:
+        if a not in div or b not in div:
+            continue
+        cfgs = sorted({(int(x), int(y)) for x, y in zip(div[a].key_bits, div[a].value_bits)}
+                      & {(int(x), int(y)) for x, y in zip(div[b].key_bits, div[b].value_bits)})
+        for (kb, vb) in cfgs:
             ms = {}
-            for c in ("plain", "g32"):
+            for c in (a, b):
                 d = div[c]; d = d[(d.key_bits == kb) & (d.value_bits == vb)]
                 ms[c] = d.groupby("idx").apply(lambda g: wmean(g, ["attn_js"]), include_groups=False)["attn_js"]
             j = pd.concat(ms, axis=1).dropna()
-            L.append(f"| {cfg_label(kb, vb)} | {j['plain'].mean():.4f} | {j['g32'].mean():.4f} | {int((j['g32'] < j['plain']).sum())}/{len(j)} | {wilcoxon(j['plain'], j['g32']).pvalue:.2e} |")
-        L.append("")
+            if len(j) < 5:
+                continue
+            L.append(f"| {a} vs {b} | {cfg_label(kb, vb)} | {j[a].mean():.4f} | {j[b].mean():.4f} | "
+                     f"{int((j[b] < j[a]).sum())}/{len(j)} | {wilcoxon(j[a], j[b]).pvalue:.2e} |")
+    L.append("")
 
     # ---- 7. divergence along the sequence ---------------------------------
     if pos:
@@ -181,6 +204,29 @@ def main():
                 L.append(f"| {c} | {layer} | " + " | ".join(f"{g.get(n, float('nan')):.4f}" for n in names) + " |")
         L.append("")
 
+    # ---- 8. effective bits per element (prompt protection + group metadata) --
+    if lens:
+        L += ["## 8. Effective bits per cache element (codes + group metadata + fp16 prefix; per-vector norm excluded)", "",
+              "Pooled over the 50 sentences: (16 P + b_eff (S - P)) / S with P = protected prompt keys, S = all keys. "
+              "'at S=1000' re-evaluates the same formula for a 1000-key sequence with the same prompts.", "",
+              "| cell | config | prompt P (min/mean/max) | S (min/mean/max) | key bits | value bits | key bits at S=1000 |",
+              "|---|---|---|---|---|---|---|"]
+        for c in CELLS:
+            if c not in lens:
+                continue
+            d = lens[c]
+            for (kb, vb), g in d.groupby(["key_bits", "value_bits"]):
+                P = g["prompt_len"].to_numpy().astype(float); S = g["seq_len"].to_numpy().astype(float)
+                pp = int(g["protect_prefix"].fillna(0).iloc[0]) if "protect_prefix" in g else 0
+                Pp = P if pp < 0 else np.minimum(P, float(pp))
+                meta = 1.0 if int(g["key_group"].iloc[0]) > 0 else 0.0
+                kbits = effective_bits(int(kb), meta, pp != 0, Pp, S)
+                vbits = effective_bits(int(vb), 0.0, pp != 0, Pp, S)
+                k1000 = effective_bits(int(kb), meta, pp != 0, Pp, np.full_like(S, 1000.0))
+                L.append(f"| {c} | {cfg_label(int(kb), int(vb))} | {int(P.min())}/{P.mean():.0f}/{int(P.max())} | "
+                         f"{int(S.min())}/{S.mean():.0f}/{int(S.max())} | {kbits:.2f} | {vbits:.2f} | {k1000:.2f} |")
+        L.append("")
+
     with open(os.path.join(args.out, "keyfix_analysis.md"), "w") as f:
         f.write("\n".join(L))
     print("\n".join(L))
@@ -190,6 +236,9 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     keys = [k for k in ("K2V2", "K3V3") if k in layer_tabs]
+    if not keys:
+        print("no divergence tables, figure skipped")
+        return
     fig, axes = plt.subplots(1, len(keys), figsize=(4.2 * len(keys), 3.4), sharey=False)
     axes = np.atleast_1d(axes)
     for ax, k in zip(axes, keys):

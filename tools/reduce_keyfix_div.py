@@ -13,6 +13,11 @@ to download from the GPU box.  This writes, per raw file:
   <out>/<stem>_bytime.csv  talker-only per (group, idx, config, pos_bin): mean
                            and max of attn_js over layers and steps in the bin
                            (the per-sentence time course)
+  <out>/<stem>_bylen.csv   per (group, idx, config): prompt_len (pos of the
+                           talker prefill row = number of prompt keys), seq_len
+                           (last pos = prompt + generated keys) and the number
+                           of recorded talker steps; needed for the effective
+                           bits of the protect_prefix cells
 
 `talker` is pos >= --talker-min-pos (33), the same split tools/summarize_keyfix.py
 uses to drop code-predictor rows.  Both tables are exact means of the raw rows,
@@ -28,7 +33,7 @@ import os
 import numpy as np
 import pandas as pd
 
-CFG = ["key_bits", "value_bits", "rw", "protected_layers", "key_group", "pre_rope"]
+CFG = ["key_bits", "value_bits", "rw", "protected_layers", "key_group", "pre_rope", "protect_prefix"]
 METRICS = ["attn_js", "attn_tv", "attn_top1", "attn_dentropy", "out_cos",
            "cos_k", "cos_v", "relmse_k", "relmse_v"]
 
@@ -84,7 +89,7 @@ def _finish_time(parts, keys):
 
 def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
     stem = os.path.splitext(os.path.basename(path))[0]
-    by_sent, by_pos, hist, mx, by_time = [], [], [], [], []
+    by_sent, by_pos, hist, mx, by_time, by_len = [], [], [], [], [], []
     cfg = None
     for chunk in pd.read_csv(path, chunksize=chunksize):
         if cfg is None:
@@ -107,6 +112,12 @@ def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
             tt["top1_sum"] = g["attn_top1"].sum().to_numpy() if "attn_top1" in t.columns else 0.0
             tt["n"] = g.size().to_numpy()
             by_time.append(tt)
+            lkeys = ["group", "idx"] + cfg
+            gl = t.groupby(lkeys, sort=False)["pos"]
+            ll = gl.min().rename("prompt_len").reset_index()
+            ll["seq_len"] = gl.max().to_numpy()
+            ll["n_steps"] = gl.size().to_numpy()
+            by_len.append(ll)
     if cfg is None:
         print(f"{path}: empty, skipped")
         return
@@ -121,7 +132,11 @@ def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
         d = _finish_time(by_time, ["group", "idx"] + cfg + ["pos_bin"])
         c.to_csv(os.path.join(out_dir, f"{stem}_bystep.csv"), index=False)
         d.to_csv(os.path.join(out_dir, f"{stem}_bytime.csv"), index=False)
-        msg += f", {len(c)} by-step rows, {len(d)} by-time rows"
+        lk = ["group", "idx"] + cfg
+        e = (pd.concat(by_len, ignore_index=True).groupby(lk, sort=True)
+             .agg(prompt_len=("prompt_len", "min"), seq_len=("seq_len", "max"), n_steps=("n_steps", "sum")).reset_index())
+        e.to_csv(os.path.join(out_dir, f"{stem}_bylen.csv"), index=False)
+        msg += f", {len(c)} by-step rows, {len(d)} by-time rows, {len(e)} by-length rows"
     print(msg)
 
 
