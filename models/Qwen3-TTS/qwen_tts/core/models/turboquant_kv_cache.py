@@ -138,6 +138,10 @@ class TurboQuantKVCache(DynamicCache):
         # (track_only=False). Independent of the placeholder bookkeeping so
         # group-rounded spans can never desynchronise it.
         self._compressed_upto: dict[int, int] = {}
+        # Protected prefix per layer (config.protect_prefix): -1 resolves to the
+        # prefill length on the layer's first update(); positions [0, prefix)
+        # are never compressed and are counted as fp16 in memory_report().
+        self._prefix_len: dict[int, int] = {}
 
         # Lazy per-layer compressor (only instantiated when track_only=False).
         self._compressors: dict[int, TurboQuantV3] = {}
@@ -266,13 +270,15 @@ class TurboQuantKVCache(DynamicCache):
         """Run actual compression on tokens that fell outside the residual window.
 
         With ``config.key_group`` > 0 the span end is rounded DOWN to a multiple
-        of the group so every compressed block is a whole group aligned to
-        position 0; the partial tail stays fp16 until its group fills.
+        of the group so every compressed block is a whole group aligned to the
+        start of the compressible region (position 0, or the end of the
+        protected prefix); the partial tail stays fp16 until its group fills.
         """
         rw = self.config.residual_window
-        if new_total_len <= rw:
+        pfx = self._prefix_len.get(layer_idx, 0)
+        if new_total_len <= rw + pfx:
             return
-        already_compressed = self._compressed_upto.get(layer_idx, 0)
+        already_compressed = max(self._compressed_upto.get(layer_idx, 0), pfx)
         want_compressed_upper = new_total_len - rw
         g = self.config.key_group
         if g > 0:
@@ -348,6 +354,9 @@ class TurboQuantKVCache(DynamicCache):
         needed = s + n
 
         self._ensure_capacity(layer_idx, needed, template=key_states)
+        if s == 0:  # first update of this layer = the prefill
+            pp = int(self.config.protect_prefix)
+            self._prefix_len[layer_idx] = n if pp < 0 else max(pp, 0)
 
         # Single slice-write — no cat, no per-step dtype conversion.
         self._buf_k[layer_idx][:, :, s : s + n, :].copy_(key_states)
@@ -364,9 +373,10 @@ class TurboQuantKVCache(DynamicCache):
         # Track virtual chunk spans for memory_report / test introspection.
         # One placeholder per overflow event (matches legacy chunk-per-overflow count).
         rw = self.config.residual_window
-        if needed > rw:
+        pfx = self._prefix_len.get(layer_idx, 0)
+        if needed > rw + pfx:
             prev_compressed = sum(c.get("span", 0) for c in self._chunks_k[layer_idx])
-            want_compressed = needed - rw
+            want_compressed = needed - rw - pfx
             new_span = want_compressed - prev_compressed
             if new_span > 0:
                 self._chunks_k[layer_idx].append({"span": new_span})
@@ -443,7 +453,8 @@ class TurboQuantKVCache(DynamicCache):
             fp16_equiv += 2 * B * H * cur_len * D * 2  # fp16 = 2 bytes
 
             kb, vb = self._layer_bit_widths(layer_idx)
-            rw = min(self.config.residual_window, cur_len)
+            # fp16 tokens = protected prefix + residual window (both exact).
+            rw = min(self.config.residual_window + self._prefix_len.get(layer_idx, 0), cur_len)
             compressed_tokens = max(cur_len - rw, 0)
 
             # Simulated: what compression WOULD store = compressed chunks + fp16

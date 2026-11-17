@@ -69,10 +69,12 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
    `CELLS="g32 g32pre" CFGS="fp16,K3V3@0" SEEDS="1 2" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_seeds.log 2>&1 &`
    Settles whether g32pre's 6% is real. Then re-run the reducer, re-download,
    re-run `tools/analyze_keyfix.py`.
-2b. Prompt protection: keep the first P (prompt) positions of the cache in
-   fp16 (config field + cache change; library edit, ask first). One cell each
-   at K2V2 and K3V3, 50 sentences, seed 0. Honest bit accounting:
-   (P*16 + (S-P)*b)/S per element.
+2b. Prompt protection (implemented 2026-11-17: `TurboQuantConfig.protect_prefix`,
+   -1 = whole prefill; cells `pp` and `g32pp` in 03/14 scripts; wav segment
+   `_pp=prompt`, CSV column `protect_prefix`, config label `+pp`). Smoke:
+   `bash scripts/gpu/03_smoke_keyfix.sh` (all four cells, must PASS). Full:
+   `CELLS="pp g32pp" CFGS="fp16,K2V2@0,K3V3@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pp.log 2>&1 &`
+   Honest bit accounting: (P*16 + (S-P)*b)/S per element, P = 44-67 here.
 3. Query-aware key rotation (the 2-bit candidate, from OSCAR arXiv:2605.17757
    and NOVA-KV arXiv:2608.04074): calibrate the query second moment per
    (layer, KV head) on ~20 sentences, rotate keys into its eigenbasis instead

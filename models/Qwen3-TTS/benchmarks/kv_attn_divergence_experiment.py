@@ -80,6 +80,7 @@ COLUMNS = [
     "protected_layers",
     "key_group",
     "pre_rope",
+    "protect_prefix",
     "attn_js",
     "attn_tv",
     "attn_top1",
@@ -90,7 +91,7 @@ COLUMNS = [
     "relmse_k",
     "relmse_v",
 ]
-_N_ID = 10  # id/config columns before the metrics
+_N_ID = 11  # id/config columns before the metrics
 _METRICS = COLUMNS[_N_ID:]
 
 _CFG_RE = re.compile(r"[Kk](\d+)[Vv](\d+)@(\d+)$")
@@ -127,6 +128,7 @@ def make_config(
     protected_layers: int = 2,
     key_group: int = 0,
     pre_rope_keys: bool = False,
+    protect_prefix: int = 0,
 ) -> TurboQuantConfig:
     """A config with REAL on-path compression (track_only=False).
 
@@ -145,6 +147,7 @@ def make_config(
         track_only=False,
         key_group=key_group,
         pre_rope_keys=pre_rope_keys,
+        protect_prefix=protect_prefix,
     )
 
 
@@ -198,7 +201,7 @@ class DivergenceRecorder:
     """Per-(layer, pos, config) attention + KV divergence during one fp16 pass."""
 
     def __init__(self, specs, n_layers, prot_layers, prot_bits, stride,
-                 key_group: int = 0, pre_rope: bool = False):
+                 key_group: int = 0, pre_rope: bool = False, protect_prefix: int = 0):
         self.specs = specs  # list of (key_bits, value_bits, rw)
         self.n_layers, self.pl, self.pb, self.stride = (
             n_layers,
@@ -208,6 +211,11 @@ class DivergenceRecorder:
         )
         self.key_group = int(key_group)
         self.pre_rope = bool(pre_rope)
+        # protect_prefix: -1 = the prefill length of each attention class
+        # (learned on the prefill call), N > 0 = fixed; the first `prefix`
+        # positions are spliced back in fp16 after compress/decompress.
+        self.protect_prefix = int(protect_prefix)
+        self._prefix: dict = {}
         self.active = False
         self.rows: list[tuple] = []
         self.errors = 0
@@ -265,10 +273,22 @@ class DivergenceRecorder:
         self._rope_buf[name] = buf
         return buf
 
+    def _prefix_len(self, module, query, pos):
+        """Protected prefix for this module's sequence (0 when off)."""
+        if self.protect_prefix == 0:
+            return 0
+        if self.protect_prefix > 0:
+            return min(self.protect_prefix, pos)
+        name = type(module).__name__
+        if query.shape[2] == pos:  # prefill (or restart): the prompt length
+            self._prefix[name] = pos
+        return min(self._prefix.get(name, 0), pos)
+
     def record(self, module, query, key, value, attention_mask, scaling):
         pos = key.shape[2]
         if self.pre_rope:  # must see EVERY step, even the ones the stride skips
             cos, sin = self._rope_tables(module, pos)
+        pfx = self._prefix_len(module, query, pos)  # must see every step too
         if self.stride > 1 and (pos % self.stride) != 0:
             return
         head_dim = key.shape[-1]
@@ -296,21 +316,24 @@ class DivergenceRecorder:
             rk, rv = comp.decompress_kv(ck, cv)
             if rope is not None:  # back to post-RoPE space for the attention map
                 rk = rope_keys(rk.to(key.dtype), inverse=False, **rope)
+            if pfx > 0:  # protected prefix: exact fp16 keys AND values
+                rk = torch.cat([key[:, :, :pfx].to(rk.dtype), rk[:, :, pfx:]], dim=2)
+                rv = torch.cat([value[:, :, :pfx].to(rv.dtype), rv[:, :, pfx:]], dim=2)
             ac = compressed_attention(query, rk, groups, attention_mask, scaling)
             o_fp16 = torch.matmul(af, modeling.repeat_kv(value, groups).float())
             o_comp = torch.matmul(ac, modeling.repeat_kv(rv, groups).float())
             # KV recon on the compressed prefix only — the last rw tokens are
             # bit-exact fp16 and would dilute the error as S grows past rw.
             split_at = max(pos - rw, 0)
-            if split_at == 0:  # nothing compressed at this position
+            if split_at <= pfx:  # nothing compressed at this position
                 cos_k = cos_v = 1.0
                 relmse_k = relmse_v = 0.0
             else:
                 cos_k, relmse_k = _kv_recon_errors(
-                    key[:, :, :split_at], rk[:, :, :split_at], head_dim
+                    key[:, :, pfx:split_at], rk[:, :, pfx:split_at], head_dim
                 )
                 cos_v, relmse_v = _kv_recon_errors(
-                    value[:, :, :split_at], rv[:, :, :split_at], head_dim
+                    value[:, :, pfx:split_at], rv[:, :, pfx:split_at], head_dim
                 )
             self.rows.append(
                 (
@@ -324,6 +347,7 @@ class DivergenceRecorder:
                     self.pl,
                     self.key_group,
                     int(self.pre_rope),
+                    self.protect_prefix,
                     js_divergence(af, ac),
                     total_variation(af, ac),
                     top1_agreement(af, ac),
@@ -401,7 +425,7 @@ def force_eager(model) -> None:
 def accumulate_running(running: dict, rows: list) -> None:
     """Fold streamed rows into per-config running sums (bounded memory)."""
     for r in rows:
-        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw); r[7..9] = pl, key_group, pre_rope
+        cfg = (r[4], r[5], r[6])  # (key_bits, value_bits, rw); r[7..10] = pl, key_group, pre_rope, protect_prefix
         d = running.setdefault(cfg, dict({"_n": 0}, **{m: 0.0 for m in _METRICS}))
         d["_n"] += 1
         for m, v in zip(_METRICS, r[_N_ID:]):
@@ -429,12 +453,13 @@ def running_frame(running: dict) -> pd.DataFrame:
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     """Offline: per-config means from a streamed CSV."""
     keys = ["key_bits", "value_bits", "rw", "protected_layers"]
-    keys += [c for c in ("key_group", "pre_rope") if c in df.columns]
+    keys += [c for c in ("key_group", "pre_rope", "protect_prefix") if c in df.columns]
     return df.groupby(keys)[_METRICS].mean().sort_index()
 
 
-def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group=0, pre_rope=False):
-    # fp16 carries no _pl/_g/_pre segment: none of them apply to uncompressed
+def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group=0, pre_rope=False,
+              protect_prefix=0):
+    # fp16 carries no _pl/_g/_pre/_pp segment: none of them apply to uncompressed
     # generation, so runs at different settings share one baseline wav.
     if kb is None:
         cfg = "fp16"
@@ -444,10 +469,13 @@ def _wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group=0, pre_
             cfg += f"_g={key_group}"
         if pre_rope:
             cfg += "_pre"
+        if protect_prefix:
+            cfg += "_pp=prompt" if protect_prefix < 0 else f"_pp={protect_prefix}"
     return os.path.join(out_dir, f"qwen_{group}_{idx}_sampling_s{seed}_t{temp}_{cfg}.wav")
 
 
-def load_done(out_path: str, protected_layers: int, key_group: int = 0, pre_rope: bool = False) -> set:
+def load_done(out_path: str, protected_layers: int, key_group: int = 0, pre_rope: bool = False,
+              protect_prefix: int = 0) -> set:
     """(group, idx) pairs already recorded in a divergence CSV (for --resume).
 
     Only rows recorded under the SAME ``protected_layers`` (and, when the CSV
@@ -461,7 +489,7 @@ def load_done(out_path: str, protected_layers: int, key_group: int = 0, pre_rope
     try:
         header = pd.read_csv(out_path, nrows=0).columns
         cols = ["group", "idx", "protected_layers"] + [
-            c for c in ("key_group", "pre_rope") if c in header
+            c for c in ("key_group", "pre_rope", "protect_prefix") if c in header
         ]
         df = pd.read_csv(out_path, usecols=cols)
     except ValueError as exc:
@@ -474,6 +502,10 @@ def load_done(out_path: str, protected_layers: int, key_group: int = 0, pre_rope
         df = df[df["key_group"] == key_group]
     if "pre_rope" in df.columns:
         df = df[df["pre_rope"] == int(pre_rope)]
+    if "protect_prefix" in df.columns:
+        df = df[df["protect_prefix"] == int(protect_prefix)]
+    elif protect_prefix:  # pre-flag CSV holds no protected rows
+        return set()
     return set(zip(df["group"].astype(str), df["idx"].astype(int)))
 
 
@@ -482,10 +514,12 @@ def pending_items(items: list, done: set) -> list:
     return [t for t in items if (str(t[0]), int(t[1])) not in done]
 
 
-def audio_done(out_dir, group, idx, seed, temp, specs, pl, key_group=0, pre_rope=False) -> bool:
+def audio_done(out_dir, group, idx, seed, temp, specs, pl, key_group=0, pre_rope=False,
+               protect_prefix=0) -> bool:
     """True iff every config's wav for this sentence already exists (audio resume)."""
     return all(
-        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group, pre_rope))
+        os.path.exists(_wav_path(out_dir, group, idx, seed, temp, kb, vb, rw, pl, key_group, pre_rope,
+                                 protect_prefix))
         for kb, vb, rw in specs
     )
 
@@ -530,12 +564,14 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     args.protected_layers,
                     args.key_group,
                     args.pre_rope_keys,
+                    args.protect_prefix,
                 )
             ]
         else:
             items = pending_items(
                 items,
-                load_done(args.out, args.protected_layers, args.key_group, args.pre_rope_keys),
+                load_done(args.out, args.protected_layers, args.key_group, args.pre_rope_keys,
+                          args.protect_prefix),
             )
         print(f"resume: skipping {n0 - len(items)} done, running {len(items)}")
 
@@ -568,7 +604,8 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     None
                     if kb is None
                     else make_config(
-                        kb, vb, rw, args.protected_layers, args.key_group, args.pre_rope_keys
+                        kb, vb, rw, args.protected_layers, args.key_group, args.pre_rope_keys,
+                        args.protect_prefix,
                     ),
                     seed=args.seed,
                     gen_overrides=decode_overrides(
@@ -590,6 +627,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                         args.protected_layers,
                         args.key_group,
                         args.pre_rope_keys,
+                        args.protect_prefix,
                     ),
                     wavs[0],
                     sr,
@@ -669,6 +707,14 @@ def main() -> None:
         "re-applied to the reconstruction). Run-wide: wavs get a _pre segment, "
         "rows a pre_rope column.",
     )
+    parser.add_argument(
+        "--protect-prefix",
+        type=int,
+        default=0,
+        help="Keep the first N cache positions (keys and values) in fp16: -1 = the "
+        "whole prefill (the prompt), N > 0 = fixed count, 0 = off. Run-wide: wavs "
+        "get a _pp=prompt / _pp=<N> segment, rows a protect_prefix column.",
+    )
     parser.add_argument("--step-stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.9)
@@ -707,7 +753,7 @@ def main() -> None:
     print(
         f"key-fix: key_group={args.key_group} "
         f"({'group min-max key scaling' if args.key_group else 'fixed codebook'}), "
-        f"pre_rope_keys={args.pre_rope_keys}"
+        f"pre_rope_keys={args.pre_rope_keys}, protect_prefix={args.protect_prefix}"
     )
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=args.device, dtype=dtype
@@ -720,7 +766,7 @@ def main() -> None:
     d = TurboQuantConfig()  # for protected_bits (8-bit); protected_layers from CLI
     recorder = DivergenceRecorder(
         specs, n_layers, args.protected_layers, d.protected_bits, args.step_stride,
-        key_group=args.key_group, pre_rope=args.pre_rope_keys,
+        key_group=args.key_group, pre_rope=args.pre_rope_keys, protect_prefix=args.protect_prefix,
     )
 
     if args.no_divergence:  # audio-only: no eager-forcing, no patch, no recording

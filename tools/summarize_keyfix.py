@@ -19,11 +19,12 @@ import glob
 import os
 
 COLLAPSE_CER = 0.5
-CELLS = ["plain", "g32", "pre", "g32pre"]
+CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp"]
 
 
-def _label(kb, vb, rw, kg, pre):
-    return f"K{int(kb)}V{int(vb)}@{int(rw)}" + (f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "")
+def _label(kb, vb, rw, kg, pre, pp=0):
+    return (f"K{int(kb)}V{int(vb)}@{int(rw)}" + (f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "")
+            + ("" if not pp else ("+pp" if int(pp) < 0 else f"+pp{int(pp)}")))
 
 
 def _md(df, floatfmt=".3f", index=False) -> str:
@@ -109,7 +110,7 @@ def main() -> None:
             paths = [args.plain_div]
         for p in paths:
             d = pd.read_csv(p)
-            for c in ("key_group", "pre_rope"):
+            for c in ("key_group", "pre_rope", "protect_prefix"):
                 if c not in d.columns:
                     d[c] = 0
             d["cell"] = cell
@@ -133,7 +134,8 @@ def main() -> None:
                       f"rows per layer before/after the filter, layers 0-4 vs 5: "
                       + ", ".join(f"L{l}: {int(before.get(l, 0))}->{int(after.get(l, 0))}" for l in (0, 4, 5)),
                       ""]
-        d["config"] = [_label(*r) for r in zip(d.key_bits, d.value_bits, d.rw, d.key_group, d.pre_rope)]
+        d["config"] = [_label(*r) for r in zip(d.key_bits, d.value_bits, d.rw, d.key_group, d.pre_rope,
+                                                d.protect_prefix)]
         m = (d.groupby(["cell", "config"])[["attn_js", "attn_top1", "out_cos", "cos_k", "cos_v", "relmse_k"]]
              .mean().reset_index().sort_values(["config", "cell"]))
         lines += ["## Attention / KV divergence (talker layers; mean over layers, positions, sentences)", "",

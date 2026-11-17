@@ -28,7 +28,7 @@ unset HF_HUB_OFFLINE 2>/dev/null || true
 
 OUT_DIR=models/Qwen3-TTS/benchmarks/outputs/smoke_keyfix
 CFGS="fp16,K8V8@0,K2V2@0"
-ALL_CELLS="plain g32 pre"
+ALL_CELLS="plain g32 pre pp"
 CELLS="${CELLS:-$ALL_CELLS}"
 
 echo "### 1/3 unit tests (key-fix + divergence driver + caches) ###"
@@ -44,7 +44,8 @@ for CELL in $CELLS; do
     plain) FLAGS="" ;;
     g32)   FLAGS="--key-group 32" ;;
     pre)   FLAGS="--pre-rope-keys" ;;
-    *) echo "unknown cell '$CELL' (plain|g32|pre) — check for curly quotes in CELLS=..." >&2; exit 2 ;;
+    pp)    FLAGS="--protect-prefix -1" ;;
+    *) echo "unknown cell '$CELL' (plain|g32|pre|pp) — check for curly quotes in CELLS=..." >&2; exit 2 ;;
   esac
   echo "--- cell $CELL ($FLAGS) ---"
   # shellcheck disable=SC2086
@@ -57,5 +58,5 @@ for CELL in $CELLS; do
     2>&1 | tee "logs/smoke_keyfix_${CELL}.log"
 done
 
-echo "### 3/3 validate (all three cells, whichever were re-run) ###"
+echo "### 3/3 validate (all cells, whichever were re-run) ###"
 "$PY" tools/validate_keyfix_smoke.py --results results --wavdir "$OUT_DIR" --n 2 --logs logs

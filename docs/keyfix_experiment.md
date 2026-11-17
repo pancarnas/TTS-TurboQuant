@@ -17,6 +17,16 @@ RoPE, VALL-E-X keys carry no position at all.
 | g32 | `--key-group 32` | rotated keys min-max scaled per 32 consecutive tokens, uniform 2^bits grid, fp16 min/scale stored (the paper's fix) |
 | pre | `--pre-rope-keys` | RoPE undone on the span that ages out of the window, quantized, RoPE re-applied; attention still reads post-RoPE keys |
 | g32pre | both | the two stacked |
+| pp | `--protect-prefix -1` | the prefill (prompt: text + reference audio, 44-67 tokens) stays fp16, keys and values; everything generated is compressed as in plain |
+| g32pp | `--key-group 32 --protect-prefix -1` | group scaling on the generated keys, prompt exact |
+
+`pp` follows the keygauss diagnostic (2026-11-17): 23-73% of the talker's
+attention mass per layer sits on the prompt keys, so the hypothesis is that
+most of the 2-bit collapse comes from the few dozen prompt keys, not the
+hundreds of generated ones. Bit accounting is honest: with prompt length P,
+sequence S and b bits, keys cost (16P + b(S-P))/S bits per element on
+average; `memory_report()` counts the prefix at fp16. VALL-E-X's cache ignores
+`protect_prefix` (not implemented there).
 
 | if K2 is rescued by | conclusion |
 |---|---|

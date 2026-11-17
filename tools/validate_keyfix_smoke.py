@@ -1,6 +1,6 @@
 """Validate a 03_smoke_keyfix.sh run (no regeneration): pipeline correctness only.
 
-Reads results/smoke_keyfix_{plain,g32,pre}.csv and the smoke wav dir and prints
+Reads results/smoke_keyfix_{plain,g32,pre,pp}.csv and the smoke wav dir and prints
 a PASS/FAIL line per check plus one verdict. It deliberately asserts only what
 MUST hold if the plumbing is right — it never asserts the scientific outcome
 (whether group scaling / pre-RoPE help), which the full run is for.
@@ -17,7 +17,7 @@ import os
 import re
 import sys
 
-CELLS = {"plain": (0, 0), "g32": (32, 0), "pre": (0, 1)}
+CELLS = {"plain": (0, 0, 0), "g32": (32, 0, 0), "pre": (0, 1, 0), "pp": (0, 0, -1)}
 
 
 def _sha(path: str) -> str:
@@ -36,6 +36,8 @@ def _wav(wavdir, idx, cfg):
             seg += "_g=32"
         if cell == "pre":
             seg += "_pre"
+        if cell == "pp":
+            seg += "_pp=prompt"
         name = f"qwen_librispeech_pc_{idx}_sampling_s0_t0.9_{seg}.wav"
     return os.path.join(wavdir, name)
 
@@ -59,7 +61,7 @@ def main() -> None:
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
 
     frames = {}
-    for cell, (kg, pre) in CELLS.items():
+    for cell, (kg, pre, pp) in CELLS.items():
         p = os.path.join(args.results, f"smoke_keyfix_{cell}.csv")
         if not os.path.exists(p) or os.path.getsize(p) == 0:
             check(f"{cell}: divergence CSV exists ({p})", False)
@@ -67,10 +69,11 @@ def main() -> None:
         df = pd.read_csv(p)
         frames[cell] = df
         check(f"{cell}: has rows ({len(df)})", len(df) > 0)
-        check(f"{cell}: key_group/pre_rope columns present", {"key_group", "pre_rope"} <= set(df.columns))
-        if {"key_group", "pre_rope"} <= set(df.columns):
-            check(f"{cell}: key_group=={kg} and pre_rope=={pre} on every row",
-                  (df.key_group == kg).all() and (df.pre_rope == pre).all())
+        flag_cols = {"key_group", "pre_rope", "protect_prefix"}
+        check(f"{cell}: key_group/pre_rope/protect_prefix columns present", flag_cols <= set(df.columns))
+        if flag_cols <= set(df.columns):
+            check(f"{cell}: key_group=={kg}, pre_rope=={pre}, protect_prefix=={pp} on every row",
+                  (df.key_group == kg).all() and (df.pre_rope == pre).all() and (df.protect_prefix == pp).all())
         check(f"{cell}: both K8V8 and K2V2 recorded",
               {8, 2} <= set(df.key_bits.unique()))
         check(f"{cell}: {args.n} sentences", df.idx.nunique() == args.n)
@@ -79,9 +82,9 @@ def main() -> None:
     # a cell can look fine while most of its rows are missing (first smoke run:
     # the pre cell kept 22k of 115k rows). Every cell runs the same sentences,
     # configs and steps, so the row counts must agree exactly.
-    if len(frames) == 3:
+    if len(frames) == len(CELLS):
         n_plain = len(frames["plain"])
-        for cell in ("g32", "pre"):
+        for cell in [c for c in CELLS if c != "plain"]:
             check(f"{cell}: same row count as plain ({len(frames[cell])} vs {n_plain})",
                   len(frames[cell]) == n_plain)
     for cell in CELLS:
@@ -93,7 +96,7 @@ def main() -> None:
         n_err = int(m.group(1)) if m else 0
         check(f"{cell}: no measurement errors in {lp} ({n_err})", n_err == 0)
 
-    if len(frames) == 3:
+    if len(frames) == len(CELLS):
         for cell, df in frames.items():
             g = df.groupby("key_bits")[["cos_k", "cos_v", "attn_js", "relmse_k"]].mean()
             print(f"\n  {cell} — mean by key_bits:\n" + g.round(5).to_string())
@@ -107,10 +110,16 @@ def main() -> None:
         c2 = {c: frames[c][frames[c].key_bits == 2].cos_k.mean() for c in CELLS}
         check("all cells: K2V2 cos_k in [0.5, 0.999] (lossy, not broken)",
               all(0.5 <= v <= 0.999 for v in c2.values()))
+        # pp: the prompt is spliced back exact, so its attention divergence must
+        # drop below plain while the recon metrics (compressed part only) match plain
+        p2 = frames["pp"][frames["pp"].key_bits == 2]
+        pl2 = frames["plain"][frames["plain"].key_bits == 2]
+        check("pp: K2V2 attn_js < plain (prompt keys exact)", p2.attn_js.mean() < pl2.attn_js.mean())
+        check("pp: K8V8 attn_js < 1e-3", frames["pp"][frames["pp"].key_bits == 8].attn_js.mean() < 1e-3)
         # informational — this is the hypothesis the full run tests
-        print(f"  [info] K2V2 cos_k   plain={c2['plain']:.4f}  g32={c2['g32']:.4f}  pre={c2['pre']:.4f}")
+        print("  [info] K2V2 cos_k   " + "  ".join(f"{c}={v:.4f}" for c, v in c2.items()))
         j2 = {c: frames[c][frames[c].key_bits == 2].attn_js.mean() for c in CELLS}
-        print(f"  [info] K2V2 attn_js plain={j2['plain']:.5f}  g32={j2['g32']:.5f}  pre={j2['pre']:.5f}")
+        print("  [info] K2V2 attn_js " + "  ".join(f"{c}={v:.5f}" for c, v in j2.items()))
 
     # --- wavs ---
     idxs = sorted(frames["plain"].idx.unique()) if "plain" in frames else list(range(args.n))
@@ -125,9 +134,10 @@ def main() -> None:
             check(f"idx {idx}: K2V2 wav exists for cell {cell}", os.path.exists(p))
             p8 = _wav(args.wavdir, idx, (8, 8, cell))
             check(f"idx {idx}: K8V8 wav exists for cell {cell}", os.path.exists(p8))
-        if len(hashes) == 3:
+        if len(hashes) == len(CELLS):
             # the flags must reach generation: a flag that changed nothing is a no-op bug
             check(f"idx {idx}: K2V2 wav differs plain vs g32", hashes["plain"] != hashes["g32"])
+            check(f"idx {idx}: K2V2 wav differs plain vs pp", hashes["plain"] != hashes["pp"])
             check(f"idx {idx}: K2V2 wav differs plain vs pre", hashes["plain"] != hashes["pre"])
     # fp16 is written by every cell to the SAME path (no flag segment); it was
     # overwritten three times with the same seed — its CSV-free check is that

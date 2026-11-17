@@ -324,7 +324,7 @@ def _recorder_ns():
         "TurboQuantV3": TurboQuantV3,
         "_kv_recon_errors": _kv_recon_errors,
         "rope_keys": mod.rope_keys,
-        "_N_ID": 10,
+        "_N_ID": 11,
     }
     exec(compile(src[start:end], _EXP_PATH, "exec"), ns)
     return ns
@@ -494,9 +494,9 @@ def test_load_done_filters_keyfix_columns(tmp_path):
     load_done = _single("load_done", {"pd": pd, "os": os})
     cols = _cols()
     rows = [
-        ("g", 0, 0, 10, 2, 2, 0, 0, 0, 0) + tuple([0.1] * 9),
-        ("g", 1, 0, 10, 2, 2, 0, 0, 32, 0) + tuple([0.1] * 9),
-        ("g", 2, 0, 10, 2, 2, 0, 0, 0, 1) + tuple([0.1] * 9),
+        ("g", 0, 0, 10, 2, 2, 0, 0, 0, 0, 0) + tuple([0.1] * 9),
+        ("g", 1, 0, 10, 2, 2, 0, 0, 32, 0, 0) + tuple([0.1] * 9),
+        ("g", 2, 0, 10, 2, 2, 0, 0, 0, 1, 0) + tuple([0.1] * 9),
     ]
     p = tmp_path / "d.csv"
     pd.DataFrame(rows, columns=cols).to_csv(p, index=False)

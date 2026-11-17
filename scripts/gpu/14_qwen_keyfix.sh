@@ -44,7 +44,9 @@ cell_flags() {
     g32)    echo "--key-group 32" ;;
     pre)    echo "--pre-rope-keys" ;;
     g32pre) echo "--key-group 32 --pre-rope-keys" ;;
-    *) echo "unknown cell '$1' (plain|g32|pre|g32pre)" >&2; exit 2 ;;
+    pp)     echo "--protect-prefix -1" ;;
+    g32pp)  echo "--key-group 32 --protect-prefix -1" ;;
+    *) echo "unknown cell '$1' (plain|g32|pre|g32pre|pp|g32pp)" >&2; exit 2 ;;
   esac
 }
 
@@ -81,7 +83,8 @@ echo "### summary ###"
 # outputs of 13_qwen_divergence.sh when they are on this box (restricted to the
 # same groups/seeds by the summariser).
 PLAIN=""
-if [[ " $CELLS " != *" plain "* ]]; then
+if [[ " $CELLS " != *" plain "* ]] && [ ! -f results/qwen_keyfix_plain_seed0.csv ]; then
+  # no paired plain cell on this box yet: fall back to the 13-script baseline
   [ -f results/qwen_div_seed0.csv ] && PLAIN="$PLAIN --plain-div results/qwen_div_seed0.csv"
   [ -f results/qwen_seed_scores.csv ] && PLAIN="$PLAIN --plain-scores results/qwen_seed_scores.csv"
 fi

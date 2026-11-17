@@ -44,3 +44,9 @@ class TurboQuantConfig:
     # RoPE to the reconstruction. Only meaningful for RoPE models (Qwen3-TTS);
     # VALL-E-X has additive sinusoidal positions and ignores it.
     pre_rope_keys: bool = False
+    # protect_prefix: never compress the first N cache positions (keys AND
+    # values stay fp16). -1 = the whole prefill (the prompt: text + reference
+    # audio, which the Qwen3-TTS talker attends to with 23-73% of its mass per
+    # layer), N > 0 = a fixed count, 0 = off. Honest accounting: those tokens
+    # are counted at 16 bits in memory_report().
+    protect_prefix: int = 0

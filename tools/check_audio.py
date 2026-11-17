@@ -32,7 +32,7 @@ import soundfile as sf
 _NAME_RE = re.compile(
     r"qwen_(?P<group>.+)_(?P<idx>\d+)_sampling_s(?P<seed>\d+)_t(?P<temp>[\d.]+)"
     r"_K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)(?:_pl=(?P<pl>\d+))?"
-    r"(?:_g=(?P<kg>\d+))?(?P<pre>_pre)?\.wav$"
+    r"(?:_g=(?P<kg>\d+))?(?P<pre>_pre)?(?:_pp=(?P<pp>prompt|\d+))?\.wav$"
 )
 
 # VALL-E-X benchmark naming (benchmark_vallex_real.py --configs runs):
@@ -63,6 +63,8 @@ def parse_wav_name(name: str) -> dict | None:
             config += f"+g{int(d['kg'])}"
         if d["pre"]:
             config += "+pre"
+        if d["pp"]:
+            config += "+pp" if d["pp"] == "prompt" else f"+pp{int(d['pp'])}"
         return {
             "group": d["group"],
             "idx": int(d["idx"]),
