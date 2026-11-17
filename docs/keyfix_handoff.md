@@ -39,6 +39,15 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
    (sentence, layer, config), `_bystep.csv` with max, p95 and threshold fractions, and
    `_bytime.csv`, the per-sentence time course). Run on the box (CPU, minutes). Tests the
    "collapse is a single-step event" hypothesis.
+1b. Gaussianity diagnostic (OmniKVQuant Table 1 analogue + what fix to try),
+   ~10 GPU minutes, 20 sentences, no quantization on the path:
+   `MAXPG=20 bash scripts/gpu/15_qwen_keygauss.sh` -> `results/keygauss_stats_summary.md`
+   (retained variance / W1 / KS per 32-token window for keys, pre-RoPE keys and
+   values vs a true Gaussian; offset vs drift; relmse of fixed Lloyd-Max vs g32
+   min-max vs a static per-coordinate affine map; per-layer query/key effective
+   rank, key variance in the top-8 query directions, attention mass on the first
+   64 keys and on the prompt). Smoke with MAXPG=2 first. Download the three
+   `results/keygauss_stats*` files (small).
 2. Seeds. On the box, ~5 GPU hours:
    `CELLS="g32 g32pre" CFGS="fp16,K3V3@0" SEEDS="1 2" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_seeds.log 2>&1 &`
    Settles whether g32pre's 6% is real. Then re-run the reducer, re-download,
