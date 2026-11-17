@@ -11,10 +11,10 @@ source scripts/gpu/_ensure_env.sh
 mkdir -p results logs
 unset HF_HUB_OFFLINE 2>/dev/null || true
 MAXPG="${MAXPG:-20}"
-GROUPS="${GROUPS:-librispeech_pc}"
+EVAL_GROUPS="${EVAL_GROUPS:-librispeech_pc}"  # not GROUPS: that is a bash builtin (unix gids)
 BITS="${BITS:-2,3}"
 "$PY" models/Qwen3-TTS/benchmarks/key_gauss_stats.py \
-  --data-dir data --groups "$GROUPS" --max-per-group "$MAXPG" --bits "$BITS" \
+  --data-dir data --groups "$EVAL_GROUPS" --max-per-group "$MAXPG" --bits "$BITS" \
   --voice-mode clone --device cuda --out results/keygauss_stats.csv \
   2>&1 | tee logs/qwen_keygauss.log
 echo "keygauss done - see results/keygauss_stats_summary.md"
