@@ -21,6 +21,23 @@ code-predictor artifact), g32 cuts layer 0 by 11x but layer 5 by only 2.4x,
 so layer 5 is the scaling-resistant layer. Plain divergence grows with decode
 position, g32 divergence does not (the drift signature).
 
+## Diagnostic results (15_qwen_keygauss.sh, 20 sentences, 2026-11-17)
+
+Table-1 analogue (32-token windows; Gaussian floor 96.9% / 0.215 / 0.149
+reproduces the paper's reference row): keys post-RoPE retain 16.6% variance
+(W1 0.899, KS 0.545) vs the paper's 30.4% on Qwen2.5-Omni; prompt keys 32.1%,
+generated keys 12.7%, pre-RoPE keys 9.1% (RoPE spreads coordinates, so undoing
+it cannot help), values 32.0%. offset (energy of per-coordinate mean) 0.70;
+drift (variance between windows) 0.44 overall, -0.04 on prompt keys, 0.49 on
+generated keys. Key relmse at 2 bits: fixed 0.116 / g32 0.030 / static affine
+(10 calib sentences) 0.057; at 3 bits 0.034 / 0.005 / 0.019 -> affine alone
+cannot rescue (3-bit fixed at 0.034 collapses). Layer 5: q effective rank 7.2,
+k 6.8, only 2.1% of key variance in the top-8 query directions (iso 6.25%) ->
+query-aware rotation case; low-q-rank layers: 3,4,5,10,15,20,21,22,27.
+Attention mass on the prompt (44-67 tokens, carries the text) is 23-73% per
+layer -> prompt protection in fp16 is the cheapest mechanism test.
+Outputs on the box: results/keygauss_stats.csv, _layers.csv, _summary.md.
+
 ## Results on disk
 
 Laptop (not tracked by git): `results/keyfix/` = the downloaded archive
@@ -52,6 +69,10 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
    `CELLS="g32 g32pre" CFGS="fp16,K3V3@0" SEEDS="1 2" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_seeds.log 2>&1 &`
    Settles whether g32pre's 6% is real. Then re-run the reducer, re-download,
    re-run `tools/analyze_keyfix.py`.
+2b. Prompt protection: keep the first P (prompt) positions of the cache in
+   fp16 (config field + cache change; library edit, ask first). One cell each
+   at K2V2 and K3V3, 50 sentences, seed 0. Honest bit accounting:
+   (P*16 + (S-P)*b)/S per element.
 3. Query-aware key rotation (the 2-bit candidate, from OSCAR arXiv:2605.17757
    and NOVA-KV arXiv:2608.04074): calibrate the query second moment per
    (layer, KV head) on ~20 sentences, rotate keys into its eigenbasis instead
