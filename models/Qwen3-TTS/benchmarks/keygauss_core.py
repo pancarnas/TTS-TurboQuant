@@ -21,6 +21,7 @@ Everything is in the TurboQuant coordinate system: unit-norm vectors, rotated
 by the same random Pi the compressor uses, scaled by sqrt(D) so each coordinate
 targets N(0, 1). No model code is imported here, so it is testable on CPU.
 """
+
 from __future__ import annotations
 
 import math
@@ -52,9 +53,13 @@ def rotate_unit(x: torch.Tensor, Pi: torch.Tensor) -> torch.Tensor:
     return (x / (norms + 1e-8)) @ Pi.T * math.sqrt(x.shape[-1])
 
 
-def layer_rotation(head_dim: int, layer_idx: int, seed: int = 42, device: str = "cpu") -> torch.Tensor:
+def layer_rotation(
+    head_dim: int, layer_idx: int, seed: int = 42, device: str = "cpu"
+) -> torch.Tensor:
     """The key rotation TurboQuantV3 would use for this layer (seed + layer_idx*1000)."""
-    return generate_rotation_matrix(head_dim, seed=seed + layer_idx * 1000, device=device)
+    return generate_rotation_matrix(
+        head_dim, seed=seed + layer_idx * 1000, device=device
+    )
 
 
 # --------------------------------------------------------------------------
@@ -86,7 +91,12 @@ def window_stats(z: torch.Tensor, g: int = 32) -> dict:
     d_plus = ((i + 1).view(1, g, 1) / g - phi).amax(dim=1)
     d_minus = (phi - i.view(1, g, 1) / g).amax(dim=1)
     ks = torch.maximum(d_plus, d_minus)  # (W, D)
-    return dict(var_w=var.mean().item(), w1_w=w1.mean().item(), ks_w=ks.mean().item(), n_win=int(W * D))
+    return dict(
+        var_w=var.mean().item(),
+        w1_w=w1.mean().item(),
+        ks_w=ks.mean().item(),
+        n_win=int(W * D),
+    )
 
 
 def global_stats(z: torch.Tensor, g: int = 32) -> dict:
@@ -112,7 +122,9 @@ def global_stats(z: torch.Tensor, g: int = 32) -> dict:
     return dict(var_g=var_g.mean().item(), offset=offset, drift=drift, n_tok=int(S))
 
 
-def gaussian_reference(S: int, D: int, g: int = 32, seed: int = 0, device: str = "cpu") -> dict:
+def gaussian_reference(
+    S: int, D: int, g: int = 32, seed: int = 0, device: str = "cpu"
+) -> dict:
     """window_stats of true N(0,1) samples with the same shape (the paper's 'Gaussian' row)."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     z = torch.randn(S, D, generator=gen).to(device)
@@ -127,7 +139,7 @@ def gaussian_reference(S: int, D: int, g: int = 32, seed: int = 0, device: str =
 
 
 def _relmse(z: torch.Tensor, zhat: torch.Tensor) -> float:
-    return ((zhat - z) ** 2).sum().item() / max((z ** 2).sum().item(), 1e-12)
+    return ((zhat - z) ** 2).sum().item() / max((z**2).sum().item(), 1e-12)
 
 
 def quant_fixed(z: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
@@ -154,7 +166,9 @@ def quant_group(z: torch.Tensor, bits: int, g: int = 32) -> torch.Tensor:
     return (idx / levels * gscale + gmin).reshape(G * g, D)[:S]
 
 
-def quant_affine(z: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+def quant_affine(
+    z: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, centroids: torch.Tensor
+) -> torch.Tensor:
     """Static per-coordinate affine map (calibrated mu, sigma per coordinate)
     then the fixed Lloyd-Max codebook on the standardized values."""
     sigma = sigma.clamp_min(1e-6)
@@ -164,16 +178,65 @@ def quant_affine(z: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor, centroi
     return c[idx] * sigma + mu
 
 
-def quant_errors(z: torch.Tensor, bits: int, centroids: torch.Tensor, g: int = 32,
-                 mu: torch.Tensor | None = None, sigma: torch.Tensor | None = None) -> dict:
-    """relmse of the three codebook stages on one (S, D) coordinate block."""
-    out = {
-        f"relmse_fixed_b{bits}": _relmse(z, quant_fixed(z, centroids)),
-        f"relmse_g{g}_b{bits}": _relmse(z, quant_group(z, bits, g)),
+def quant_kmeans(z: torch.Tensor, bits: int, iters: int = 20) -> torch.Tensor:
+    """Per-coordinate 1-D k-means (Lloyd) with 2^bits levels fitted on z itself:
+    the codebook a prefill-time quantizer could fit on the prompt (metadata =
+    2^bits fp16 levels per coordinate per block)."""
+    L = 1 << bits
+    q = torch.quantile(
+        z, torch.linspace(0, 1, L + 2, device=z.device)[1:-1], dim=0
+    )  # (L, D)
+    levels = q.T.contiguous()  # (D, L)
+    zt = z.T  # (D, S)
+    for _ in range(iters):
+        idx = (zt.unsqueeze(-1) - levels.unsqueeze(1)).abs().argmin(dim=-1)  # (D, S)
+        onehot = torch.nn.functional.one_hot(idx, L).float()  # (D, S, L)
+        cnt = onehot.sum(dim=1)  # (D, L)
+        new = torch.einsum("dsl,ds->dl", onehot, zt) / cnt.clamp_min(1)
+        levels = torch.where(cnt > 0, new, levels)
+    idx = (zt.unsqueeze(-1) - levels.unsqueeze(1)).abs().argmin(dim=-1)
+    return torch.gather(levels, 1, idx).T
+
+
+def _error_stats(z: torch.Tensor, zhat: torch.Tensor, name: str, bits: int) -> dict:
+    """relmse; shift = energy of the per-coordinate MEAN error over the key
+    energy (systematic bias, 0 for an unbiased quantizer); relmsec = relmse of
+    the per-coordinate-centred keys (>= 1 means the between-token differences,
+    i.e. token identity inside the block, are gone)."""
+    e = zhat - z
+    zc = z - z.mean(dim=0, keepdim=True)
+    ec = e - e.mean(dim=0, keepdim=True)
+    return {
+        f"relmse_{name}_b{bits}": _relmse(z, zhat),
+        f"shift_{name}_b{bits}": (e.mean(dim=0) ** 2).sum().item()
+        / max((z**2).mean(dim=0).sum().item(), 1e-12),
+        f"relmsec_{name}_b{bits}": (ec**2).sum().item()
+        / max((zc**2).sum().item(), 1e-12),
     }
-    out[f"relmse_affine_b{bits}"] = (
-        _relmse(z, quant_affine(z, mu, sigma, centroids)) if mu is not None else float("nan")
-    )
+
+
+def quant_errors(
+    z: torch.Tensor,
+    bits: int,
+    centroids: torch.Tensor,
+    g: int = 32,
+    mu: torch.Tensor | None = None,
+    sigma: torch.Tensor | None = None,
+) -> dict:
+    """Error stats of every codebook stage on one (S, D) coordinate block:
+    fixed Lloyd-Max, per-window min-max (g), one min-max window over the whole
+    block (gseg), k-means fitted on the block, static affine (if calibrated)."""
+    out = {}
+    out.update(_error_stats(z, quant_fixed(z, centroids), "fixed", bits))
+    out.update(_error_stats(z, quant_group(z, bits, g), f"g{g}", bits))
+    out.update(_error_stats(z, quant_group(z, bits, max(z.shape[0], 1)), "gseg", bits))
+    out.update(_error_stats(z, quant_kmeans(z, bits), "kmeans", bits))
+    if mu is not None:
+        out.update(
+            _error_stats(z, quant_affine(z, mu, sigma, centroids), "affine", bits)
+        )
+    else:
+        out[f"relmse_affine_b{bits}"] = float("nan")
     return out
 
 
@@ -188,14 +251,14 @@ class AffineCalib:
     def add(self, key: tuple, z: torch.Tensor) -> None:
         z = z.float()
         self.sum[key] = self.sum.get(key, 0) + z.sum(dim=0)
-        self.sq[key] = self.sq.get(key, 0) + (z ** 2).sum(dim=0)
+        self.sq[key] = self.sq.get(key, 0) + (z**2).sum(dim=0)
         self.n[key] = self.n.get(key, 0) + z.shape[0]
 
     def get(self, key: tuple):
         if key not in self.n or self.n[key] < 2:
             return None, None
         mu = self.sum[key] / self.n[key]
-        var = self.sq[key] / self.n[key] - mu ** 2
+        var = self.sq[key] / self.n[key] - mu**2
         return mu, var.clamp_min(0).sqrt()
 
 
@@ -232,17 +295,31 @@ def alignment_stats(q: torch.Tensor, k: torch.Tensor, topk: int = 8) -> dict:
     _, U = torch.linalg.eigh(Mq)
     top = U[:, -topk:]
     share = torch.trace(top.T @ Ck @ top).item() / max(torch.trace(Ck).item(), 1e-12)
-    return dict(q_erank=effective_rank(Mq), k_erank=effective_rank(Ck),
-                k_share_topq=share, k_share_iso=topk / D)
+    return dict(
+        q_erank=effective_rank(Mq),
+        k_erank=effective_rank(Ck),
+        k_share_topq=share,
+        k_share_iso=topk / D,
+    )
 
 
-def attention_mass(query: torch.Tensor, key: torch.Tensor, groups: int, scaling: float,
-                   first: int, prompt_len: int) -> tuple[float, float]:
+def attention_mass(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    groups: int,
+    scaling: float,
+    first: int,
+    prompt_len: int,
+) -> tuple[float, float]:
     """Mean (over heads) attention mass of ONE query step on the first `first`
     keys and on the prompt (keys [0, prompt_len)). query (Hq, 1, D), key (Hkv, S, D)."""
     ks = key.repeat_interleave(groups, dim=0).float()  # (Hq, S, D)
-    aw = torch.softmax((query.float() @ ks.transpose(1, 2)) * scaling, dim=-1)  # (Hq, 1, S)
-    return aw[..., :first].sum(-1).mean().item(), aw[..., :prompt_len].sum(-1).mean().item()
+    aw = torch.softmax(
+        (query.float() @ ks.transpose(1, 2)) * scaling, dim=-1
+    )  # (Hq, 1, S)
+    return aw[..., :first].sum(-1).mean().item(), aw[..., :prompt_len].sum(
+        -1
+    ).mean().item()
 
 
 # --------------------------------------------------------------------------
@@ -250,9 +327,20 @@ def attention_mass(query: torch.Tensor, key: torch.Tensor, groups: int, scaling:
 # --------------------------------------------------------------------------
 
 
-def layer_rows(layer: int, keys: torch.Tensor, values: torch.Tensor, keys_pre: torch.Tensor | None,
-               prompt_len: int, Pi: torch.Tensor, bits_list: list, centroids: dict, g: int,
-               calib: AffineCalib | None, evaluate_affine: bool, ident: dict) -> list:
+def layer_rows(
+    layer: int,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    keys_pre: torch.Tensor | None,
+    prompt_len: int,
+    Pi: torch.Tensor,
+    bits_list: list,
+    centroids: dict,
+    g: int,
+    calib: AffineCalib | None,
+    evaluate_affine: bool,
+    ident: dict,
+) -> list:
     """keys / values / keys_pre: (Hkv, S, D) for one talker layer of one sentence.
 
     Returns one row per (kv_head, tensor, segment). `calib` collects affine
@@ -275,20 +363,22 @@ def layer_rows(layer: int, keys: torch.Tensor, values: torch.Tensor, keys_pre: t
                 row = dict(ident, layer=layer, kv_head=h, tensor=name, segment=seg)
                 row.update(window_stats(z, g))
                 row.update(global_stats(z, g))
-                if seg == "all" and name.startswith("key"):
+                if name.startswith("key"):
                     ck = (layer, h, name)
                     mu = sigma = None
                     if calib is not None:
                         if evaluate_affine:
                             mu, sigma = calib.get(ck)
-                        else:
+                        elif seg == "all":
                             calib.add(ck, z)
                     for bits in bits_list:
                         row.update(quant_errors(z, bits, centroids[bits], g, mu, sigma))
                 rows.append(row)
         # Gaussian reference with this head's shape (one per head, 'all')
         row = dict(ident, layer=layer, kv_head=h, tensor="gaussian", segment="all")
-        row.update(gaussian_reference(S, D, g, seed=layer * 100 + h, device=keys.device))
+        row.update(
+            gaussian_reference(S, D, g, seed=layer * 100 + h, device=keys.device)
+        )
         rows.append(row)
     return rows
 
@@ -302,11 +392,20 @@ class KeyStatsRecorder:
     """Collects, per talker layer, the final K/V cache, all queries, the RoPE
     tables and the per-step attention mass; `finalize` turns them into rows."""
 
-    def __init__(self, talker_class, bits_list, group, first, seed, calib_sentences, rope_fn=None):
+    def __init__(
+        self, talker_class, bits_list, group, first, seed, calib_sentences, rope_fn=None
+    ):
         self.talker_class = talker_class
-        self.bits_list, self.group, self.first, self.seed = bits_list, group, first, seed
+        self.bits_list, self.group, self.first, self.seed = (
+            bits_list,
+            group,
+            first,
+            seed,
+        )
         self.calib_sentences = calib_sentences
-        self.rope_fn = rope_fn  # rope_keys(k, cos, sin, mrope_section, interleaved, inverse)
+        self.rope_fn = (
+            rope_fn  # rope_keys(k, cos, sin, mrope_section, interleaved, inverse)
+        )
         self.active = False
         self.errors, self.first_error = 0, None
         self.calib = AffineCalib()
@@ -336,14 +435,28 @@ class KeyStatsRecorder:
                 self.prompt_len = pos
                 self.rope = module._tq_rope
                 self.rope_scaling = getattr(module, "rope_scaling", None) or {}
-        elif layer == 0 and self.rope is not None:  # first layer of a decode step: extend the tables
+        elif (
+            layer == 0 and self.rope is not None
+        ):  # first layer of a decode step: extend the tables
             cos, sin = module._tq_rope
-            self.rope = (torch.cat([self.rope[0], cos], dim=-2), torch.cat([self.rope[1], sin], dim=-2))
-        self.kv[layer] = (key[0].detach(), value[0].detach())  # latest = full cache (Hkv, S, D)
+            self.rope = (
+                torch.cat([self.rope[0], cos], dim=-2),
+                torch.cat([self.rope[1], sin], dim=-2),
+            )
+        self.kv[layer] = (
+            key[0].detach(),
+            value[0].detach(),
+        )  # latest = full cache (Hkv, S, D)
         self.queries.setdefault(layer, []).append(query[0].detach().to(torch.float16))
         if query.shape[2] == 1 and self.prompt_len:
-            m64, mp = attention_mass(query[0], key[0], module.num_key_value_groups, scaling,
-                                     self.first, self.prompt_len)
+            m64, mp = attention_mass(
+                query[0],
+                key[0],
+                module.num_key_value_groups,
+                scaling,
+                self.first,
+                self.prompt_len,
+            )
             s = self.mass.setdefault(layer, [0.0, 0.0, 0])
             s[0] += m64
             s[1] += mp
@@ -362,22 +475,50 @@ class KeyStatsRecorder:
                 for b in self.bits_list:
                     self.centroids.setdefault(b, codebook(D, b).to(keys.device))
             keys_pre = None
-            if self.rope_fn is not None and self.rope is not None and self.rope[0].shape[-2] == S:
+            if (
+                self.rope_fn is not None
+                and self.rope is not None
+                and self.rope[0].shape[-2] == S
+            ):
                 cos, sin = self.rope
                 rs = self.rope_scaling or {}
                 keys_pre = self.rope_fn(
-                    keys.unsqueeze(0), cos, sin,
+                    keys.unsqueeze(0),
+                    cos,
+                    sin,
                     mrope_section=rs.get("mrope_section") if cos.dim() == 4 else None,
-                    interleaved=bool(rs.get("interleaved", False)), inverse=True,
+                    interleaved=bool(rs.get("interleaved", False)),
+                    inverse=True,
                 )[0]
-            rows += layer_rows(layer, keys, values, keys_pre, self.prompt_len or 0, self.Pi[layer],
-                               self.bits_list, self.centroids, self.group, self.calib,
-                               evaluate_affine, ident)
+            rows += layer_rows(
+                layer,
+                keys,
+                values,
+                keys_pre,
+                self.prompt_len or 0,
+                self.Pi[layer],
+                self.bits_list,
+                self.centroids,
+                self.group,
+                self.calib,
+                evaluate_affine,
+                ident,
+            )
             q = torch.cat(self.queries[layer], dim=1)  # (Hq, S, D)
             groups = q.shape[0] // Hkv
-            ls = dict(ident, layer=layer, n_tok=S, prompt_len=self.prompt_len or 0,
-                      pre_rope_ok=keys_pre is not None)
-            al = [alignment_stats(q[h * groups:(h + 1) * groups].reshape(-1, D), keys[h]) for h in range(Hkv)]
+            ls = dict(
+                ident,
+                layer=layer,
+                n_tok=S,
+                prompt_len=self.prompt_len or 0,
+                pre_rope_ok=keys_pre is not None,
+            )
+            al = [
+                alignment_stats(
+                    q[h * groups : (h + 1) * groups].reshape(-1, D), keys[h]
+                )
+                for h in range(Hkv)
+            ]
             for k in al[0]:
                 ls[k] = sum(a[k] for a in al) / Hkv
             m = self.mass.get(layer)
@@ -391,7 +532,9 @@ class KeyStatsRecorder:
 
 def make_patch(original, recorder):
     def patched(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
-        out, attn = original(module, query, key, value, attention_mask, scaling, dropout, **kw)
+        out, attn = original(
+            module, query, key, value, attention_mask, scaling, dropout, **kw
+        )
         if recorder.active:
             try:
                 recorder.record(module, query, key, value, attention_mask, scaling)
@@ -400,6 +543,7 @@ def make_patch(original, recorder):
                 if recorder.first_error is None:
                     recorder.first_error = traceback.format_exc()
         return out, attn
+
     return patched
 
 
@@ -412,43 +556,121 @@ def _wmean(df, cols, w):
     return {c: float((df[c] * df[w]).sum() / df[w].sum()) for c in cols}
 
 
+def segment_table(stats: pd.DataFrame, bits: list, g: int) -> list:
+    """Prompt vs generated keys per quantizer: relmse, shift (bias energy) and
+    relmsec (error on the centred keys = loss of token identity)."""
+    quants = [
+        ("fixed", "fixed Lloyd-Max"),
+        (f"g{g}", f"min-max g{g}"),
+        ("gseg", "min-max, one window per segment"),
+        ("kmeans", "k-means fitted on the segment"),
+        ("affine", "static affine"),
+    ]
+    L = [
+        "## Prompt vs generated keys: does quantization shift them? (post-RoPE keys)",
+        "",
+        "relmse = error / energy; shift = energy of the mean error / energy (systematic bias); "
+        "relmsec = error of the centred keys / their energy (1 = token identity inside the segment is gone).",
+        "",
+    ]
+    for b in bits:
+        L += [
+            f"### {b}-bit keys",
+            "",
+            "| quantizer | prompt relmse | prompt shift | prompt relmsec | gen relmse | gen shift | gen relmsec |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for q, label in quants:
+            cols = [f"{s}_{q}_b{b}" for s in ("relmse", "shift", "relmsec")]
+            if not all(c in stats.columns for c in cols):
+                continue
+            cells = []
+            for seg in ("prompt", "gen"):
+                d = stats[(stats.tensor == "key") & (stats.segment == seg)].dropna(
+                    subset=cols[:1]
+                )
+                cells += [f"{d[c].mean():.4f}" if len(d) else "nan" for c in cols]
+            L.append(f"| {label} | " + " | ".join(cells) + " |")
+        L.append("")
+    return L
+
+
 def summarize(stats: pd.DataFrame, layers: pd.DataFrame, g: int) -> str:
-    L = ["# Key/value Gaussianity on Qwen3-TTS (OmniKVQuant Table 1 analogue)", "",
-         f"Windows of {g} tokens, talker layers, coordinates scaled so the codebook target is N(0, 1). "
-         f"{stats['idx'].nunique()} sentences.", "",
-         "| distribution | retained var | W1 | KS | offset | drift |", "|---|---|---|---|---|---|"]
-    order = [("gaussian", "all", "Gaussian"), ("key", "all", "Key (post-RoPE)"), ("key", "prompt", "  prompt tokens"),
-             ("key", "gen", "  generated tokens"), ("key_pre", "all", "Key (pre-RoPE)"), ("value", "all", "Value")]
+    L = [
+        "# Key/value Gaussianity on Qwen3-TTS (OmniKVQuant Table 1 analogue)",
+        "",
+        f"Windows of {g} tokens, talker layers, coordinates scaled so the codebook target is N(0, 1). "
+        f"{stats['idx'].nunique()} sentences.",
+        "",
+        "| distribution | retained var | W1 | KS | offset | drift |",
+        "|---|---|---|---|---|---|",
+    ]
+    order = [
+        ("gaussian", "all", "Gaussian"),
+        ("key", "all", "Key (post-RoPE)"),
+        ("key", "prompt", "  prompt tokens"),
+        ("key", "gen", "  generated tokens"),
+        ("key_pre", "all", "Key (pre-RoPE)"),
+        ("value", "all", "Value"),
+    ]
     for tensor, seg, label in order:
         d = stats[(stats.tensor == tensor) & (stats.segment == seg) & (stats.n_win > 0)]
         if not len(d):
             continue
         w = _wmean(d, ["var_w", "w1_w", "ks_w"], "n_win")
         gl = _wmean(d, ["offset", "drift"], "n_tok")
-        L.append(f"| {label} | {100 * w['var_w']:.2f}% | {w['w1_w']:.3f} | {w['ks_w']:.3f} | {gl['offset']:.3f} | {gl['drift']:.3f} |")
-    L += ["", "Retained var of a true N(0,1) window is (g-1)/g; W1/KS of the Gaussian row are the finite-sample floor.",
-          "offset = energy of the per-coordinate mean (0 = centred); drift = share of variance between windows.", ""]
+        L.append(
+            f"| {label} | {100 * w['var_w']:.2f}% | {w['w1_w']:.3f} | {w['ks_w']:.3f} | {gl['offset']:.3f} | {gl['drift']:.3f} |"
+        )
+    L += [
+        "",
+        "Retained var of a true N(0,1) window is (g-1)/g; W1/KS of the Gaussian row are the finite-sample floor.",
+        "offset = energy of the per-coordinate mean (0 = centred); drift = share of variance between windows.",
+        "",
+    ]
 
-    bits = sorted({int(c.split("_b")[-1]) for c in stats.columns if c.startswith("relmse_fixed_b")})
+    bits = sorted(
+        {
+            int(c.split("_b")[-1])
+            for c in stats.columns
+            if c.startswith("relmse_fixed_b")
+        }
+    )
     d = stats[(stats.tensor == "key") & (stats.segment == "all")]
     if len(d) and bits:
-        L += ["## Key quantization error by codebook stage (relative MSE, post-RoPE keys)", "",
-              "| bits | fixed Lloyd-Max | per-window min-max (g32) | static affine + Lloyd-Max | n sentences (affine) |", "|---|---|---|---|---|"]
+        L += [
+            "## Key quantization error by codebook stage (relative MSE, post-RoPE keys)",
+            "",
+            "| bits | fixed Lloyd-Max | per-window min-max (g32) | static affine + Lloyd-Max | n sentences (affine) |",
+            "|---|---|---|---|---|",
+        ]
         for b in bits:
             da = d.dropna(subset=[f"relmse_affine_b{b}"])
-            L.append(f"| {b} | {d[f'relmse_fixed_b{b}'].mean():.4f} | {d[f'relmse_g{g}_b{b}'].mean():.4f} | "
-                     f"{da[f'relmse_affine_b{b}'].mean() if len(da) else float('nan'):.4f} | {da['idx'].nunique()} |")
-        L += ["", "Affine = per-coordinate mean/std calibrated on the first sentences, evaluated on the rest (zero per-token metadata).", ""]
-        L += [f"## Per layer, {bits[0]}-bit keys", "",
-              "| layer | retained var | offset | drift | fixed | g32 | affine | q erank | k erank | k share in top-8 q dirs (iso) | attn mass first-64 | attn mass prompt |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            L.append(
+                f"| {b} | {d[f'relmse_fixed_b{b}'].mean():.4f} | {d[f'relmse_g{g}_b{b}'].mean():.4f} | "
+                f"{da[f'relmse_affine_b{b}'].mean() if len(da) else float('nan'):.4f} | {da['idx'].nunique()} |"
+            )
+        L += [
+            "",
+            "Affine = per-coordinate mean/std calibrated on the first sentences, evaluated on the rest (zero per-token metadata).",
+            "",
+        ]
+        L += segment_table(stats, bits, g)
+        L += [
+            f"## Per layer, {bits[0]}-bit keys",
+            "",
+            "| layer | retained var | offset | drift | fixed | g32 | affine | q erank | k erank | k share in top-8 q dirs (iso) | attn mass first-64 | attn mass prompt |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
         b = bits[0]
         for layer, dl in d.groupby("layer"):
             w = _wmean(dl[dl.n_win > 0], ["var_w"], "n_win")
             gl = _wmean(dl, ["offset", "drift"], "n_tok")
             ll = layers[layers.layer == layer]
-            L.append(f"| {int(layer)} | {100 * w['var_w']:.1f}% | {gl['offset']:.2f} | {gl['drift']:.2f} | "
-                     f"{dl[f'relmse_fixed_b{b}'].mean():.4f} | {dl[f'relmse_g{g}_b{b}'].mean():.4f} | {dl[f'relmse_affine_b{b}'].mean():.4f} | "
-                     f"{ll.q_erank.mean():.1f} | {ll.k_erank.mean():.1f} | {100 * ll.k_share_topq.mean():.1f}% ({100 * ll.k_share_iso.mean():.1f}%) | "
-                     f"{ll.attn_mass_first.mean():.3f} | {ll.attn_mass_prompt.mean():.3f} |")
+            L.append(
+                f"| {int(layer)} | {100 * w['var_w']:.1f}% | {gl['offset']:.2f} | {gl['drift']:.2f} | "
+                f"{dl[f'relmse_fixed_b{b}'].mean():.4f} | {dl[f'relmse_g{g}_b{b}'].mean():.4f} | {dl[f'relmse_affine_b{b}'].mean():.4f} | "
+                f"{ll.q_erank.mean():.1f} | {ll.k_erank.mean():.1f} | {100 * ll.k_share_topq.mean():.1f}% ({100 * ll.k_share_iso.mean():.1f}%) | "
+                f"{ll.attn_mass_first.mean():.3f} | {ll.attn_mass_prompt.mean():.3f} |"
+            )
     return "\n".join(L)
