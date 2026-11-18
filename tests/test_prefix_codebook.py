@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from turboquant.config import TurboQuantConfig
 from turboquant.compressors_v3 import (
     MSECompressor,
     TurboQuantV3,
@@ -130,3 +131,13 @@ def test_v3_rejects_bad_args():
         TurboQuantV3(16, 2, 2).compress_kv(
             torch.randn(1, 1, 4, 16), torch.randn(1, 1, 4, 16), prefix=2
         )
+
+
+def test_config_defaults_off_and_validation():
+    c = TurboQuantConfig()
+    assert c.prefix_codebook == "" and c.prefix_bits == 0
+    TurboQuantConfig(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=2)
+    with pytest.raises(ValueError):
+        TurboQuantConfig(protect_prefix=0, prefix_codebook="kmeans")
+    with pytest.raises(ValueError):
+        TurboQuantConfig(protect_prefix=-1, prefix_codebook="other")

@@ -50,3 +50,20 @@ class TurboQuantConfig:
     # layer), N > 0 = a fixed count, 0 = off. Honest accounting: those tokens
     # are counted at 16 bits in memory_report().
     protect_prefix: int = 0
+    # prefix_codebook: "" = the protected prefix stays fp16 (today's pp cells);
+    # "kmeans" = per-coordinate 1-D k-means levels fitted on the prefix at
+    # prefill; "minmax" = one min-max window over the prefix. Requires
+    # protect_prefix == -1 (the whole prefill). Keys only: prefix values use the
+    # ordinary value compressor.
+    prefix_codebook: str = ""
+    # prefix_bits: bits for the prefix keys. 0 = follow each config's key_bits,
+    # N > 0 = literally N for every config.
+    prefix_bits: int = 0
+
+    def __post_init__(self) -> None:
+        if self.prefix_codebook not in ("", "kmeans", "minmax"):
+            raise ValueError(f"unknown prefix_codebook: {self.prefix_codebook!r}")
+        if self.prefix_codebook and self.protect_prefix != -1:
+            raise ValueError("prefix_codebook requires protect_prefix == -1")
+        if self.prefix_bits < 0:
+            raise ValueError(f"prefix_bits must be >= 0, got {self.prefix_bits}")
