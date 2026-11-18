@@ -19,13 +19,15 @@ References:
 import torch
 import torch.nn.functional as F
 import math
-from typing import Optional
 
+from . import fitted_levels
 from .lloyd_max import LloydMaxCodebook
 from .turboquant import generate_rotation_matrix
 
 
-def compressed_bytes_per_token(head_dim: int, bits: int, group: int = 0) -> float:
+def compressed_bytes_per_token(
+    head_dim: int, bits: int, group: int = 0, meta_scalars: int = 0, block: int = 0
+) -> float:
     """Stored bytes for ONE compressed vector of ``head_dim`` coordinates.
 
     Packed indices (``8 // bits`` codes per byte, so 3-bit codes occupy a
@@ -33,6 +35,8 @@ def compressed_bytes_per_token(head_dim: int, bits: int, group: int = 0) -> floa
     plus an fp16 norm, plus — when ``group`` > 0 — the per-group min/scale
     metadata amortised over the group: two fp16 scalars per coordinate per
     ``group`` tokens (= 32/group bits per element, 1.0 bit at group=32).
+    ``meta_scalars`` > 0 adds a fitted codebook: that many fp16 scalars per
+    coordinate shared by ``block`` tokens (``block`` must then be > 0).
     Shared by MSECompressor.memory_bytes and both caches' memory_report so the
     analytic and realised accounting can never drift apart.
     """
@@ -40,6 +44,10 @@ def compressed_bytes_per_token(head_dim: int, bits: int, group: int = 0) -> floa
     idx_bytes = math.ceil(head_dim / indices_per_byte)
     norm_bytes = 2
     meta_bytes = (2 * head_dim * 2) / group if group > 0 else 0.0
+    if meta_scalars > 0:
+        if block <= 0:
+            raise ValueError(f"meta_scalars > 0 needs block > 0, got {block}")
+        meta_bytes += (meta_scalars * head_dim * 2) / block
     return idx_bytes + norm_bytes + meta_bytes
 
 
@@ -60,16 +68,66 @@ class MSECompressor:
     trailing group is quantized with its own (narrower) statistics.
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", group: int = 0):
+    def __init__(
+        self,
+        head_dim: int,
+        bits: int,
+        seed: int,
+        device: str = "cpu",
+        group: int = 0,
+        levels_mode: str = "",
+    ):
         self.head_dim = head_dim
         self.bits = bits
         self.device = device
         self.group = int(group)
         if self.group < 0:
             raise ValueError(f"group must be >= 0, got {group}")
+        self.levels_mode = levels_mode
+        if self.levels_mode and self.group > 0:
+            raise ValueError("levels_mode and group > 0 are exclusive codebook stages")
 
         self.Pi = generate_rotation_matrix(head_dim, seed=seed, device=device)
         self.centroids = LloydMaxCodebook(head_dim, bits).centroids.to(device)
+
+    @property
+    def meta_scalars(self) -> int:
+        """fp16 codebook scalars per coordinate per block (0 without levels_mode)."""
+        if not self.levels_mode:
+            return 0
+        return fitted_levels.meta_scalars(self.bits, self.levels_mode)
+
+    # --- fitted-levels codebook stage -----------------------------------
+
+    def _fit_quantize(self, rotated: torch.Tensor, B: int, H: int, S: int, D: int):
+        """(N, D) rotated unit vectors -> (indices (N, D) int32, stored fp16 tensors).
+
+        Levels are fitted on the whole block per (batch, head, coordinate) and
+        rounded to fp16 before assignment so compress and decompress share the
+        exact grid.
+        """
+        z = rotated.reshape(B * H, S, D)
+        levels = fitted_levels.fit_levels(z, self.bits, self.levels_mode).to(
+            torch.float16
+        )
+        if self.levels_mode == "kmeans":
+            stored = {"levels": levels.reshape(B, H, -1, D)}
+        else:
+            stored = {
+                "lo": levels[:, :1, :].reshape(B, H, 1, D),
+                "hi": levels[:, -1:, :].reshape(B, H, 1, D),
+            }
+            levels = self._levels_from_stored(stored, B, H, D)
+        indices = fitted_levels.assign(z, levels.float()).reshape(B * H * S, D)
+        return indices, stored
+
+    def _levels_from_stored(self, stored: dict, B: int, H: int, D: int) -> torch.Tensor:
+        """Stored fp16 tensors -> (B*H, L, D) fp32 levels."""
+        if self.levels_mode == "kmeans":
+            return stored["levels"].float().reshape(B * H, -1, D)
+        lo = stored["lo"].float().reshape(B * H, 1, D)
+        hi = stored["hi"].float().reshape(B * H, 1, D)
+        return fitted_levels.minmax_levels(lo, hi, self.bits)
 
     # --- grouped (min-max) codebook stage -------------------------------
 
@@ -96,8 +154,16 @@ class MSECompressor:
         idx = idx.reshape(B, H, G * g, D)[:, :, :S, :].reshape(B * H * S, D)
         return idx, gmin, gscale
 
-    def _group_dequantize(self, indices: torch.Tensor, gmin: torch.Tensor,
-                          gscale: torch.Tensor, B: int, H: int, S: int, D: int) -> torch.Tensor:
+    def _group_dequantize(
+        self,
+        indices: torch.Tensor,
+        gmin: torch.Tensor,
+        gscale: torch.Tensor,
+        B: int,
+        H: int,
+        S: int,
+        D: int,
+    ) -> torch.Tensor:
         """Inverse of _group_quantize -> (N, D) rotated unit vectors (fp32)."""
         g = self.group
         levels = (1 << self.bits) - 1
@@ -126,8 +192,10 @@ class MSECompressor:
         # Rotate + quantize. argmin returns int64 by default; cast once to int32
         # (2^bits <= 256 fits comfortably) and stay int32 through bit-packing.
         rotated = flat_norm @ self.Pi.T
-        gmin = gscale = None
-        if self.group > 0:
+        gmin = gscale = fit = None
+        if self.levels_mode:
+            indices, fit = self._fit_quantize(rotated, B, H, S, D)
+        elif self.group > 0:
             indices, gmin, gscale = self._group_quantize(rotated, B, H, S, D)
         else:
             diffs = rotated.unsqueeze(-1) - self.centroids  # (N, D, levels)
@@ -141,10 +209,15 @@ class MSECompressor:
         n_groups = indices.shape[-1] // indices_per_byte
         idx_powers = torch.tensor(
             [2 ** (self.bits * i) for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.int32, device=indices.device,
+            dtype=torch.int32,
+            device=indices.device,
         )
         # int32 * int32 → int32; final cast to uint8 for storage only.
-        idx_bytes = (indices.reshape(N, n_groups, indices_per_byte) * idx_powers).sum(-1).to(torch.uint8)
+        idx_bytes = (
+            (indices.reshape(N, n_groups, indices_per_byte) * idx_powers)
+            .sum(-1)
+            .to(torch.uint8)
+        )
 
         out = {
             "idx_bytes": idx_bytes.reshape(B, H, S, n_groups),
@@ -155,6 +228,8 @@ class MSECompressor:
         if self.group > 0:
             out["gmin"] = gmin
             out["gscale"] = gscale
+        if fit:
+            out.update(fit)
         return out
 
     @torch.no_grad()
@@ -175,15 +250,25 @@ class MSECompressor:
         mask = (1 << self.bits) - 1
         idx_shifts = torch.tensor(
             [self.bits * i for i in range(indices_per_byte - 1, -1, -1)],
-            dtype=torch.int32, device=idx_bytes.device,
+            dtype=torch.int32,
+            device=idx_bytes.device,
         )
-        indices = ((idx_bytes.to(torch.int32).unsqueeze(-1) >> idx_shifts) & mask).reshape(N, -1)
+        indices = (
+            (idx_bytes.to(torch.int32).unsqueeze(-1) >> idx_shifts) & mask
+        ).reshape(N, -1)
         if idx_pad:
             indices = indices[:, :D]
 
         # Reconstruct (fp32 for rotation-undo precision; caller re-casts to fp16).
-        if self.group > 0:
-            z = self._group_dequantize(indices, compressed["gmin"], compressed["gscale"], B, H, S, D)
+        if self.levels_mode:
+            levels = self._levels_from_stored(compressed, B, H, D)
+            z = fitted_levels.reconstruct(indices.reshape(B * H, S, D), levels).reshape(
+                N, D
+            )
+        elif self.group > 0:
+            z = self._group_dequantize(
+                indices, compressed["gmin"], compressed["gscale"], B, H, S, D
+            )
         else:
             z = self.centroids[indices]
         reconstructed = (z @ self.Pi) * vec_norms
@@ -193,7 +278,10 @@ class MSECompressor:
         """Actual memory usage in bytes (group metadata included when group > 0)."""
         D = self.head_dim
         N = B * H * S
-        compressed = int(round(N * compressed_bytes_per_token(D, self.bits, self.group)))
+        per_token = compressed_bytes_per_token(
+            D, self.bits, self.group, meta_scalars=self.meta_scalars, block=S
+        )
+        compressed = int(round(N * per_token))
         fp16 = N * D * 2
         return {
             "compressed_bytes": compressed,
@@ -239,7 +327,9 @@ class TurboQuantV3:
         self.key_group = int(key_group)
 
         # Layer-adaptive: first/last N layers get more bits
-        is_protected = layer_idx < protected_layers or layer_idx >= (n_layers - protected_layers)
+        is_protected = layer_idx < protected_layers or layer_idx >= (
+            n_layers - protected_layers
+        )
         effective_key_bits = protected_bits if is_protected else key_bits
         effective_value_bits = protected_bits if is_protected else value_bits
 
@@ -253,7 +343,9 @@ class TurboQuantV3:
         self.key_compressor = MSECompressor(
             head_dim, self.key_bits, seed=seed_base, device=device, group=self.key_group
         )
-        self.val_compressor = MSECompressor(head_dim, self.value_bits, seed=seed_base + 500, device=device)
+        self.val_compressor = MSECompressor(
+            head_dim, self.value_bits, seed=seed_base + 500, device=device
+        )
 
     @torch.no_grad()
     def compress_kv(
@@ -273,8 +365,18 @@ class TurboQuantV3:
         if S <= rw:
             # Short sequence — keep everything in fp16
             return (
-                {"fp16": keys, "compressed": None, "shape": (B, H, S, D), "split_at": S},
-                {"fp16": values, "compressed": None, "shape": (B, H, S, D), "split_at": S},
+                {
+                    "fp16": keys,
+                    "compressed": None,
+                    "shape": (B, H, S, D),
+                    "split_at": S,
+                },
+                {
+                    "fp16": values,
+                    "compressed": None,
+                    "shape": (B, H, S, D),
+                    "split_at": S,
+                },
             )
 
         # Split: compress old tokens, keep recent in fp16
@@ -337,7 +439,9 @@ class TurboQuantV3:
             compressed_bytes = 0
 
         # fp16 residual window
-        fp16_window_bytes = B * H * fp16_S * self.head_dim * 2 * 2  # keys + values, fp16
+        fp16_window_bytes = (
+            B * H * fp16_S * self.head_dim * 2 * 2
+        )  # keys + values, fp16
 
         total_compressed = compressed_bytes + fp16_window_bytes
         total_fp16 = B * H * S * self.head_dim * 2 * 2  # full fp16 baseline
@@ -345,7 +449,9 @@ class TurboQuantV3:
         return {
             "compressed_bytes": total_compressed,
             "fp16_bytes": total_fp16,
-            "compression_ratio": total_fp16 / total_compressed if total_compressed > 0 else 0,
+            "compression_ratio": total_fp16 / total_compressed
+            if total_compressed > 0
+            else 0,
             "compressed_tokens": compressed_S,
             "fp16_tokens": fp16_S,
             "key_bits": self.key_bits,
