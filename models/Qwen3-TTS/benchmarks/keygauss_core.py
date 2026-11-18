@@ -30,6 +30,7 @@ import traceback
 import pandas as pd
 import torch
 
+from turboquant.fitted_levels import assign, fit_levels, reconstruct
 from turboquant.lloyd_max import LloydMaxCodebook
 from turboquant.turboquant import generate_rotation_matrix
 
@@ -182,20 +183,9 @@ def quant_kmeans(z: torch.Tensor, bits: int, iters: int = 20) -> torch.Tensor:
     """Per-coordinate 1-D k-means (Lloyd) with 2^bits levels fitted on z itself:
     the codebook a prefill-time quantizer could fit on the prompt (metadata =
     2^bits fp16 levels per coordinate per block)."""
-    L = 1 << bits
-    q = torch.quantile(
-        z, torch.linspace(0, 1, L + 2, device=z.device)[1:-1], dim=0
-    )  # (L, D)
-    levels = q.T.contiguous()  # (D, L)
-    zt = z.T  # (D, S)
-    for _ in range(iters):
-        idx = (zt.unsqueeze(-1) - levels.unsqueeze(1)).abs().argmin(dim=-1)  # (D, S)
-        onehot = torch.nn.functional.one_hot(idx, L).float()  # (D, S, L)
-        cnt = onehot.sum(dim=1)  # (D, L)
-        new = torch.einsum("dsl,ds->dl", onehot, zt) / cnt.clamp_min(1)
-        levels = torch.where(cnt > 0, new, levels)
-    idx = (zt.unsqueeze(-1) - levels.unsqueeze(1)).abs().argmin(dim=-1)
-    return torch.gather(levels, 1, idx).T
+    zz = z.unsqueeze(0)
+    lv = fit_levels(zz, bits, "kmeans", iters)
+    return reconstruct(assign(zz, lv), lv)[0]
 
 
 def _error_stats(z: torch.Tensor, zhat: torch.Tensor, name: str, bits: int) -> dict:
