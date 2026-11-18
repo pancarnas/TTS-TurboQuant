@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from turboquant.compressors_v3 import MSECompressor, compressed_bytes_per_token
+from turboquant.compressors_v3 import (
+    MSECompressor,
+    TurboQuantV3,
+    compressed_bytes_per_token,
+)
 
 
 def test_bytes_per_token_adds_amortized_metadata_and_keeps_old_signature():
@@ -54,3 +58,75 @@ def test_memory_bytes_counts_levels_over_the_block():
     assert c.meta_scalars == 4
     expected = round(2 * 53 * compressed_bytes_per_token(32, 2, 0, 4, 53))
     assert c.memory_bytes(1, 2, 53)["compressed_bytes"] == expected
+
+
+def test_v3_prefix_zero_is_identical_to_old_output():
+    c = TurboQuantV3(
+        16,
+        key_bits=2,
+        value_bits=2,
+        residual_window=0,
+        protected_layers=0,
+        key_group=16,
+    )
+    k = torch.randn(1, 2, 64, 16)
+    v = torch.randn(1, 2, 64, 16)
+    a = c.decompress_kv(*c.compress_kv(k, v))
+    b = c.decompress_kv(*c.compress_kv(k, v, prefix=0))
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+def test_v3_prefix_compressed_with_fitted_levels_rest_unchanged():
+    base = TurboQuantV3(16, 2, 2, residual_window=0, protected_layers=0, key_group=16)
+    pq = TurboQuantV3(
+        16,
+        2,
+        2,
+        residual_window=0,
+        protected_layers=0,
+        key_group=16,
+        prefix_codebook="kmeans",
+        prefix_bits=3,
+    )
+    assert pq.prefix_bits_effective == 3 and pq.prefix_key_compressor.bits == 3
+    k = torch.randn(1, 2, 70, 16)
+    v = torch.randn(1, 2, 70, 16)
+    ck, cv = pq.compress_kv(k, v, prefix=22)
+    assert ck["prefix"]["n"] == 22 and "levels" in ck["prefix"]["compressed"]
+    rk, rv = pq.decompress_kv(ck, cv)
+    assert rk.shape == k.shape
+    fixed = base.decompress_kv(*base.compress_kv(k[:, :, :22], v[:, :, :22]))[0]
+
+    def err(a, b):
+        return ((a - b) ** 2).sum() / (b**2).sum()
+
+    assert err(rk[:, :, :22], k[:, :, :22]) < 0.5 * err(fixed, k[:, :, :22])
+    rest = base.decompress_kv(*base.compress_kv(k[:, :, 22:], v[:, :, 22:]))[0]
+    assert torch.equal(rk[:, :, 22:], rest)
+
+
+def test_v3_prefix_only_empty_remainder():
+    pq = TurboQuantV3(
+        16, 2, 2, protected_layers=0, prefix_codebook="minmax", prefix_bits=3
+    )
+    k = torch.randn(1, 2, 22, 16)
+    v = torch.randn(1, 2, 22, 16)
+    ck, cv = pq.compress_kv(k, v, prefix=22)
+    rk, rv = pq.decompress_kv(ck, cv)
+    assert rk.shape == k.shape and rv.shape == v.shape
+
+
+def test_v3_prefix_bits_zero_follows_key_bits():
+    c = TurboQuantV3(16, 8, 8, protected_layers=0, prefix_codebook="minmax")
+    assert c.prefix_bits_effective == 8
+
+
+def test_v3_rejects_bad_args():
+    with pytest.raises(ValueError):
+        TurboQuantV3(16, 2, 2, prefix_codebook="median")
+    with pytest.raises(ValueError):
+        TurboQuantV3(16, 2, 2, prefix_codebook="kmeans", prefix_bits=-1)
+    with pytest.raises(ValueError):
+        TurboQuantV3(16, 2, 2).compress_kv(
+            torch.randn(1, 1, 4, 16), torch.randn(1, 1, 4, 16), prefix=2
+        )

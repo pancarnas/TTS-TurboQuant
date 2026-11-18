@@ -320,7 +320,13 @@ class TurboQuantV3:
         seed: int = 42,
         device: str = "cpu",
         key_group: int = 0,
+        prefix_codebook: str = "",
+        prefix_bits: int = 0,
     ):
+        if prefix_codebook not in ("", "kmeans", "minmax"):
+            raise ValueError(f"unknown prefix_codebook {prefix_codebook!r}")
+        if prefix_bits < 0:
+            raise ValueError("prefix_bits must be >= 0")
         self.head_dim = head_dim
         self.residual_window = residual_window
         self.device = device
@@ -346,19 +352,56 @@ class TurboQuantV3:
         self.val_compressor = MSECompressor(
             head_dim, self.value_bits, seed=seed_base + 500, device=device
         )
+        # Prompt-span keys use a codebook fitted on the prompt itself; same
+        # seed as key_compressor so the rotation matches.
+        self.prefix_bits_effective = min(prefix_bits or self.key_bits, 8)
+        self.prefix_key_compressor = (
+            MSECompressor(
+                head_dim,
+                self.prefix_bits_effective,
+                seed=seed_base,
+                device=device,
+                levels_mode=prefix_codebook,
+            )
+            if prefix_codebook
+            else None
+        )
 
     @torch.no_grad()
     def compress_kv(
-        self, keys: torch.Tensor, values: torch.Tensor
+        self, keys: torch.Tensor, values: torch.Tensor, prefix: int = 0
     ) -> tuple[dict, dict]:
         """
         Compress key and value tensors.
         Input: keys, values — both (B, H, S, D)
 
+        With prefix > 0 the first `prefix` tokens are compressed with the
+        fitted-levels prefix compressor (stored under "prefix"); the dicts'
+        other fields describe the remainder keys[:, :, prefix:] exactly as
+        for prefix == 0 (the remainder may be empty).
+
         If S > residual_window, the last `residual_window` tokens are kept
         in fp16 (uncompressed) for generation quality. Only older tokens
         are quantized.
         """
+        if prefix == 0:
+            return self._compress_rest(keys, values)
+        if self.prefix_key_compressor is None:
+            raise ValueError("prefix > 0 requires a prefix_codebook")
+        ck, cv = self._compress_rest(keys[:, :, prefix:], values[:, :, prefix:])
+        ck["prefix"] = {
+            "compressed": self.prefix_key_compressor.compress(keys[:, :, :prefix]),
+            "n": prefix,
+        }
+        cv["prefix"] = {
+            "compressed": self.val_compressor.compress(values[:, :, :prefix]),
+            "n": prefix,
+        }
+        return ck, cv
+
+    def _compress_rest(
+        self, keys: torch.Tensor, values: torch.Tensor
+    ) -> tuple[dict, dict]:
         B, H, S, D = keys.shape
         rw = self.residual_window
 
@@ -409,6 +452,19 @@ class TurboQuantV3:
         Decompress back to full tensors.
         Returns: keys (B, H, S, D), values (B, H, S, D)
         """
+        keys, values = self._decompress_rest(compressed_k, compressed_v)
+        if "prefix" not in compressed_k:
+            return keys, values
+        pk = self.prefix_key_compressor.decompress(compressed_k["prefix"]["compressed"])
+        pv = self.val_compressor.decompress(compressed_v["prefix"]["compressed"])
+        return (
+            torch.cat([pk.to(keys.dtype), keys], dim=2),
+            torch.cat([pv.to(values.dtype), values], dim=2),
+        )
+
+    def _decompress_rest(
+        self, compressed_k: dict, compressed_v: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if compressed_k["compressed"] is None:
             return compressed_k["fp16"], compressed_v["fp16"]
 
