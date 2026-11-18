@@ -141,3 +141,69 @@ def test_config_defaults_off_and_validation():
         TurboQuantConfig(protect_prefix=0, prefix_codebook="kmeans")
     with pytest.raises(ValueError):
         TurboQuantConfig(protect_prefix=-1, prefix_codebook="other")
+
+
+from tests.test_keyfix import _cfg, _feed_qwen, _qwen_cache_mod  # noqa: E402
+
+
+def test_cache_prefix_codebook_quantizes_the_prompt_and_leaves_generation_as_pp():
+    mod = _qwen_cache_mod()
+    g = torch.Generator().manual_seed(0)
+    P, D, H = 40, 64, 2
+    k0, v0 = torch.randn(1, H, P, D, generator=g), torch.randn(1, H, P, D, generator=g)
+    pq = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3, key_group=16), n_layers=1)
+    pp = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, key_group=16), n_layers=1)
+    for c in (pq, pp):
+        c.update(k0.clone(), v0.clone(), layer_idx=0)
+    assert not torch.equal(pq._buf_k[0][:, :, :P], k0)  # prompt keys lossy
+    assert not torch.equal(pq._buf_v[0][:, :, :P], v0)  # prompt values quantized too
+    cos = torch.nn.functional.cosine_similarity(
+        pq._buf_k[0][:, :, :P].flatten(2), k0.flatten(2), dim=-1
+    ).mean()
+    assert cos > 0.97
+    assert pq._chunks_k[0][0].get("prefix") is True and pq._chunks_k[0][0]["span"] == P
+    k_in_q, k_out_q = _feed_qwen(pq, steps=4, step_len=8, seed=1)
+    k_in_p, k_out_p = _feed_qwen(pp, steps=4, step_len=8, seed=1)
+    assert torch.equal(k_out_q[:, :, P:], k_out_p[:, :, P:])  # generated path identical to pp
+    assert pq._compressed_upto[0] == pp._compressed_upto[0] == P + 32
+
+
+def test_cache_prefix_codebook_with_identity_rope_matches_post_rope_path():
+    # cos = 1, sin = 0 makes RoPE the identity, so the pre-RoPE path must reproduce the plain path
+    mod = _qwen_cache_mod()
+    P, D, H = 40, 64, 2
+    g = torch.Generator().manual_seed(0)
+    k0, v0 = torch.randn(1, H, P, D, generator=g), torch.randn(1, H, P, D, generator=g)
+    plain = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3), n_layers=1)
+    pre = mod.TurboQuantKVCache(
+        _cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3, pre_rope_keys=True),
+        n_layers=1,
+        rope_scaling=None,
+    )
+    plain.update(k0.clone(), v0.clone(), layer_idx=0)
+    pre.update(k0.clone(), v0.clone(), layer_idx=0,
+               cache_kwargs={"cos": torch.ones(1, P, D), "sin": torch.zeros(1, P, D)})
+    assert torch.allclose(pre._buf_k[0][:, :, :P], plain._buf_k[0][:, :, :P], atol=1e-5)
+    assert not torch.equal(pre._buf_k[0][:, :, :P], k0)
+
+
+def test_cache_prefix_codebook_memory_report():
+    mod = _qwen_cache_mod()
+    D, H, P, n = 64, 2, 40, 32
+    pq = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, prefix_codebook="minmax", prefix_bits=3, track_only=True), n_layers=1)
+    pp = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, track_only=True), n_layers=1)
+    for c in (pq, pp):
+        c.update(torch.randn(1, H, P, D), torch.randn(1, H, P, D), layer_idx=0)
+        c.update(torch.randn(1, H, n, D), torch.randn(1, H, n, D), layer_idx=0)
+    diff = pp.memory_report()["compressed_bytes"] - pq.memory_report()["compressed_bytes"]
+    expect = H * P * (2 * D * 2 - compressed_bytes_per_token(D, 3, 0, 2, P) - compressed_bytes_per_token(D, 2))
+    assert abs(diff - expect) < 1
+    assert torch.isfinite(pq._buf_k[0][:, :, :P]).all()  # track_only: buffer untouched
+
+
+def test_cache_default_config_unchanged():
+    mod = _qwen_cache_mod()
+    a, b = mod.TurboQuantKVCache(_cfg(), n_layers=1), mod.TurboQuantKVCache(_cfg(prefix_codebook=""), n_layers=1)
+    ka, oa = _feed_qwen(a, steps=5, step_len=8)
+    kb, ob = _feed_qwen(b, steps=5, step_len=8)
+    assert torch.equal(oa, ob)

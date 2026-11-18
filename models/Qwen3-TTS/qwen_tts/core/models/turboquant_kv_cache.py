@@ -32,6 +32,7 @@ from transformers.cache_utils import DynamicCache
 
 from turboquant.config import TurboQuantConfig
 from turboquant.compressors_v3 import TurboQuantV3, compressed_bytes_per_token
+from turboquant.fitted_levels import meta_scalars
 
 
 # Initial buffer capacity (tokens). Grows by doubling on overflow.
@@ -261,8 +262,36 @@ class TurboQuantKVCache(DynamicCache):
                 seed=self.config.seed,
                 device=str(device),
                 key_group=self.config.key_group,
+                prefix_codebook=self.config.prefix_codebook,
+                prefix_bits=self.config.prefix_bits,
             )
         return self._compressors[layer_idx]
+
+    def _compress_prefix(self, layer_idx: int, template: torch.Tensor) -> None:
+        """Quantize the prefill span [0, prefix) with the fitted-levels codebook.
+
+        Writes the lossy reconstruction back into the buffer and records a
+        ``"prefix"`` chunk; ``_compressed_upto`` is left alone so the generated
+        keys keep their own group alignment starting at the prefix end.
+        """
+        pfx = self._prefix_len[layer_idx]
+        k = self._buf_k[layer_idx][:, :, :pfx, :]
+        v = self._buf_v[layer_idx][:, :, :pfx, :]
+        rope_kw = None
+        if self.config.pre_rope_keys:
+            cos, sin = self._rope_slice(0, pfx)
+            rope_kw = self._rope_kwargs()
+            k = rope_keys(k, cos, sin, inverse=True, **rope_kw)
+        comp = self._get_compressor(layer_idx, template.shape[-1], template.device)
+        ck, cv = comp.compress_kv(k, v, prefix=pfx)
+        rk, rv = comp.decompress_kv(ck, cv)
+        dtype = self._buf_k[layer_idx].dtype
+        if rope_kw is not None:
+            rk = rope_keys(rk.to(dtype), cos, sin, inverse=False, **rope_kw)
+        self._buf_k[layer_idx][:, :, :pfx, :].copy_(rk.to(dtype))
+        self._buf_v[layer_idx][:, :, :pfx, :].copy_(rv.to(self._buf_v[layer_idx].dtype))
+        self._chunks_k[layer_idx].append({"blob": ck, "span": pfx, "prefix": True})
+        self._chunks_v[layer_idx].append({"blob": cv, "span": pfx, "prefix": True})
 
     def _legacy_compress_overflow(
         self, layer_idx: int, new_total_len: int, template: torch.Tensor
@@ -370,12 +399,17 @@ class TurboQuantKVCache(DynamicCache):
                 )
             self._record_rope(s, cache_kwargs["cos"], cache_kwargs["sin"])
 
+        if s == 0 and self.config.prefix_codebook and not self.config.track_only:
+            self._compress_prefix(layer_idx, template=key_states)
+
         # Track virtual chunk spans for memory_report / test introspection.
         # One placeholder per overflow event (matches legacy chunk-per-overflow count).
         rw = self.config.residual_window
         pfx = self._prefix_len.get(layer_idx, 0)
         if needed > rw + pfx:
-            prev_compressed = sum(c.get("span", 0) for c in self._chunks_k[layer_idx])
+            prev_compressed = sum(
+                c.get("span", 0) for c in self._chunks_k[layer_idx] if not c.get("prefix")
+            )
             want_compressed = needed - rw - pfx
             new_span = want_compressed - prev_compressed
             if new_span > 0:
@@ -456,17 +490,26 @@ class TurboQuantKVCache(DynamicCache):
             # fp16 tokens = protected prefix + residual window (both exact).
             rw = min(self.config.residual_window + self._prefix_len.get(layer_idx, 0), cur_len)
             compressed_tokens = max(cur_len - rw, 0)
+            # With a prefix codebook the prompt is quantized, not fp16: charge it
+            # separately and drop it from the exact-fp16 count.
+            pfx_q = min(self._prefix_len.get(layer_idx, 0), cur_len) if self.config.prefix_codebook else 0
+            rw -= pfx_q
+            kb_pfx = min(self.config.prefix_bits or kb, 8)
+            pfx_k_bytes = pfx_q * compressed_bytes_per_token(
+                D, kb_pfx, 0, meta_scalars(kb_pfx, self.config.prefix_codebook), pfx_q
+            ) if pfx_q else 0
+            pfx_v_bytes = pfx_q * compressed_bytes_per_token(D, vb)
 
             # Simulated: what compression WOULD store = compressed chunks + fp16
             # residual. Shared formula (turboquant.compressors_v3); keys carry
             # the group min/scale metadata when key_group > 0.
             sim_k = (
-                (compressed_tokens * compressed_bytes_per_token(D, kb, self.config.key_group) + rw * D * 2)
+                (compressed_tokens * compressed_bytes_per_token(D, kb, self.config.key_group) + rw * D * 2 + pfx_k_bytes)
                 * B
                 * H
             )
             sim_v = (
-                (compressed_tokens * compressed_bytes_per_token(D, vb) + rw * D * 2)
+                (compressed_tokens * compressed_bytes_per_token(D, vb) + rw * D * 2 + pfx_v_bytes)
                 * B
                 * H
             )
