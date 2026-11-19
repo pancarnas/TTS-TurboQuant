@@ -151,7 +151,10 @@ def test_cache_prefix_codebook_quantizes_the_prompt_and_leaves_generation_as_pp(
     g = torch.Generator().manual_seed(0)
     P, D, H = 40, 64, 2
     k0, v0 = torch.randn(1, H, P, D, generator=g), torch.randn(1, H, P, D, generator=g)
-    pq = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3, key_group=16), n_layers=1)
+    pq = mod.TurboQuantKVCache(
+        _cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3, key_group=16),
+        n_layers=1,
+    )
     pp = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, key_group=16), n_layers=1)
     for c in (pq, pp):
         c.update(k0.clone(), v0.clone(), layer_idx=0)
@@ -164,7 +167,9 @@ def test_cache_prefix_codebook_quantizes_the_prompt_and_leaves_generation_as_pp(
     assert pq._chunks_k[0][0].get("prefix") is True and pq._chunks_k[0][0]["span"] == P
     k_in_q, k_out_q = _feed_qwen(pq, steps=4, step_len=8, seed=1)
     k_in_p, k_out_p = _feed_qwen(pp, steps=4, step_len=8, seed=1)
-    assert torch.equal(k_out_q[:, :, P:], k_out_p[:, :, P:])  # generated path identical to pp
+    assert torch.equal(
+        k_out_q[:, :, P:], k_out_p[:, :, P:]
+    )  # generated path identical to pp
     assert pq._compressed_upto[0] == pp._compressed_upto[0] == P + 32
 
 
@@ -174,15 +179,26 @@ def test_cache_prefix_codebook_with_identity_rope_matches_post_rope_path():
     P, D, H = 40, 64, 2
     g = torch.Generator().manual_seed(0)
     k0, v0 = torch.randn(1, H, P, D, generator=g), torch.randn(1, H, P, D, generator=g)
-    plain = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3), n_layers=1)
+    plain = mod.TurboQuantKVCache(
+        _cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3), n_layers=1
+    )
     pre = mod.TurboQuantKVCache(
-        _cfg(protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3, pre_rope_keys=True),
+        _cfg(
+            protect_prefix=-1,
+            prefix_codebook="kmeans",
+            prefix_bits=3,
+            pre_rope_keys=True,
+        ),
         n_layers=1,
         rope_scaling=None,
     )
     plain.update(k0.clone(), v0.clone(), layer_idx=0)
-    pre.update(k0.clone(), v0.clone(), layer_idx=0,
-               cache_kwargs={"cos": torch.ones(1, P, D), "sin": torch.zeros(1, P, D)})
+    pre.update(
+        k0.clone(),
+        v0.clone(),
+        layer_idx=0,
+        cache_kwargs={"cos": torch.ones(1, P, D), "sin": torch.zeros(1, P, D)},
+    )
     assert torch.allclose(pre._buf_k[0][:, :, :P], plain._buf_k[0][:, :, :P], atol=1e-5)
     assert not torch.equal(pre._buf_k[0][:, :, :P], k0)
 
@@ -190,20 +206,147 @@ def test_cache_prefix_codebook_with_identity_rope_matches_post_rope_path():
 def test_cache_prefix_codebook_memory_report():
     mod = _qwen_cache_mod()
     D, H, P, n = 64, 2, 40, 32
-    pq = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, prefix_codebook="minmax", prefix_bits=3, track_only=True), n_layers=1)
+    pq = mod.TurboQuantKVCache(
+        _cfg(
+            protect_prefix=-1, prefix_codebook="minmax", prefix_bits=3, track_only=True
+        ),
+        n_layers=1,
+    )
     pp = mod.TurboQuantKVCache(_cfg(protect_prefix=-1, track_only=True), n_layers=1)
     for c in (pq, pp):
         c.update(torch.randn(1, H, P, D), torch.randn(1, H, P, D), layer_idx=0)
         c.update(torch.randn(1, H, n, D), torch.randn(1, H, n, D), layer_idx=0)
-    diff = pp.memory_report()["compressed_bytes"] - pq.memory_report()["compressed_bytes"]
-    expect = H * P * (2 * D * 2 - compressed_bytes_per_token(D, 3, 0, 2, P) - compressed_bytes_per_token(D, 2))
+    diff = (
+        pp.memory_report()["compressed_bytes"] - pq.memory_report()["compressed_bytes"]
+    )
+    expect = (
+        H
+        * P
+        * (
+            2 * D * 2
+            - compressed_bytes_per_token(D, 3, 0, 2, P)
+            - compressed_bytes_per_token(D, 2)
+        )
+    )
     assert abs(diff - expect) < 1
     assert torch.isfinite(pq._buf_k[0][:, :, :P]).all()  # track_only: buffer untouched
 
 
 def test_cache_default_config_unchanged():
     mod = _qwen_cache_mod()
-    a, b = mod.TurboQuantKVCache(_cfg(), n_layers=1), mod.TurboQuantKVCache(_cfg(prefix_codebook=""), n_layers=1)
+    a, b = (
+        mod.TurboQuantKVCache(_cfg(), n_layers=1),
+        mod.TurboQuantKVCache(_cfg(prefix_codebook=""), n_layers=1),
+    )
     ka, oa = _feed_qwen(a, steps=5, step_len=8)
     kb, ob = _feed_qwen(b, steps=5, step_len=8)
     assert torch.equal(oa, ob)
+
+
+def test_recorder_prefix_codebook_splices_quantized_prompt():
+    import os  # noqa: F401
+    from tests.test_keyfix import _cols, _recorder_ns, _talker_module
+
+    ns = _recorder_ns()
+    D, groups, P = 64, 2, 24
+    rec = ns["DivergenceRecorder"](
+        specs=[(2, 2, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        protect_prefix=-1,
+        prefix_codebook="kmeans",
+        prefix_bits=3,
+    )
+    pp = ns["DivergenceRecorder"](
+        specs=[(2, 2, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        protect_prefix=-1,
+    )
+    for r in (rec, pp):
+        r.group, r.idx = "g", 0
+    g = torch.Generator().manual_seed(0)
+    key = torch.randn(1, 2, P, D, generator=g)
+    q = torch.randn(1, 4, P, D, generator=g)
+    for r in (rec, pp):
+        r.record(_talker_module(groups, P, 0, D), q, key, key, None, D**-0.5)
+    d, dp = dict(zip(_cols(), rec.rows[0])), dict(zip(_cols(), pp.rows[0]))
+    assert (
+        d["prefix_codebook"] == "kmeans"
+        and d["prefix_bits"] == 3
+        and dp["prefix_codebook"] == ""
+    )
+    assert (
+        0 < d["attn_js"] and d["cos_k"] < 1.0 and d["relmse_k"] > 0
+    )  # prompt lossy, measured
+    assert dp["attn_js"] < 1e-6  # fp16 prompt still exact
+    assert rec.errors == 0
+
+
+def test_recorder_compressor_cache_key_includes_effective_prefix_bits():
+    from tests.test_keyfix import _recorder_ns
+
+    ns = _recorder_ns()
+    rec = ns["DivergenceRecorder"](
+        specs=[(8, 8, 0), (2, 2, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        protect_prefix=-1,
+        prefix_codebook="kmeans",
+        prefix_bits=0,
+    )
+    a = rec._comp(0, 8, 8, 0, 16, "cpu")
+    b = rec._comp(0, 2, 2, 0, 16, "cpu")
+    assert a.prefix_bits_effective == 8 and b.prefix_bits_effective == 2
+
+
+def test_wav_path_and_make_config_carry_codebook(tmp_path):
+    import os
+
+    from tests.test_keyfix import _single
+
+    wav_path = _single("_wav_path", {"os": os})
+    assert wav_path(
+        str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 32, True, -1, "kmeans", 3
+    ).endswith("_pl=0_g=32_pre_pq=k3.wav")
+    assert wav_path(
+        str(tmp_path), "g", 3, 0, 0.9, 8, 8, 0, 0, 32, True, -1, "minmax", 0
+    ).endswith("_pq=m8.wav")
+    assert wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 32, True, -1).endswith(
+        "_pp=prompt.wav"
+    )
+    assert wav_path(
+        str(tmp_path), "g", 3, 0, 0.9, None, None, None, 0, 0, False, -1, "kmeans", 2
+    ).endswith("_fp16.wav")
+    make_config = _single("make_config", {"TurboQuantConfig": TurboQuantConfig})
+    c = make_config(2, 2, 0, 0, 32, True, -1, "kmeans", 2)
+    assert c.prefix_codebook == "kmeans" and c.prefix_bits == 2
+
+
+def test_load_done_filters_codebook_and_old_csv(tmp_path):
+    import os
+
+    from tests.test_keyfix import _cols, _single
+
+    pd = pytest.importorskip("pandas")
+    load_done = _single("load_done", {"pd": pd, "os": os})
+    cols = _cols()
+    rows = [
+        ("g", 0, 0, 10, 2, 2, 0, 0, 32, 1, -1, "", 0) + tuple([0.1] * 9),
+        ("g", 1, 0, 10, 2, 2, 0, 0, 32, 1, -1, "kmeans", 2) + tuple([0.1] * 9),
+    ]
+    p = tmp_path / "d.csv"
+    pd.DataFrame(rows, columns=cols).to_csv(p, index=False)
+    assert load_done(str(p), 0, 32, True, -1) == {("g", 0)}
+    assert load_done(str(p), 0, 32, True, -1, "kmeans", 2) == {("g", 1)}
+    old = tmp_path / "old.csv"
+    pd.DataFrame(rows, columns=cols).drop(
+        columns=["prefix_codebook", "prefix_bits"]
+    ).to_csv(old, index=False)
+    assert load_done(str(old), 0, 32, True, -1, "kmeans", 2) == set()

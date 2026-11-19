@@ -163,8 +163,8 @@ def test_load_done_filters_protect_prefix(tmp_path):
     load_done = _single("load_done", {"pd": pd, "os": os})
     cols = _cols()
     rows = [
-        ("g", 0, 0, 10, 2, 2, 0, 0, 0, 0, 0) + tuple([0.1] * 9),
-        ("g", 1, 0, 10, 2, 2, 0, 0, 0, 0, -1) + tuple([0.1] * 9),
+        ("g", 0, 0, 10, 2, 2, 0, 0, 0, 0, 0, "", 0) + tuple([0.1] * 9),
+        ("g", 1, 0, 10, 2, 2, 0, 0, 0, 0, -1, "", 0) + tuple([0.1] * 9),
     ]
     p = tmp_path / "d.csv"
     pd.DataFrame(rows, columns=cols).to_csv(p, index=False)
