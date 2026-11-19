@@ -36,7 +36,7 @@ echo "### 1/3 unit tests (key-fix + divergence driver + caches) ###"
 "$PY" -c "import pytest" 2>/dev/null || pip install -q pytest
 "$PY" -m pytest tests/test_keyfix.py tests/test_kv_attn_divergence.py \
   tests/test_turboquant_cache_readback.py tests/test_score_wav_dir.py \
-  tests/test_check_audio.py models/Qwen3-TTS/tests/ -q
+  tests/test_check_audio.py tests/test_prefix_codebook.py tests/test_fitted_levels.py models/Qwen3-TTS/tests/ -q
 
 echo "### 2/3 tiny cells through the Qwen divergence experiment ###"
 [ "$CELLS" = "$ALL_CELLS" ] && rm -rf "$OUT_DIR"

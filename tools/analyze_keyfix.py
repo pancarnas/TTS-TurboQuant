@@ -78,6 +78,24 @@ def effective_bits(bits, meta_bits, prefix_fp16, P, S, prefix_bits_per_elem=None
     return float((pcost * P.sum() + (bits + meta_bits) * (S - P).sum()) / S.sum())
 
 
+def prefix_cell_bits(g, kb, vb):
+    """Pooled key/value bits for one (cell, config) frame; codebook cells cost pb bits per prompt element
+    (keys add the fitted levels' fp16 scalars; prompt values are quantized at vb by the value compressor)."""
+    P, S = g["prompt_len"].to_numpy().astype(float), g["seq_len"].to_numpy().astype(float)
+    pp = int(g["protect_prefix"].fillna(0).iloc[0]) if "protect_prefix" in g else 0
+    Pp = P if pp < 0 else np.minimum(P, float(pp))
+    meta = 1.0 if int(g["key_group"].iloc[0]) > 0 else 0.0
+    mode, pb = str(g["prefix_codebook"].iloc[0]), int(g["prefix_bits"].iloc[0]) or kb
+    cost = vcost = None
+    if mode:  # codebook-coded prompt: pb bits per element plus the fitted levels' fp16 scalars
+        from turboquant.fitted_levels import meta_scalars
+        cost, vcost = pb + meta_scalars(pb, mode) * 16 / Pp.mean(), float(vb)
+    S1000 = np.full_like(S, 1000.0)
+    return {"key": effective_bits(kb, meta, pp != 0, Pp, S, cost),
+            "value": effective_bits(vb, 0.0, pp != 0, Pp, S, vcost),
+            "key_1000": effective_bits(kb, meta, pp != 0, Pp, S1000, cost), "mode": mode, "pb": pb}
+
+
 def runaway_table(scores):
     """Per (cell, base config): collapses (CER > 0.5), runaways (collapsed, duration > 3x the sentence's fp16
     duration), early stops (< 1.5x), and the median ratio / speaker similarity over the collapsed sentences."""
@@ -274,18 +292,9 @@ def main():
                 continue
             d = lens[c]
             for (kb, vb), g in d.groupby(["key_bits", "value_bits"]):
-                P = g["prompt_len"].to_numpy().astype(float); S = g["seq_len"].to_numpy().astype(float)
-                pp = int(g["protect_prefix"].fillna(0).iloc[0]) if "protect_prefix" in g else 0
-                Pp = P if pp < 0 else np.minimum(P, float(pp))
-                meta = 1.0 if int(g["key_group"].iloc[0]) > 0 else 0.0
-                mode, pb = str(g["prefix_codebook"].iloc[0]), int(g["prefix_bits"].iloc[0]) or int(kb)
-                cost = None
-                if mode:  # codebook-coded prompt keys: pb bits per element plus the fitted levels' fp16 scalars
-                    from turboquant.fitted_levels import meta_scalars
-                    cost = pb + meta_scalars(pb, mode) * 16 / Pp.mean()
-                kbits = effective_bits(int(kb), meta, pp != 0, Pp, S, cost)
-                vbits = effective_bits(int(vb), 0.0, pp != 0, Pp, S)
-                k1000 = effective_bits(int(kb), meta, pp != 0, Pp, np.full_like(S, 1000.0), cost)
+                P, S = g["prompt_len"].to_numpy().astype(float), g["seq_len"].to_numpy().astype(float)
+                bits = prefix_cell_bits(g, int(kb), int(vb))
+                kbits, vbits, k1000, mode, pb = (bits[k] for k in ("key", "value", "key_1000", "mode", "pb"))
                 label = cfg_label(int(kb), int(vb)) + (f" {mode} {pb}b prompt" if mode else "")
                 L.append(f"| {c} | {label} | {int(P.min())}/{P.mean():.0f}/{int(P.max())} | "
                          f"{int(S.min())}/{S.mean():.0f}/{int(S.max())} | {kbits:.2f} | {vbits:.2f} | {k1000:.2f} |")

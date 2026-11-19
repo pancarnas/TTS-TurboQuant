@@ -66,6 +66,9 @@ source .venv/bin/activate            # same env as the campaign (00_setup.sh)
 bash scripts/gpu/03_smoke_keyfix.sh
 # re-run ONE cell after a code fix (keeps the other cells' CSVs and wavs):
 CELLS="pre" bash scripts/gpu/03_smoke_keyfix.sh
+# the validator expects every cell from the same run: CELLS=pk alone against
+# older smoke CSVs fails the column checks for the old cells, so re-run the
+# default ALL_CELLS once after pulling this branch
 
 # 2. full run, Qwen, seed 0, three cells (9-18 h at MAXPG=100; see knobs)
 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix.log 2>&1 &
@@ -153,8 +156,9 @@ Prefix codebook metadata: quantizing the prompt with fitted levels stores
 `meta_scalars` fp16 scalars per coordinate for the whole prompt, amortized as
 `meta_scalars * 16 / P` bits per prompt key element (P = prompt length), where
 `meta_scalars` is L = 2^b for k-means and 2 for minmax. The norm is excluded, as
-for every other cell. `memory_report()` counts it, so the pooled figures in
-the cell table (3.04 / 3.42 / 3.11) come from the cache, not this formula.
+for every other cell, so the pooled figures in the cell table (3.04 / 3.42 /
+3.11) are this formula with the per-vector norm left out, not numbers read from
+the cache; `memory_report()` includes the norm and gives slightly higher ones.
 
 ## Smoke history
 

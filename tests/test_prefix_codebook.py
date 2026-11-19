@@ -1,5 +1,7 @@
 """Prefix codebook (docs/superpowers plan 2026-11-18): fitted-levels stage."""
 
+import types
+
 import pytest
 import torch
 
@@ -464,3 +466,117 @@ def test_validator_wav_name_for_pk():
     assert v._wav("w", 1, (2, 2, "pp")).endswith("_pp=prompt.wav")
     assert v.CELLS["pk"] == (32, 1, -1, "kmeans", 0)
     assert v.CELLS["plain"] == (0, 0, 0, "", 0)
+
+
+def test_prefix_cell_bits_counts_codebook_keys_and_quantized_values():
+    import pandas as pd
+
+    from tools import analyze_keyfix as an
+
+    frame = pd.DataFrame(
+        {
+            "group": ["g"],
+            "idx": [0],
+            "key_bits": [2],
+            "value_bits": [2],
+            "rw": [0],
+            "protected_layers": [0],
+            "key_group": [32],
+            "pre_rope": [1],
+            "protect_prefix": [-1],
+            "prefix_codebook": ["kmeans"],
+            "prefix_bits": [2],
+            "prompt_len": [53],
+            "seq_len": [303],
+            "n_steps": [250],
+        }
+    )
+    got = an.prefix_cell_bits(frame, 2, 2)
+    assert got["key"] == pytest.approx(((2 + 4 * 16 / 53) * 53 + 3 * 250) / 303)
+    assert got["value"] == pytest.approx(2.0)
+
+
+def test_check_resume_header(tmp_path):
+    import pandas as pd
+
+    from tests.test_keyfix import _single
+
+    check = _single("check_resume_header", {"pd": pd, "COLUMNS": ["a", "b"]})
+    old, ok = tmp_path / "old.csv", tmp_path / "ok.csv"
+    old.write_text("a\n1\n")
+    ok.write_text("a,b\n1,2\n")
+    check(str(ok))
+    with pytest.raises(SystemExit):
+        check(str(old))
+
+
+def test_recorder_memoizes_prompt_round_trip():
+    from tests.test_keyfix import _recorder_ns, _talker_module
+
+    ns = _recorder_ns()
+    D, P = 64, 24
+    rec = ns["DivergenceRecorder"](
+        specs=[(2, 2, 0)], n_layers=4, prot_layers=0, prot_bits=8, stride=1,
+        protect_prefix=-1, prefix_codebook="kmeans", prefix_bits=3,
+    )  # fmt: skip
+    rec.group, rec.idx = "g", 0
+    g = torch.Generator().manual_seed(0)
+    key = torch.randn(1, 2, P + 2, D, generator=g)
+    q = torch.randn(1, 4, P, D, generator=g)
+    rec.record(_talker_module(2, P, 0, D), q, key[:, :, :P], key[:, :, :P], None, D**-0.5)
+    (entry,) = rec._prompt_rt.values()
+    rec.record(
+        _talker_module(2, 1, P, D), q[:, :, :1], key[:, :, : P + 1], key[:, :, : P + 1],
+        None, D**-0.5,
+    )  # fmt: skip
+    assert len(rec._prompt_rt) == 1
+    assert next(iter(rec._prompt_rt.values()))[2] is entry[2]  # same round trip reused
+    assert rec.errors == 0
+
+
+@pytest.mark.parametrize("mode", ["kmeans", "minmax"])
+@pytest.mark.parametrize("pre_rope", [True, False])
+def test_cache_and_recorder_quantize_prompt_identically(mode, pre_rope):
+    from tests.test_keyfix import (
+        _MROPE,
+        _cfg,
+        _qwen_cache_mod,
+        _recorder_ns,
+        _rope_kwargs_for_positions,
+    )
+
+    mod, ns = _qwen_cache_mod(), _recorder_ns()
+    D, H, P = 64, 2, 40
+    g = torch.Generator().manual_seed(0)
+    k0 = torch.randn(1, H, P, D, generator=g)
+    v0 = torch.randn(1, H, P, D, generator=g)
+    cfg = _cfg(
+        protect_prefix=-1, prefix_codebook=mode, prefix_bits=3, key_group=16,
+        pre_rope_keys=pre_rope,
+    )  # fmt: skip
+    cache = mod.TurboQuantKVCache(cfg, n_layers=4, rope_scaling=_MROPE)
+    kw = _rope_kwargs_for_positions(0, P, D, _MROPE)
+    kwargs = {"cos": kw["cos"], "sin": kw["sin"]} if pre_rope else None
+    cache.update(k0.clone(), v0.clone(), layer_idx=1, cache_kwargs=kwargs)
+    ck, cv = cache._buf_k[1][:, :, :P].clone(), cache._buf_v[1][:, :, :P].clone()
+    Rec = ns["DivergenceRecorder"]
+    rec = Rec(
+        specs=[(2, 2, 0)], n_layers=4, prot_layers=0, prot_bits=8, stride=1, key_group=16,
+        pre_rope=pre_rope, protect_prefix=-1, prefix_codebook=mode, prefix_bits=3,
+    )  # fmt: skip
+    comp = rec._comp(1, 2, 2, 0, D, "cpu")
+    rope, key_in = None, k0
+    if pre_rope:
+        cos, sin = kw["cos"], kw["sin"]
+        rope = dict(
+            cos=cos, sin=sin,
+            mrope_section=_MROPE.get("mrope_section") if cos.dim() == 4 else None,
+            interleaved=bool(_MROPE.get("interleaved", False)),
+        )  # fmt: skip
+        key_in = ns["rope_keys"](k0, inverse=True, **rope)
+    module = types.SimpleNamespace(layer_idx=1)
+    rk, rv = rec._splice_quantized_prefix(
+        module, comp, key_in, v0, k0.clone(), v0.clone(), P, rope, k0.dtype, (2, 2, 0)
+    )
+    assert not torch.equal(ck, k0)  # the cache really quantized the prompt
+    assert torch.equal(rk, ck) and torch.equal(rv, cv)

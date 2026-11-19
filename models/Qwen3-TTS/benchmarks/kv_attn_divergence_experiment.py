@@ -245,6 +245,8 @@ class DivergenceRecorder:
         # pre_rope: per-attention-class running copy of the raw rotary tables
         # (cos, sin) for every position seen so far in the current generation.
         self._rope_buf: dict = {}
+        # prompt round trips, reused across steps (the prefill tensor is fixed within a sentence)
+        self._prompt_rt: dict = {}
 
     def _comp(self, layer, kb, vb, rw, head_dim, device):
         key = (layer, kb, vb, rw)
@@ -306,11 +308,27 @@ class DivergenceRecorder:
             self._prefix[name] = pos
         return min(self._prefix.get(name, 0), pos)
 
-    @staticmethod
-    def _splice_quantized_prefix(comp, key_in, value, rk, rv, pfx, rope, dtype):
+    def _prompt_round_trip(self, module, comp, key_in, value, pfx, key):
+        """Decompressed prompt (keys pre-RoPE, values), memoized per (class, layer, config, pfx)."""
+        pk_in, pv_in = key_in[:, :, :pfx], value[:, :, :pfx]
+        hit = self._prompt_rt.get(key)
+        if (
+            hit is not None
+            and torch.equal(pk_in, hit[0])
+            and torch.equal(pv_in, hit[1])
+        ):
+            return hit[2], hit[3]
+        ck, cv = comp.compress_kv(pk_in, pv_in, prefix=pfx)
+        rpk, rpv = comp.decompress_kv(ck, cv)
+        self._prompt_rt[key] = (pk_in.clone(), pv_in.clone(), rpk, rpv)
+        return rpk, rpv
+
+    def _splice_quantized_prefix(
+        self, module, comp, key_in, value, rk, rv, pfx, rope, dtype, spec
+    ):
         """Replace the first ``pfx`` reconstructed positions with the prefix-codebook round trip."""
-        pk, pv = comp.compress_kv(key_in[:, :, :pfx], value[:, :, :pfx], prefix=pfx)
-        rpk, rpv = comp.decompress_kv(pk, pv)
+        cache_key = (type(module).__name__, module.layer_idx, *spec, pfx)
+        rpk, rpv = self._prompt_round_trip(module, comp, key_in, value, pfx, cache_key)
         if rope is not None:
             head = {
                 **rope,
@@ -359,7 +377,16 @@ class DivergenceRecorder:
                 pfx > 0 and self.prefix_codebook
             ):  # prompt quantized with its own codebook
                 rk, rv = self._splice_quantized_prefix(
-                    comp, key_in, value, rk, rv, pfx, rope, key.dtype
+                    module,
+                    comp,
+                    key_in,
+                    value,
+                    rk,
+                    rv,
+                    pfx,
+                    rope,
+                    key.dtype,
+                    (kb, vb, rw),
                 )
             elif pfx > 0:  # protected prefix: exact fp16 keys AND values
                 rk = torch.cat([key[:, :, :pfx].to(rk.dtype), rk[:, :, pfx:]], dim=2)
@@ -635,6 +662,16 @@ def audio_done(
     )
 
 
+def check_resume_header(out_path: str) -> None:
+    """Refuse to append to a CSV written with a different column set (older runs have fewer id columns)."""
+    have = list(pd.read_csv(out_path, nrows=0).columns)
+    if have != COLUMNS:
+        raise SystemExit(
+            f"--resume: {out_path} has a different header than this branch writes "
+            f"({len(have)} vs {len(COLUMNS)} columns); use a fresh --out instead of appending"
+        )
+
+
 def run_experiment(model, speaker, recorder, args) -> dict:
     """Generate audio + (unless --no-divergence) stream divergence rows to args.out.
 
@@ -700,6 +737,8 @@ def run_experiment(model, speaker, recorder, args) -> dict:
     if not no_div:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         append = resume and os.path.exists(args.out) and os.path.getsize(args.out) > 0
+        if append:
+            check_resume_header(args.out)
         fh = open(args.out, "a" if append else "w", newline="", encoding="utf-8")
         writer = csv.writer(fh)
         if not append:  # fresh file gets a header; append continues an existing one
@@ -764,6 +803,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
             if no_div:
                 continue  # audio-only: skip the expensive fp16 recording pass
             recorder.group, recorder.idx = group, idx  # fp16 pass (recorder on)
+            recorder._prompt_rt.clear()
             recorder.active = True
             set_global_seed(args.seed, deterministic=False)
             run_generation(
@@ -895,6 +935,10 @@ def main() -> None:
         raise SystemExit(f"--key-group must be >= 0, got {args.key_group}")
     if args.prefix_codebook and args.protect_prefix != -1:
         raise SystemExit("--prefix-codebook requires --protect-prefix -1")
+    if args.prefix_bits and not args.prefix_codebook:
+        raise SystemExit("--prefix-bits requires --prefix-codebook")
+    if not 0 <= args.prefix_bits <= 8:
+        raise SystemExit(f"--prefix-bits must be in 0..8, got {args.prefix_bits}")
     print(
         f"key-fix: key_group={args.key_group} "
         f"({'group min-max key scaling' if args.key_group else 'fixed codebook'}), "
