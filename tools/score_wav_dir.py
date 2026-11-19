@@ -71,7 +71,7 @@ FP16_PL = -1
 _WAV_RE = re.compile(
     r"^qwen_(?P<group>.+)_(?P<idx>\d+)_sampling_s(?P<seed>\d+)_t(?P<temp>[0-9.]+)"
     r"_(?:K(?P<kb>\d+)_V(?P<vb>\d+)_rw=(?P<rw>\d+)_pl=(?P<pl>\d+)"
-    r"(?:_g=(?P<kg>\d+))?(?P<pre>_pre)?(?:_pp=(?P<pp>prompt|\d+))?|fp16)\.wav$"
+    r"(?:_g=(?P<kg>\d+))?(?P<pre>_pre)?(?:_pp=(?P<pp>prompt|\d+))?(?:_pq=(?P<pq>[km]\d+))?|fp16)\.wav$"
 )
 
 # VALL-E-X benchmark naming (benchmark_vallex_real.py --configs runs). The
@@ -84,11 +84,11 @@ _VALLEX_WAV_RE = re.compile(
 )
 
 
-def _keyfix_suffix(kg, pre, pp=None) -> str:
+def _keyfix_suffix(kg, pre, pp=None, pq=None) -> str:
     """Config-label suffix for the key-fix flags: '+g32', '+pre', '+pp' (prompt
-    protected) / '+pp<N>', in any combination."""
-    return ((f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "")
-            + ("" if not pp else ("+pp" if pp == "prompt" else f"+pp{int(pp)}")))
+    protected) / '+pp<N>', or '+pk<b>' / '+pm<b>' (prompt codebook, replaces +pp)."""
+    tail = f"+p{pq}" if pq else ("" if not pp else ("+pp" if pp == "prompt" else f"+pp{int(pp)}"))
+    return (f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "") + tail
 
 
 def parse_wav_name(name: str) -> dict | None:
@@ -113,7 +113,7 @@ def parse_wav_name(name: str) -> dict | None:
             "pl": FP16_PL if fp16 else int(d["pl"]),
             "config": BASELINE
             if fp16
-            else f"K{d['kb']}V{d['vb']}@{d['rw']}" + _keyfix_suffix(d["kg"], d["pre"], d["pp"]),
+            else f"K{d['kb']}V{d['vb']}@{d['rw']}" + _keyfix_suffix(d["kg"], d["pre"], d["pp"], d["pq"]),
             "wav": name,
         }
     m = _VALLEX_WAV_RE.match(name)

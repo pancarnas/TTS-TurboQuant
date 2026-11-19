@@ -19,12 +19,13 @@ import glob
 import os
 
 COLLAPSE_CER = 0.5
-CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp"]
+CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp", "pk2", "pk3", "pm3"]
 
 
-def _label(kb, vb, rw, kg, pre, pp=0):
-    return (f"K{int(kb)}V{int(vb)}@{int(rw)}" + (f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "")
-            + ("" if not pp else ("+pp" if int(pp) < 0 else f"+pp{int(pp)}")))
+def _label(kb, vb, rw, kg, pre, pp=0, pq="", pb=0):
+    """Config label; pq is the prefix_codebook mode ('kmeans'/'minmax'/'') and pb the CLI prefix bits (0 = kb)."""
+    tail = f"+p{pq[0]}{int(pb or kb)}" if pq else ("" if not pp else ("+pp" if int(pp) < 0 else f"+pp{int(pp)}"))
+    return f"K{int(kb)}V{int(vb)}@{int(rw)}" + (f"+g{int(kg)}" if kg else "") + ("+pre" if pre else "") + tail
 
 
 def _md(df, floatfmt=".3f", index=False) -> str:
@@ -110,9 +111,11 @@ def main() -> None:
             paths = [args.plain_div]
         for p in paths:
             d = pd.read_csv(p)
-            for c in ("key_group", "pre_rope", "protect_prefix"):
+            for c in ("key_group", "pre_rope", "protect_prefix", "prefix_bits"):
                 if c not in d.columns:
                     d[c] = 0
+            d["prefix_bits"] = d["prefix_bits"].fillna(0)
+            d["prefix_codebook"] = d["prefix_codebook"].fillna("") if "prefix_codebook" in d.columns else ""
             d["cell"] = cell
             div_frames.append(d)
     if args.plain_div and div_frames:
@@ -135,7 +138,7 @@ def main() -> None:
                       + ", ".join(f"L{l}: {int(before.get(l, 0))}->{int(after.get(l, 0))}" for l in (0, 4, 5)),
                       ""]
         d["config"] = [_label(*r) for r in zip(d.key_bits, d.value_bits, d.rw, d.key_group, d.pre_rope,
-                                                d.protect_prefix)]
+                                                d.protect_prefix, d.prefix_codebook, d.prefix_bits)]
         m = (d.groupby(["cell", "config"])[["attn_js", "attn_top1", "out_cos", "cos_k", "cos_v", "relmse_k"]]
              .mean().reset_index().sort_values(["config", "cell"]))
         lines += ["## Attention / KV divergence (talker layers; mean over layers, positions, sentences)", "",

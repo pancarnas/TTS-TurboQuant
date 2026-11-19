@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tools.check_audio import _pair_diff_rate, parse_wav_name, summarize
+from tools.check_audio import _NAME_RE, _pair_diff_rate, parse_wav_name, summarize
 
 
 def test_parse_wav_name_handles_underscored_groups():
@@ -85,3 +85,9 @@ def test_pair_diff_rate():
     }
     differ, have = _pair_diff_rate(sents, "K4V4@24", "K4V4@0")
     assert (differ, have) == (1, 2)
+
+
+def test_check_audio_regex_pq():
+    name = "qwen_librispeech_pc_2_sampling_s0_t0.9_K2_V2_rw=0_pl=0_pq=k2.wav"
+    assert _NAME_RE.match(name).group("pq") == "k2"
+    assert parse_wav_name(name)["config"].endswith("+pk2")

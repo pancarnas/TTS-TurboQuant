@@ -22,15 +22,18 @@ import numpy as np
 import pandas as pd
 from scipy.stats import binomtest, mannwhitneyu, wilcoxon
 
-CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp"]
+CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp", "pk2", "pk3", "pm3"]
 CELL_LABEL = {"plain": "plain", "g32": "g32", "pre": "pre-RoPE", "g32pre": "g32 + pre-RoPE",
-              "pp": "prompt fp16", "g32pp": "g32 + prompt fp16"}
+              "pp": "prompt fp16", "g32pp": "g32 + prompt fp16", "pk2": "kmeans prompt 2b + g32pre",
+              "pk3": "kmeans prompt 3b + g32pre", "pm3": "minmax prompt 3b + g32pre"}
 # fixed categorical order; markers and line styles are the second encoding
 CELL_STYLE = {"plain": ("#2a78d6", "o", "-"), "g32": ("#eb6834", "s", "-"),
               "pre": ("#1baf7a", "^", "--"), "g32pre": ("#eda100", "D", "--"),
-              "pp": ("#8a5cf5", "v", ":"), "g32pp": ("#c8398a", "P", "-.")}
+              "pp": ("#8a5cf5", "v", ":"), "g32pp": ("#c8398a", "P", "-."),
+              "pk2": ("#0f9bb0", "X", "-"), "pk3": ("#6b8e23", "<", "--"), "pm3": ("#a0522d", ">", ":")}
 PAIRS = [("plain", "g32"), ("plain", "pre"), ("plain", "pp"), ("g32", "g32pre"), ("pre", "g32pre"),
          ("g32", "g32pp"), ("pp", "g32pp"), ("g32pre", "g32pp")]
+PAIRS += [(a, c) for c in ("pk2", "pk3", "pm3") for a in ("g32pre", "g32pp")]
 METRICS = ["attn_js", "attn_top1", "out_cos", "cos_k", "relmse_k"]
 
 
@@ -40,7 +43,7 @@ def wmean(g, cols):
 
 
 def load(root):
-    scores, div, pos, lens = {}, {}, {}, {}
+    scores, div, pos, lens, steps = {}, {}, {}, {}, {}
     for c in CELLS:
         p = os.path.join(root, "results", f"qwen_keyfix_{c}_scores.csv")
         if not os.path.exists(p):
@@ -59,14 +62,69 @@ def load(root):
         bl = sorted(glob.glob(os.path.join(root, "results", "keyfix_reduced", f"qwen_keyfix_{c}_seed*_bylen.csv")))
         if bl:
             lens[c] = pd.concat([pd.read_csv(x) for x in bl], ignore_index=True)
-    return scores, div, pos, lens
+            lens[c]["prefix_bits"] = lens[c]["prefix_bits"].fillna(0) if "prefix_bits" in lens[c] else 0
+            lens[c]["prefix_codebook"] = lens[c]["prefix_codebook"].fillna("") if "prefix_codebook" in lens[c] else ""
+        bt = sorted(glob.glob(os.path.join(root, "results", "keyfix_reduced", f"qwen_keyfix_{c}_seed*_bystep.csv")))
+        if bt:
+            steps[c] = pd.concat([pd.read_csv(x) for x in bt], ignore_index=True)
+    return scores, div, pos, lens, steps
 
 
-def effective_bits(bits, meta_bits, prefix_fp16, P, S):
-    """Pooled bits per element over sentences: fp16 for the protected prefix, codes + metadata for the rest.
-    Ignores the per-vector fp16 norm (same in every cell)."""
+def effective_bits(bits, meta_bits, prefix_fp16, P, S, prefix_bits_per_elem=None):
+    """Pooled bits per element over sentences: fp16 (or prefix_bits_per_elem when given) for the protected
+    prefix, codes + metadata for the rest. Ignores the per-vector fp16 norm (same in every cell)."""
     P = np.minimum(P, S) if prefix_fp16 else np.zeros_like(S)
-    return float((16.0 * P.sum() + (bits + meta_bits) * (S - P).sum()) / S.sum())
+    pcost = 16.0 if prefix_bits_per_elem is None else prefix_bits_per_elem
+    return float((pcost * P.sum() + (bits + meta_bits) * (S - P).sum()) / S.sum())
+
+
+def runaway_table(scores):
+    """Per (cell, base config): collapses (CER > 0.5), runaways (collapsed, duration > 3x the sentence's fp16
+    duration), early stops (< 1.5x), and the median ratio / speaker similarity over the collapsed sentences."""
+    rows = []
+    for cell, s in scores.items():
+        ref = s[s["config"] == "fp16"].drop_duplicates("idx").set_index("idx")["dur_s"]
+        q = s[s["config"] != "fp16"].copy()
+        q["base"] = q["config"].str.split("+").str[0]
+        q["ratio"] = q["dur_s"] / q["idx"].map(ref)
+        for base, g in q.groupby("base"):
+            c = g[g["cer"] > 0.5]
+            rows.append({"cell": cell, "config": base, "n_collapse": len(c), "runaway": int((c["ratio"] > 3).sum()),
+                         "stopped": int((c["ratio"] < 1.5).sum()), "ratio_median": c["ratio"].median(),
+                         "spk_median": c["spk_sim"].median()})
+    return pd.DataFrame(rows, columns=["cell", "config", "n_collapse", "runaway", "stopped", "ratio_median",
+                                       "spk_median"])
+
+
+def _auc_p(stat, bad):
+    """P(collapsed > survived) (ties 0.5) and the Mann-Whitney p of a per-sentence statistic."""
+    a, b = stat[stat.index.isin(bad[bad].index)], stat[stat.index.isin(bad[~bad].index)]
+    if not len(a) or not len(b):
+        return float("nan"), float("nan")
+    r = mannwhitneyu(a, b)
+    return float(r.statistic / (len(a) * len(b))), float(r.pvalue)
+
+
+def step_table(div_step, scores):
+    """Per (cell, config) with both collapsed and surviving sentences: AUC and Mann-Whitney p of the
+    per-sentence max over layers of js_max, of js_p95, and of layer-5 js_max (from the _bystep tables)."""
+    rows = []
+    for cell, st in div_step.items():
+        if cell not in scores:
+            continue
+        st = st.assign(config=[f"K{int(k)}V{int(v)}@{int(r)}" for k, v, r in zip(st.key_bits, st.value_bits, st.rw)])
+        sc = scores[cell].assign(base=lambda d: d["config"].str.split("+").str[0])
+        for cfg, g in st.groupby("config"):
+            bad = (sc[sc["base"] == cfg].drop_duplicates("idx").set_index("idx")["cer"] > 0.5)
+            if bad.all() or not bad.any():
+                continue
+            stats = {"js_max": g.groupby("idx")["js_max"].max(), "js_p95": g.groupby("idx")["js_p95"].max(),
+                     "l5_max": g[g["layer"] == 5].groupby("idx")["js_max"].max()}
+            row = {"cell": cell, "config": cfg, "n_collapse": int(bad.sum()), "n_ok": int((~bad).sum())}
+            for k, v in stats.items():
+                row[f"auc_{k}"], row[f"p_{k}"] = _auc_p(v, bad)
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def cfg_label(kb, vb):
@@ -92,7 +150,7 @@ def main():
     ap.add_argument("--root", default="results/keyfix")
     ap.add_argument("--out", default="results/keyfix")
     args = ap.parse_args()
-    scores, div, pos, lens = load(args.root)
+    scores, div, pos, lens, steps = load(args.root)
     os.makedirs(args.out, exist_ok=True)
     L = []
 
@@ -220,12 +278,31 @@ def main():
                 pp = int(g["protect_prefix"].fillna(0).iloc[0]) if "protect_prefix" in g else 0
                 Pp = P if pp < 0 else np.minimum(P, float(pp))
                 meta = 1.0 if int(g["key_group"].iloc[0]) > 0 else 0.0
-                kbits = effective_bits(int(kb), meta, pp != 0, Pp, S)
+                mode, pb = str(g["prefix_codebook"].iloc[0]), int(g["prefix_bits"].iloc[0]) or int(kb)
+                cost = None
+                if mode:  # codebook-coded prompt keys: pb bits per element plus the fitted levels' fp16 scalars
+                    from turboquant.fitted_levels import meta_scalars
+                    cost = pb + meta_scalars(pb, mode) * 16 / Pp.mean()
+                kbits = effective_bits(int(kb), meta, pp != 0, Pp, S, cost)
                 vbits = effective_bits(int(vb), 0.0, pp != 0, Pp, S)
-                k1000 = effective_bits(int(kb), meta, pp != 0, Pp, np.full_like(S, 1000.0))
-                L.append(f"| {c} | {cfg_label(int(kb), int(vb))} | {int(P.min())}/{P.mean():.0f}/{int(P.max())} | "
+                k1000 = effective_bits(int(kb), meta, pp != 0, Pp, np.full_like(S, 1000.0), cost)
+                label = cfg_label(int(kb), int(vb)) + (f" {mode} {pb}b prompt" if mode else "")
+                L.append(f"| {c} | {label} | {int(P.min())}/{P.mean():.0f}/{int(P.max())} | "
                          f"{int(S.min())}/{S.mean():.0f}/{int(S.max())} | {kbits:.2f} | {vbits:.2f} | {k1000:.2f} |")
         L.append("")
+
+    # ---- 9. runaway classification ----------------------------------------
+    L += ["## 9. Runaway classification", "",
+          "Collapse = CER > 0.5; runaway = collapsed with duration > 3x that sentence's fp16 duration; "
+          "stopped = collapsed with duration < 1.5x. Medians are over the collapsed sentences.", "",
+          md_table(runaway_table(scores)), ""]
+
+    # ---- 10. per-step maximum vs collapse ---------------------------------
+    L += ["## 10. Per-step maximum vs collapse", "",
+          "Within a cell and config: AUC = P(collapsed sentence has the larger statistic), ties 0.5, with the "
+          "Mann-Whitney p. Statistics per sentence: max over layers of the per-step js_max / js_p95, and layer-5 js_max.", ""]
+    st = step_table(steps, scores)
+    L += [md_table(st), ""] if len(st) else ["_no cell has both collapsed and surviving sentences with _bystep data_", ""]
 
     with open(os.path.join(args.out, "keyfix_analysis.md"), "w") as f:
         f.write("\n".join(L))

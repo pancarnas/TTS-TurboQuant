@@ -379,3 +379,71 @@ def test_recorder_prefix_codebook_pre_rope_decode_step_records():
     rec.record(_talker_module(groups, 1, P, D), q1, key, key, None, D**-0.5)
     assert rec.errors == 0, rec.first_error
     assert [dict(zip(_cols(), r))["pos"] for r in rec.rows] == [P, P + 1]
+
+
+def test_summarize_label_with_codebook():
+    from tools import summarize_keyfix as sm
+
+    assert sm._label(2, 2, 0, 32, 1, -1, "kmeans", 2) == "K2V2@0+g32+pre+pk2"
+    assert sm._label(2, 2, 0, 32, 1, -1) == "K2V2@0+g32+pre+pp"
+
+
+def test_effective_bits_with_prefix_cost():
+    import numpy as np
+
+    from tools import analyze_keyfix as an
+
+    P, S = np.array([53.0]), np.array([303.0])
+    got = an.effective_bits(2, 1.0, True, P, S, prefix_bits_per_elem=3.2)
+    assert got == pytest.approx((3.2 * 53 + 3 * 250) / 303)
+    assert an.effective_bits(2, 1.0, True, P, S) == pytest.approx(
+        (16 * 53 + 3 * 250) / 303
+    )
+
+
+def test_runaway_classification_counts():
+    import pandas as pd
+
+    from tools import analyze_keyfix as an
+
+    scores = pd.DataFrame(
+        {
+            "idx": [0, 0, 1, 1],
+            "config": ["fp16", "K2V2@0+g32", "fp16", "K2V2@0+g32"],
+            "dur_s": [4.0, 30.0, 5.0, 5.2],
+            "cer": [0.0, 0.9, 0.0, 0.6],
+            "spk_sim": [1, 0.8, 1, 0.9],
+        }
+    )
+    r = an.runaway_table({"g32": scores})
+    row = r[(r.cell == "g32") & (r.config == "K2V2@0")].iloc[0]
+    assert row.n_collapse == 2 and row.runaway == 1 and row.stopped == 1
+
+
+def test_step_table_auc_separates_collapsed_from_ok():
+    import pandas as pd
+
+    from tools import analyze_keyfix as an
+
+    scores = pd.DataFrame(
+        {
+            "idx": [0, 1, 2, 3],
+            "config": ["K3V3@0"] * 4,
+            "cer": [0.9, 0.8, 0.0, 0.1],
+            "dur_s": [9.0] * 4,
+            "spk_sim": [1.0] * 4,
+        }
+    )
+    step = pd.DataFrame(
+        {
+            "idx": [0, 1, 2, 3],
+            "layer": [5] * 4,
+            "key_bits": [3] * 4,
+            "value_bits": [3] * 4,
+            "rw": [0] * 4,
+            "js_max": [0.9, 0.8, 0.1, 0.2],
+            "js_p95": [0.5, 0.4, 0.1, 0.2],
+        }
+    )
+    t = an.step_table({"g32": step}, {"g32": scores})
+    assert len(t) == 1 and t.iloc[0].auc_js_max == 1.0

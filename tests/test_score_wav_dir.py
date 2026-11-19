@@ -204,3 +204,12 @@ def test_score_entries_metrics_and_baseline_embed_reuse(tmp_path):
     assert all(r["transcript"] == "hello there" for r in rows)
     # baseline embedded once for the sentence, not once per compressed config
     assert sum(p.endswith("_fp16.wav") for p in embed_calls) == 1
+
+
+def test_score_parses_pq_segment():
+    from tools.score_wav_dir import parse_wav_name as pwn
+
+    base = "qwen_librispeech_pc_2_sampling_s0_t0.9_K2_V2_rw=0_pl=0"
+    assert pwn(f"{base}_g=32_pre_pq=k3.wav")["config"] == "K2V2@0+g32+pre+pk3"
+    assert pwn(f"{base}_pq=m3.wav")["config"] == "K2V2@0+pm3"
+    assert pwn(f"{base}_g=32_pp=prompt.wav")["config"] == "K2V2@0+g32+pp"

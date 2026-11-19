@@ -33,7 +33,8 @@ import os
 import numpy as np
 import pandas as pd
 
-CFG = ["key_bits", "value_bits", "rw", "protected_layers", "key_group", "pre_rope", "protect_prefix"]
+CFG = ["key_bits", "value_bits", "rw", "protected_layers", "key_group", "pre_rope", "protect_prefix",
+       "prefix_codebook", "prefix_bits"]
 METRICS = ["attn_js", "attn_tv", "attn_top1", "attn_dentropy", "out_cos",
            "cos_k", "cos_v", "relmse_k", "relmse_v"]
 
@@ -92,6 +93,9 @@ def reduce_file(path, out_dir, min_pos, pos_bin, chunksize):
     by_sent, by_pos, hist, mx, by_time, by_len = [], [], [], [], [], []
     cfg = None
     for chunk in pd.read_csv(path, chunksize=chunksize):
+        for col, default in (("prefix_codebook", ""), ("prefix_bits", 0)):  # "" reads back as NaN, which groupby drops
+            if col in chunk.columns:
+                chunk[col] = chunk[col].fillna(default)
         if cfg is None:
             cfg = [c for c in CFG if c in chunk.columns]
             metrics = [m for m in METRICS if m in chunk.columns]
