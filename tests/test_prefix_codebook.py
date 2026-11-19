@@ -350,3 +350,32 @@ def test_load_done_filters_codebook_and_old_csv(tmp_path):
         columns=["prefix_codebook", "prefix_bits"]
     ).to_csv(old, index=False)
     assert load_done(str(old), 0, 32, True, -1, "kmeans", 2) == set()
+
+
+def test_recorder_prefix_codebook_pre_rope_decode_step_records():
+    from tests.test_keyfix import _cols, _recorder_ns, _talker_module
+
+    ns = _recorder_ns()
+    D, groups, P = 64, 2, 24
+    rec = ns["DivergenceRecorder"](
+        specs=[(2, 2, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        pre_rope=True,
+        protect_prefix=-1,
+        prefix_codebook="kmeans",
+        prefix_bits=3,
+    )
+    rec.group, rec.idx = "g", 0
+    g = torch.Generator().manual_seed(0)
+    key = torch.randn(1, 2, P + 1, D, generator=g)
+    q = torch.randn(1, 4, P, D, generator=g)
+    rec.record(
+        _talker_module(groups, P, 0, D), q, key[:, :, :P], key[:, :, :P], None, D**-0.5
+    )
+    q1 = torch.randn(1, 4, 1, D, generator=g)
+    rec.record(_talker_module(groups, 1, P, D), q1, key, key, None, D**-0.5)
+    assert rec.errors == 0, rec.first_error
+    assert [dict(zip(_cols(), r))["pos"] for r in rec.rows] == [P, P + 1]

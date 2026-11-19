@@ -312,7 +312,12 @@ class DivergenceRecorder:
         pk, pv = comp.compress_kv(key_in[:, :, :pfx], value[:, :, :pfx], prefix=pfx)
         rpk, rpv = comp.decompress_kv(pk, pv)
         if rope is not None:
-            rpk = rope_keys(rpk.to(dtype), inverse=False, **rope)
+            head = {
+                **rope,
+                "cos": rope["cos"][..., :pfx, :],
+                "sin": rope["sin"][..., :pfx, :],
+            }
+            rpk = rope_keys(rpk.to(dtype), inverse=False, **head)
         rk = torch.cat([rpk.to(rk.dtype), rk[:, :, pfx:]], dim=2)
         rv = torch.cat([rpv.to(rv.dtype), rv[:, :, pfx:]], dim=2)
         return rk, rv
@@ -562,17 +567,8 @@ def load_done(
         return set()
     try:
         header = pd.read_csv(out_path, nrows=0).columns
-        cols = ["group", "idx", "protected_layers"] + [
-            c
-            for c in (
-                "key_group",
-                "pre_rope",
-                "protect_prefix",
-                "prefix_codebook",
-                "prefix_bits",
-            )
-            if c in header
-        ]
+        opt = "key_group pre_rope protect_prefix prefix_codebook prefix_bits".split()
+        cols = ["group", "idx", "protected_layers"] + [c for c in opt if c in header]
         df = pd.read_csv(out_path, usecols=cols)
     except ValueError as exc:
         raise SystemExit(
@@ -897,6 +893,8 @@ def main() -> None:
     )
     if args.key_group < 0:
         raise SystemExit(f"--key-group must be >= 0, got {args.key_group}")
+    if args.prefix_codebook and args.protect_prefix != -1:
+        raise SystemExit("--prefix-codebook requires --protect-prefix -1")
     print(
         f"key-fix: key_group={args.key_group} "
         f"({'group min-max key scaling' if args.key_group else 'fixed codebook'}), "
