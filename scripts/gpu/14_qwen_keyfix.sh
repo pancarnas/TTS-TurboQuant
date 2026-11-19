@@ -12,6 +12,10 @@
 #                            already produced by 13_qwen_divergence.sh seed 0
 #                            for K2V2@0/K3V3@0; add it here to regenerate
 #                            under this CFGS list (e.g. for K2V4@0).
+#                            Others: pre g32pre pp g32pp, and the prefix-
+#                            codebook cells pk2 pk3 pm3 (g32 + pre-RoPE, prompt
+#                            keys quantized with levels fitted on the prompt:
+#                            k-means 2 bit / k-means 3 bit / min-max 3 bit).
 #   CFGS="fp16,K2V2@0,K2V4@0,K3V3@0"   configs per cell (fp16 = audio baseline)
 #   SEEDS="0"                paired seeds (3 = error bars, 3x the time)
 #   MAXPG=100                librispeech_pc sentences (50 halves everything)
@@ -46,7 +50,10 @@ cell_flags() {
     g32pre) echo "--key-group 32 --pre-rope-keys" ;;
     pp)     echo "--protect-prefix -1" ;;
     g32pp)  echo "--key-group 32 --protect-prefix -1" ;;
-    *) echo "unknown cell '$1' (plain|g32|pre|g32pre|pp|g32pp)" >&2; exit 2 ;;
+    pk2)    echo "--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook kmeans --prefix-bits 2" ;;
+    pk3)    echo "--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook kmeans --prefix-bits 3" ;;
+    pm3)    echo "--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook minmax --prefix-bits 3" ;;
+    *) echo "unknown cell '$1' (plain|g32|pre|g32pre|pp|g32pp|pk2|pk3|pm3)" >&2; exit 2 ;;
   esac
 }
 

@@ -1,6 +1,6 @@
 """Validate a 03_smoke_keyfix.sh run (no regeneration): pipeline correctness only.
 
-Reads results/smoke_keyfix_{plain,g32,pre,pp}.csv and the smoke wav dir and prints
+Reads results/smoke_keyfix_{plain,g32,pre,pp,pk}.csv and the smoke wav dir and prints
 a PASS/FAIL line per check plus one verdict. It deliberately asserts only what
 MUST hold if the plumbing is right — it never asserts the scientific outcome
 (whether group scaling / pre-RoPE help), which the full run is for.
@@ -17,7 +17,14 @@ import os
 import re
 import sys
 
-CELLS = {"plain": (0, 0, 0), "g32": (32, 0, 0), "pre": (0, 1, 0), "pp": (0, 0, -1)}
+# (key_group, pre_rope, protect_prefix, prefix_codebook, prefix_bits)
+CELLS = {
+    "plain": (0, 0, 0, "", 0),
+    "g32": (32, 0, 0, "", 0),
+    "pre": (0, 1, 0, "", 0),
+    "pp": (0, 0, -1, "", 0),
+    "pk": (32, 1, -1, "kmeans", 0),
+}
 
 
 def _sha(path: str) -> str:
@@ -38,6 +45,8 @@ def _wav(wavdir, idx, cfg):
             seg += "_pre"
         if cell == "pp":
             seg += "_pp=prompt"
+        if cell == "pk":
+            seg += f"_g=32_pre_pq=k{kb}"
         name = f"qwen_librispeech_pc_{idx}_sampling_s0_t0.9_{seg}.wav"
     return os.path.join(wavdir, name)
 
@@ -61,7 +70,7 @@ def main() -> None:
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
 
     frames = {}
-    for cell, (kg, pre, pp) in CELLS.items():
+    for cell, (kg, pre, pp, pcb, pbits) in CELLS.items():
         p = os.path.join(args.results, f"smoke_keyfix_{cell}.csv")
         if not os.path.exists(p) or os.path.getsize(p) == 0:
             check(f"{cell}: divergence CSV exists ({p})", False)
@@ -74,6 +83,11 @@ def main() -> None:
         if flag_cols <= set(df.columns):
             check(f"{cell}: key_group=={kg}, pre_rope=={pre}, protect_prefix=={pp} on every row",
                   (df.key_group == kg).all() and (df.pre_rope == pre).all() and (df.protect_prefix == pp).all())
+        pq_cols = {"prefix_codebook", "prefix_bits"}
+        check(f"{cell}: prefix_codebook/prefix_bits columns present", pq_cols <= set(df.columns))
+        if pq_cols <= set(df.columns):
+            check(f"{cell}: prefix_codebook=={pcb!r}, prefix_bits=={pbits} on every row",
+                  (df.prefix_codebook.fillna("") == pcb).all() and (df.prefix_bits.fillna(0) == pbits).all())
         check(f"{cell}: both K8V8 and K2V2 recorded",
               {8, 2} <= set(df.key_bits.unique()))
         check(f"{cell}: {args.n} sentences", df.idx.nunique() == args.n)
@@ -128,6 +142,24 @@ def main() -> None:
         print(f"  [info] pp vs plain K2V2: attn_js {p2.attn_js.mean():.4f} vs {pl2.attn_js.mean():.4f}, "
               f"attn_top1 {p2.attn_top1.mean():.4f} vs {pl2.attn_top1.mean():.4f}, "
               f"dentropy {p2.attn_dentropy.mean():+.4f} vs {pl2.attn_dentropy.mean():+.4f}")
+        # pk: the prompt is quantized at prefill, so the prefill rows are lossy
+        # at K2V2 (unlike pp), less lossy than plain's (own fitted levels), and
+        # near-lossless at K8V8 (the pbits=0 follows key_bits).
+        pk = frames["pk"]
+        pkt, plt_ = pk[pk.pos >= 33], frames["plain"][frames["plain"].pos >= 33]
+
+        def prefill(d):
+            first = d.groupby(["idx", "key_bits"]).pos.transform("min")
+            return d[d.pos == first]
+
+        pk2, pl2p = prefill(pkt[pkt.key_bits == 2]), prefill(plt_[plt_.key_bits == 2])
+        check(f"pk: K2V2 prefill rows lossy (cos_k < 1, {len(pk2)} rows)",
+              len(pk2) > 0 and (pk2.cos_k < 1.0).all())
+        check("pk: K2V2 prefill relmse_k below plain's "
+              f"({pk2.relmse_k.mean():.4f} vs {pl2p.relmse_k.mean():.4f})",
+              len(pl2p) > 0 and pk2.relmse_k.mean() < pl2p.relmse_k.mean())
+        pk8 = prefill(pkt[pkt.key_bits == 8])
+        check("pk: K8V8 prefill cos_k > 0.999", len(pk8) > 0 and (pk8.cos_k > 0.999).all())
         # informational — this is the hypothesis the full run tests
         print("  [info] K2V2 cos_k   " + "  ".join(f"{c}={v:.4f}" for c, v in c2.items()))
         j2 = {c: frames[c][frames[c].key_bits == 2].attn_js.mean() for c in CELLS}
@@ -151,6 +183,8 @@ def main() -> None:
             check(f"idx {idx}: K2V2 wav differs plain vs g32", hashes["plain"] != hashes["g32"])
             check(f"idx {idx}: K2V2 wav differs plain vs pp", hashes["plain"] != hashes["pp"])
             check(f"idx {idx}: K2V2 wav differs plain vs pre", hashes["plain"] != hashes["pre"])
+            check(f"idx {idx}: K2V2 wav differs plain vs pk", hashes["plain"] != hashes["pk"])
+            check(f"idx {idx}: K2V2 wav differs pp vs pk", hashes["pp"] != hashes["pk"])
     # fp16 is written by every cell to the SAME path (no flag segment); it was
     # overwritten three times with the same seed — its CSV-free check is that
     # the K2V2 wavs above differ while fp16 exists. (Byte-identity across cells

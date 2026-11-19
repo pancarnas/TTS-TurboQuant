@@ -19,6 +19,9 @@ RoPE, VALL-E-X keys carry no position at all.
 | g32pre | both | the two stacked |
 | pp | `--protect-prefix -1` | the prefill (prompt: text + reference audio, 44-67 tokens) stays fp16, keys and values; everything generated is compressed as in plain |
 | g32pp | `--key-group 32 --protect-prefix -1` | group scaling on the generated keys, prompt exact |
+| pk2 | `--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook kmeans --prefix-bits 2` | g32pre on the generated keys; prompt keys quantized at 2 bits with k-means levels fitted on the prompt. Prompt cost 3.2 bits per key element (pooled 3.04 on these sentences) |
+| pk3 | same with `--prefix-bits 3` | 3-bit k-means prompt. Prompt cost 5.4 bits (pooled 3.42) |
+| pm3 | `--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook minmax --prefix-bits 3` | 3-bit prompt on one min-max window. Prompt cost 3.6 bits (pooled 3.11) |
 
 `pp` follows the keygauss diagnostic (2026-11-17): 23-73% of the talker's
 attention mass per layer sits on the prompt keys, so the hypothesis is that
@@ -27,6 +30,20 @@ hundreds of generated ones. Bit accounting is honest: with prompt length P,
 sequence S and b bits, keys cost (16P + b(S-P))/S bits per element on
 average; `memory_report()` counts the prefix at fp16. VALL-E-X's cache ignores
 `protect_prefix` (not implemented there).
+
+Protection cells (`pp`, `ppN`, keys-only/values-only) are diagnostics, not
+candidates: they run only when a fully quantized cell fails and we need to know
+which part of the prompt is the carrier. `g32pp` stays as the reference
+ceiling.
+
+Prefix codebook (`pk2`, `pk3`, `pm3`): the candidate that follows from `pp`.
+The prompt keys are quantized at prefill with levels fitted on the prompt
+itself (k-means: 2^b levels per coordinate, stored fp16; minmax: one window, two
+endpoints); prompt values use the fixed codebook, generated keys stay g32pre.
+Design in `docs/superpowers/specs/2026-11-18-prefix-codebook-design.md`.
+`keygauss_core.quant_kmeans` now shares `turboquant/fitted_levels.py` and its
+init quantiles changed from (i+1)/(L+1) to (i+0.5)/L, so k-means numbers from
+before 2026-11-19 may differ slightly.
 
 | if K2 is rescued by | conclusion |
 |---|---|
@@ -58,6 +75,12 @@ python tools/summarize_keyfix.py --results results \
     --plain-div results/qwen_div_seed0.csv --plain-scores results/qwen_seed_scores.csv
 ```
 
+Prefix-codebook cells (after the smoke prints PASS; seed 0, 50 sentences):
+
+```bash
+CELLS="pk2 pk3 pm3" CFGS="fp16,K2V2@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pq.log 2>&1 &
+```
+
 Shorter first pass: `MAXPG=50 bash scripts/gpu/14_qwen_keyfix.sh` halves the
 time; `CELLS="g32 pre"` drops the stacked cell. Everything resumes per sentence
 (`--resume`), so a killed run is restarted with the same command.
@@ -77,7 +100,11 @@ this run's config list (K2V4@0 is new).
 - K8V8 under `--pre-rope-keys` has cos_k > 0.999 and attn_js < 1e-3 on the real
   mRoPE tables: with near-lossless keys, any error left would be a wrong RoPE
   inverse
-- CSV rows carry `key_group` / `pre_rope` with the cell's values
+- CSV rows carry `key_group` / `pre_rope` / `protect_prefix` /
+  `prefix_codebook` / `prefix_bits` with the cell's values
+- the `pk` cell: its K2V2 prefill rows are lossy (cos_k < 1) with lower
+  relmse_k than plain's, its K8V8 prefill rows have cos_k > 0.999, and its K2V2
+  wav differs from plain and from pp
 
 It prints the K2V2 cos_k / attn_js of the three cells as information only. The
 smoke never asserts the scientific outcome.
@@ -101,11 +128,12 @@ Timing is scaled from the stage table in `scripts/gpu/README.md` (6 configs x
 | file | content |
 |---|---|
 | `results/qwen_keyfix_<cell>_seed<s>.csv` | per (layer, position, config) divergence rows, with `key_group`, `pre_rope` columns |
-| `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/*.wav` | compressed wavs, name segments `_g=32` / `_pre`; fp16 shared |
+| `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/*.wav` | compressed wavs, name segments `_g=32` / `_pre` / `_pp=prompt` / `_pq=k2` (`_pq=m3` for min-max; the number is the effective prompt bits); fp16 shared |
 | `results/qwen_keyfix_<cell>_scores.csv` | Whisper large-v3 CER/WER, WavLM spk_sim vs fp16 (`SCORE=1`, default) |
 | `results/keyfix_summary.md` | per cell x config objective + divergence tables and the per-layer attn_js profile for K2V2@0 |
 
-Config labels in the scores CSV are `K2V2@0+g32`, `K2V2@0+pre`, `K2V2@0+g32+pre`;
+Config labels in the scores CSV are `K2V2@0+g32`, `K2V2@0+pre`, `K2V2@0+g32+pre`, and for the prefix codebook `+pk2`, `+pk3`, `+pm3`
+(appended after the other flag labels);
 all existing analysis tools treat them as ordinary extra configs.
 
 ## Bit accounting
@@ -120,6 +148,13 @@ E2M1 plus one shared 8-bit exponent per 32 coordinates), i.e. 0.27 bits per key
 element; the paper's "bits/elem" figures (2.258 / 2.625) are the average over
 keys and values (keys 2.39 / 3.125, values 2.125). Our fp16 metadata is the
 best case for their method, which is what a mechanism test wants.
+
+Prefix codebook metadata: quantizing the prompt with fitted levels stores
+`meta_scalars` fp16 scalars per coordinate for the whole prompt, amortized as
+`meta_scalars * 16 / P` bits per prompt key element (P = prompt length), where
+`meta_scalars` is L = 2^b for k-means and 2 for minmax. The norm is excluded, as
+for every other cell. `memory_report()` counts it, so the pooled figures in
+the cell table (3.04 / 3.42 / 3.11) come from the cache, not this formula.
 
 ## Smoke history
 

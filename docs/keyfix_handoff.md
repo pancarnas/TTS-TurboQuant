@@ -85,9 +85,16 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
    -1 = whole prefill, N > 0 fixed; cells `pp` and `g32pp` in 03/14 scripts;
    wav segment `_pp=prompt` / `_pp=N`, CSV column `protect_prefix`, config
    label `+pp` / `+ppN`). Result: g32pp rescues K2V2 completely (see "State").
-   Still to do for it: run the reducer on the box, download, rerun
-   `tools/analyze_keyfix.py` (section 8 = effective bits from `_bylen.csv`),
-   and listen to a few `keyfix_g32pp` wavs.
+   Next GPU job: the prefix-codebook cells `pk2`, `pk3`, `pm3` (prompt keys
+   quantized at prefill with levels fitted on the prompt; design in
+   `docs/superpowers/specs/2026-11-18-prefix-codebook-design.md`). Smoke first:
+   `bash scripts/gpu/03_smoke_keyfix.sh` must print `KEYFIX SMOKE PASS` (it now
+   has the `pk` cell), then
+   `CELLS="pk2 pk3 pm3" CFGS="fp16,K2V2@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pq.log 2>&1 &`.
+   Afterwards run the reducer, download, rerun `tools/analyze_keyfix.py`
+   (section 8 = effective bits from `_bylen.csv`, section 9 = runaway
+   classification, section 10 = per-step maximum vs collapse; the new cells
+   appear as `pk2`/`pk3`/`pm3`), and listen to a few wavs.
 2c. Prefix sweep (next GPU job, ~2 h per N): `protect_prefix` 4 / 16 / 32 with
    g32 at K2V2 separates an attention-sink effect (N = 4 enough) from the
    reference-audio keys (only the full prompt works) and finds the cheapest

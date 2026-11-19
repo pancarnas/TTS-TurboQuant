@@ -447,3 +447,20 @@ def test_step_table_auc_separates_collapsed_from_ok():
     )
     t = an.step_table({"g32": step}, {"g32": scores})
     assert len(t) == 1 and t.iloc[0].auc_js_max == 1.0
+
+
+def test_validator_wav_name_for_pk():
+    import importlib.util
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "validate_pk", os.path.join(root, "tools/validate_keyfix_smoke.py")
+    )
+    v = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(v)
+    assert v._wav("w", 1, (2, 2, "pk")).endswith("_K2_V2_rw=0_pl=0_g=32_pre_pq=k2.wav")
+    assert v._wav("w", 1, (8, 8, "pk")).endswith("_pq=k8.wav")
+    assert v._wav("w", 1, (2, 2, "pp")).endswith("_pp=prompt.wav")
+    assert v.CELLS["pk"] == (32, 1, -1, "kmeans", 0)
+    assert v.CELLS["plain"] == (0, 0, 0, "", 0)

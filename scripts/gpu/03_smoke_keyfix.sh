@@ -4,9 +4,10 @@
 #
 #   1. unit tests        — compressor group scaling, RoPE undo/redo, both
 #                          caches' span rounding, recorder, parsers (CPU)
-#   2. three tiny cells  — 2 librispeech_pc sentences x {fp16, K8V8@0, K2V2@0}
+#   2. five tiny cells — 2 librispeech_pc sentences x {fp16, K8V8@0, K2V2@0}
 #                          through the Qwen divergence experiment, once per
-#                          cell: plain / --key-group 32 / --pre-rope-keys
+#                          cell: plain / g32 / pre / pp / pk (g32 + pre-RoPE +
+#                          quantized prompt via --prefix-codebook kmeans)
 #   3. AUTO-VALIDATE     — fp16 wavs identical across cells (flags never touch
 #                          the baseline), K2V2 wavs differ across cells (flags
 #                          reach generation), K8V8 pre-RoPE cos_k ~ 1 (RoPE is
@@ -28,7 +29,7 @@ unset HF_HUB_OFFLINE 2>/dev/null || true
 
 OUT_DIR=models/Qwen3-TTS/benchmarks/outputs/smoke_keyfix
 CFGS="fp16,K8V8@0,K2V2@0"
-ALL_CELLS="plain g32 pre pp"
+ALL_CELLS="plain g32 pre pp pk"
 CELLS="${CELLS:-$ALL_CELLS}"
 
 echo "### 1/3 unit tests (key-fix + divergence driver + caches) ###"
@@ -37,7 +38,7 @@ echo "### 1/3 unit tests (key-fix + divergence driver + caches) ###"
   tests/test_turboquant_cache_readback.py tests/test_score_wav_dir.py \
   tests/test_check_audio.py models/Qwen3-TTS/tests/ -q
 
-echo "### 2/3 three tiny cells through the Qwen divergence experiment ###"
+echo "### 2/3 tiny cells through the Qwen divergence experiment ###"
 [ "$CELLS" = "$ALL_CELLS" ] && rm -rf "$OUT_DIR"
 for CELL in $CELLS; do
   case "$CELL" in
@@ -45,7 +46,8 @@ for CELL in $CELLS; do
     g32)   FLAGS="--key-group 32" ;;
     pre)   FLAGS="--pre-rope-keys" ;;
     pp)    FLAGS="--protect-prefix -1" ;;
-    *) echo "unknown cell '$CELL' (plain|g32|pre|pp) — check for curly quotes in CELLS=..." >&2; exit 2 ;;
+    pk)    FLAGS="--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook kmeans --prefix-bits 0" ;;
+    *) echo "unknown cell '$CELL' (plain|g32|pre|pp|pk) — check for curly quotes in CELLS=..." >&2; exit 2 ;;
   esac
   echo "--- cell $CELL ($FLAGS) ---"
   # shellcheck disable=SC2086
