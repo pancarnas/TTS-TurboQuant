@@ -22,18 +22,20 @@ import numpy as np
 import pandas as pd
 from scipy.stats import binomtest, mannwhitneyu, wilcoxon
 
-CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp", "pk2", "pk3", "pm3"]
+CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp", "pk2", "pk3", "pm3", "pm4"]
 CELL_LABEL = {"plain": "plain", "g32": "g32", "pre": "pre-RoPE", "g32pre": "g32 + pre-RoPE",
               "pp": "prompt fp16", "g32pp": "g32 + prompt fp16", "pk2": "kmeans prompt 2b + g32pre",
-              "pk3": "kmeans prompt 3b + g32pre", "pm3": "minmax prompt 3b + g32pre"}
+              "pk3": "kmeans prompt 3b + g32pre", "pm3": "minmax prompt 3b + g32pre",
+              "pm4": "minmax prompt 4b + g32pre"}
 # fixed categorical order; markers and line styles are the second encoding
 CELL_STYLE = {"plain": ("#2a78d6", "o", "-"), "g32": ("#eb6834", "s", "-"),
               "pre": ("#1baf7a", "^", "--"), "g32pre": ("#eda100", "D", "--"),
               "pp": ("#8a5cf5", "v", ":"), "g32pp": ("#c8398a", "P", "-."),
-              "pk2": ("#0f9bb0", "X", "-"), "pk3": ("#6b8e23", "<", "--"), "pm3": ("#a0522d", ">", ":")}
+              "pk2": ("#0f9bb0", "X", "-"), "pk3": ("#6b8e23", "<", "--"), "pm3": ("#a0522d", ">", ":"),
+              "pm4": ("#444444", "*", "-.")}
 PAIRS = [("plain", "g32"), ("plain", "pre"), ("plain", "pp"), ("g32", "g32pre"), ("pre", "g32pre"),
          ("g32", "g32pp"), ("pp", "g32pp"), ("g32pre", "g32pp")]
-PAIRS += [(a, c) for c in ("pk2", "pk3", "pm3") for a in ("g32pre", "g32pp")]
+PAIRS += [(a, c) for c in ("pk2", "pk3", "pm3", "pm4") for a in ("g32pre", "g32pp")]
 METRICS = ["attn_js", "attn_top1", "out_cos", "cos_k", "relmse_k"]
 
 

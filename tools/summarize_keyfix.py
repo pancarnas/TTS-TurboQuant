@@ -19,7 +19,7 @@ import glob
 import os
 
 COLLAPSE_CER = 0.5
-CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp", "pk2", "pk3", "pm3"]
+CELLS = ["plain", "g32", "pre", "g32pre", "pp", "g32pp", "pk2", "pk3", "pm3", "pm4"]
 
 
 def _label(kb, vb, rw, kg, pre, pp=0, pq="", pb=0):

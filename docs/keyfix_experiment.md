@@ -22,6 +22,7 @@ RoPE, VALL-E-X keys carry no position at all.
 | pk2 | `--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook kmeans --prefix-bits 2` | g32pre on the generated keys; prompt keys quantized at 2 bits with k-means levels fitted on the prompt. Prompt cost 3.2 bits per key element (pooled 3.04 on these sentences) |
 | pk3 | same with `--prefix-bits 3` | 3-bit k-means prompt. Prompt cost 5.4 bits (pooled 3.42) |
 | pm3 | `--key-group 32 --pre-rope-keys --protect-prefix -1 --prefix-codebook minmax --prefix-bits 3` | 3-bit prompt on one min-max window. Prompt cost 3.6 bits (pooled 3.11) |
+| pm4 | same with `--prefix-bits 4` | 4-bit prompt on one min-max window, run over K2 and K3 generated keys (`CFGS="fp16,K2V2@0,K3V3@0"`). Prompt cost 4.6 bits (pooled about 3.3 at K2, 4.1 at K3) |
 
 `pp` follows the keygauss diagnostic (2026-11-17): 23-73% of the talker's
 attention mass per layer sits on the prompt keys, so the hypothesis is that
@@ -84,6 +85,14 @@ Prefix-codebook cells (after the smoke prints PASS; seed 0, 50 sentences):
 CELLS="pk2 pk3 pm3" CFGS="fp16,K2V2@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pq.log 2>&1 &
 ```
 
+Follow-up after the 2026-11-19 result (pk2/pk3 collapse 100 %, pm3 36 %, see
+`docs/keyfix_prefill_proposal.md`): the 4-bit min-max prompt over 2- and 3-bit
+generated keys, one cell, two configs:
+
+```bash
+CELLS="pm4" CFGS="fp16,K2V2@0,K3V3@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pm4.log 2>&1 &
+```
+
 Shorter first pass: `MAXPG=50 bash scripts/gpu/14_qwen_keyfix.sh` halves the
 time; `CELLS="g32 pre"` drops the stacked cell. Everything resumes per sentence
 (`--resume`), so a killed run is restarted with the same command.
@@ -135,7 +144,7 @@ Timing is scaled from the stage table in `scripts/gpu/README.md` (6 configs x
 | `results/qwen_keyfix_<cell>_scores.csv` | Whisper large-v3 CER/WER, WavLM spk_sim vs fp16 (`SCORE=1`, default) |
 | `results/keyfix_summary.md` | per cell x config objective + divergence tables and the per-layer attn_js profile for K2V2@0 |
 
-Config labels in the scores CSV are `K2V2@0+g32`, `K2V2@0+pre`, `K2V2@0+g32+pre`, and for the prefix codebook `+pk2`, `+pk3`, `+pm3`
+Config labels in the scores CSV are `K2V2@0+g32`, `K2V2@0+pre`, `K2V2@0+g32+pre`, and for the prefix codebook `+pk2`, `+pk3`, `+pm3`, `+pm4`
 (appended after the other flag labels);
 all existing analysis tools treat them as ordinary extra configs.
 
