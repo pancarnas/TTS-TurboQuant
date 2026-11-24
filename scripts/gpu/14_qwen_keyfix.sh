@@ -20,6 +20,12 @@
 #   SEEDS="0"                paired seeds (3 = error bars, 3x the time)
 #   MAXPG=100                librispeech_pc sentences (50 halves everything)
 #   SCORE=1                  run Whisper/WavLM scoring per cell afterwards
+#   IDXFILE=                 sentence idx list (one idx per line, # comments);
+#                            when set the whole group is enumerated and MAXPG
+#                            is ignored. MOS runs: docs/qwen_mos_idx_list.txt
+#   NODIV=0                  1 = audio only (no fp16 divergence pass); resume
+#                            then skips per (sentence, config) wav, so a new
+#                            config fills only its own gap
 #
 # Rough cost per cell on an A100-40GB at MAXPG=100: 100 sentences x
 # (3 TQ configs + fp16 + fp16 divergence pass) = 500 generations ~ 3-6 h.
@@ -41,6 +47,11 @@ CFGS="${CFGS:-fp16,K2V2@0,K2V4@0,K3V3@0}"
 SEEDS="${SEEDS:-0}"
 MAXPG="${MAXPG:-100}"
 SCORE="${SCORE:-1}"
+IDXFILE="${IDXFILE:-}"       # sentence idx list (one per line); overrides MAXPG
+NODIV="${NODIV:-0}"          # 1 = audio only, no fp16 divergence pass
+EXTRA=""
+[ -n "$IDXFILE" ] && EXTRA="$EXTRA --idx-file $IDXFILE"
+[ "$NODIV" = "1" ] && EXTRA="$EXTRA --no-divergence"
 
 cell_flags() {
   case "$1" in
@@ -69,11 +80,11 @@ for CELL in $CELLS; do
       --configs "$CFGS" --protected-layers 0 --seed "$SEED" \
       --voice-mode clone --device cuda \
       --audio-out-dir "$OUT_DIR" \
-      --out "results/qwen_keyfix_${CELL}_seed${SEED}.csv" --resume $FLAGS \
+      --out "results/qwen_keyfix_${CELL}_seed${SEED}.csv" --resume $FLAGS $EXTRA \
       2>&1 | tee "logs/qwen_keyfix_${CELL}_seed${SEED}.log"
     # record() swallows per-step errors so one bad step cannot kill a 5-hour
     # run; but a cell with skipped measurements is NOT a result. Stop here.
-    if grep -q "measurement errors" "logs/qwen_keyfix_${CELL}_seed${SEED}.log"; then
+    if [ "$NODIV" != "1" ] && grep -q "measurement errors" "logs/qwen_keyfix_${CELL}_seed${SEED}.log"; then
       echo "ABORT: cell=$CELL seed=$SEED had measurement errors — see the log above" >&2
       exit 3
     fi
