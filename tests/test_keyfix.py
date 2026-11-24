@@ -664,3 +664,13 @@ def test_select_idxs_filters_on_index():
     items = [("g", 0, "a"), ("g", 1, "b"), ("g", 2, "c")]
     assert select_idxs(items, {1}) == [("g", 1, "b")]
     assert select_idxs(items, None) == items
+
+
+def test_wav_present_requires_nonempty_file(tmp_path):
+    wav_present = _single("wav_present", {"os": os})
+    empty, full = tmp_path / "e.wav", tmp_path / "f.wav"
+    empty.write_bytes(b"")
+    full.write_bytes(b"RIFF")
+    assert not wav_present(str(tmp_path / "missing.wav"))
+    assert not wav_present(str(empty))
+    assert wav_present(str(full))

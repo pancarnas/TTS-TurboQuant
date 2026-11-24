@@ -642,6 +642,11 @@ def select_idxs(items: list, allowed) -> list:
     return items if allowed is None else [t for t in items if t[1] in allowed]
 
 
+def wav_present(path: str) -> bool:
+    """True iff the wav exists and is non-empty (per-config skip in audio-only resume)."""
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
 def audio_done(
     out_dir,
     group,
@@ -778,6 +783,24 @@ def run_experiment(model, speaker, recorder, args) -> dict:
             if args.voice_mode == "clone" and not ref_audio:
                 continue
             for kb, vb, rw in specs:  # per-config audio (recorder off); fp16 -> no TQ
+                wav_out = _wav_path(
+                    out_dir,
+                    group,
+                    idx,
+                    args.seed,
+                    args.temperature,
+                    kb,
+                    vb,
+                    rw,
+                    args.protected_layers,
+                    args.key_group,
+                    args.pre_rope_keys,
+                    args.protect_prefix,
+                    args.prefix_codebook,
+                    args.prefix_bits,
+                )
+                if resume and no_div and wav_present(wav_out):
+                    continue  # this config's wav exists: fill only the missing ones
                 recorder.active = False
                 set_global_seed(args.seed, deterministic=False)
                 wavs, sr, *_ = run_generation(
@@ -805,26 +828,7 @@ def run_experiment(model, speaker, recorder, args) -> dict:
                     ref_audio=ref_audio,
                     ref_text=ref_text,
                 )
-                sf.write(
-                    _wav_path(
-                        out_dir,
-                        group,
-                        idx,
-                        args.seed,
-                        args.temperature,
-                        kb,
-                        vb,
-                        rw,
-                        args.protected_layers,
-                        args.key_group,
-                        args.pre_rope_keys,
-                        args.protect_prefix,
-                        args.prefix_codebook,
-                        args.prefix_bits,
-                    ),
-                    wavs[0],
-                    sr,
-                )
+                sf.write(wav_out, wavs[0], sr)
             if no_div:
                 continue  # audio-only: skip the expensive fp16 recording pass
             recorder.group, recorder.idx = group, idx  # fp16 pass (recorder on)
