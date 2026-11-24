@@ -1,4 +1,4 @@
-# Key-fix experiment: handoff (2026-11-17)
+# Key-fix experiment: handoff (2026-11-23)
 
 Read this first when picking up `exp/keyfix-group-prerope` on a new machine.
 Run book with commands: `docs/keyfix_experiment.md`. Background and option
@@ -31,6 +31,23 @@ g32pp 0.019; layer 5 falls from 0.225 (g32) to 0.036 (g32pp). Cost: the prefix
 is 44-67 keys and the sentences are 100-770 keys, so g32pp K2 is about 5 bits
 per key element pooled over this set (3.7 at 1000 keys). Full table and
 reading in `docs/keyfix_experiment.md`, "Results, prompt protection".
+
+**Prefix codebook (2026-11-19/20, cells pk2 / pk3 / pm3 / pm4, same 50
+sentences, seed 0, all over g32pre generated keys):** quantizing the prompt
+keys at prefill with levels fitted on the prompt. k-means levels (pk2, pk3)
+collapse 100% like g32pre although pk3 has the lowest key error of any cell;
+one min-max window at 3 bits (pm3) collapses 36%; at 4 bits (pm4) K2V2
+collapses 1/50 (CER 0.034, spk_sim 0.954) and K3V3 0/50 (CER 0.007, WER
+0.013, spk_sim 0.959; fp16 CER 0.005 / WER 0.014). Pooled key bits (section
+8): pm4 K2V2 3.30 (3.09 at 1000 keys), K3V3 4.11 (4.03), against g32pp 5.44
+/ 6.25. So K3V3+pm4 is the fully quantized cache at fp16 intelligibility and
+K2V2+pm4 the aggressive point. The one pm4 collapse is sentence 4, a runaway
+to the generation cap that also defeats 16 of the other 20 quantized
+settings; pm4 at K3V3 passes it. Reading: the prompt KEYS carry the collapse
+and what matters is keeping the per-coordinate range exact, not the MSE
+("range, not shape"). Prompt values at 2-3 bits do not cause collapse but
+likely cost the 0.04 of spk_sim against g32pp. Table and reading in
+`docs/keyfix_experiment.md`, "Results, prefix codebook".
 
 ## Diagnostic results (15_qwen_keygauss.sh, 20 sentences, 2026-11-17)
 
@@ -85,16 +102,12 @@ under `models/Qwen3-TTS/benchmarks/outputs/keyfix_<cell>/`.
    -1 = whole prefill, N > 0 fixed; cells `pp` and `g32pp` in 03/14 scripts;
    wav segment `_pp=prompt` / `_pp=N`, CSV column `protect_prefix`, config
    label `+pp` / `+ppN`). Result: g32pp rescues K2V2 completely (see "State").
-   Next GPU job: the prefix-codebook cells `pk2`, `pk3`, `pm3` (prompt keys
-   quantized at prefill with levels fitted on the prompt; design in
-   `docs/superpowers/specs/2026-11-18-prefix-codebook-design.md`). Smoke first:
-   `bash scripts/gpu/03_smoke_keyfix.sh` must print `KEYFIX SMOKE PASS` (it now
-   has the `pk` cell), then
-   `CELLS="pk2 pk3 pm3" CFGS="fp16,K2V2@0" MAXPG=50 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_pq.log 2>&1 &`.
-   Afterwards run the reducer, download, rerun `tools/analyze_keyfix.py`
-   (section 8 = effective bits from `_bylen.csv`, section 9 = runaway
-   classification, section 10 = per-step maximum vs collapse; the new cells
-   appear as `pk2`/`pk3`/`pm3`), and listen to a few wavs.
+   Prefix codebook cells pk2 / pk3 / pm3 / pm4: DONE 2026-11-20, reduced,
+   downloaded and analysed 2026-11-23 (see "State"). Remaining optional cell,
+   zero code, ~1.5 GPU h: `CELLS="pm4" CFGS="fp16,K3V4@0" MAXPG=50` to see
+   whether prompt values at 4 bits close the spk_sim gap to g32pp (0.96 vs
+   0.99). Cells B (fp16 first 4 tokens) and D (dense-and-sparse) of
+   `docs/keyfix_prefill_proposal.md` are no longer needed for collapse.
 2c. Prefix sweep (next GPU job, ~2 h per N): `protect_prefix` 4 / 16 / 32 with
    g32 at K2V2 separates an attention-sink effect (N = 4 enough) from the
    reference-audio keys (only the full prompt works) and finds the cheapest

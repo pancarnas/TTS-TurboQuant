@@ -190,7 +190,7 @@ browser truncates downloads at 24 MiB. Reduce first, then split:
 
 ```
 $PY tools/reduce_keyfix_div.py            # -> results/keyfix_reduced/*_bysent.csv, *_bypos.csv, *_bystep.csv, *_bytime.csv, *_bylen.csv
-ls results | grep keyfix | grep -v seed0 | sed s,^,results/, > keyfix_list.txt
+ls results | grep keyfix | grep -v seed0 | grep -v reduced | sed s,^,results/, > keyfix_list.txt
 ls results/keyfix_reduced | sed s,^,results/keyfix_reduced/, >> keyfix_list.txt
 ls logs | grep keyfix | sed s,^,logs/, >> keyfix_list.txt
 tar czf keyfix_results.tgz -T keyfix_list.txt
@@ -201,6 +201,52 @@ On the laptop: `cat keyfix_part_aa keyfix_part_ab > keyfix_results.tgz`,
 `tar xzf ... -C results/keyfix`, then
 `python tools/analyze_keyfix.py --root results/keyfix --out results/keyfix`
 writes `keyfix_analysis.md` and `keyfix_layers.{png,pdf}`.
+
+## MOS objective run (39 speakers, 195 sentences)
+
+Audio for the listening study (design
+`docs/superpowers/specs/2026-11-24-qwen-mos-sentence-set-design.md`): pm4
+at fp16 / K2V2 / K3V2 / K3V3, g32pre and g32pp at fp16 / K2V2, on the
+speaker-diverse librispeech_pc list (5 sentences per speaker, 4-9 s). Audio
+only, seed 0, no divergence. The list is committed so it outlives the box.
+
+Build the list once on the box (data/librispeech_pc must be present), commit:
+
+```
+$PY tools/select_mos_sentences.py --data-dir data --per-speaker 5 --min-dur 4 --max-dur 9 --out docs/qwen_mos_idx_list.txt
+git add docs/qwen_mos_idx_list.txt && git commit -m "Add the 39-speaker librispeech_pc sentence list for the Qwen MOS runs"
+```
+
+Expected `wrote 195 idxs across 39 speakers` (fewer only if a speaker has no
+4-9 s sentence; the tool names it).
+
+Smoke, 2 sentences, one new config (about 5 min):
+
+```
+head -2 docs/qwen_mos_idx_list.txt > idx2.txt
+CELLS="pm4" CFGS="fp16,K3V2@0" IDXFILE=idx2.txt NODIV=1 SCORE=0 bash scripts/gpu/14_qwen_keyfix.sh
+ls models/Qwen3-TTS/benchmarks/outputs/keyfix_pm4 | grep _K3_V2_
+```
+
+Expected two wavs `qwen_librispeech_pc_<idx>_sampling_s0_t0.9_K3_V2_rw=0_pl=0_g=32_pre_pq=m4.wav`
+for the two idxs, and the log line `restricting to 2 idxs from idx2.txt`.
+
+Full runs, back to back (about 7 GPU h on the L4; both resume per wav):
+
+```
+CELLS="pm4" CFGS="fp16,K2V2@0,K3V2@0,K3V3@0" IDXFILE=docs/qwen_mos_idx_list.txt NODIV=1 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_mos_pm4.log 2>&1 &
+```
+
+```
+CELLS="g32pre g32pp" CFGS="fp16,K2V2@0" IDXFILE=docs/qwen_mos_idx_list.txt NODIV=1 nohup bash scripts/gpu/14_qwen_keyfix.sh > logs/keyfix_mos_ref.log 2>&1 &
+```
+
+Progress: `ls models/Qwen3-TTS/benchmarks/outputs/keyfix_pm4 | grep -c _pq=m4`
+reaches 585 (3 quantized configs x 195) when pm4 is done; the scorer then
+appends to `results/qwen_keyfix_<cell>_scores.csv` (resume, so the first-50
+rows stay). Download only the three scores CSVs and the three
+`logs/qwen_keyfix_<cell>_score.log` files (all under 1 MB); the wavs stay on
+the box until the listening set is built there.
 
 ## Results, seed 0, 50 sentences (2026-11-10)
 
@@ -294,3 +340,55 @@ What it says
   rescues, it is an attention-sink effect; if only the full prompt does, the
   reference audio keys are the carrier.
 
+## Results, prefix codebook, seed 0, 50 sentences (2026-11-19/20)
+
+Cells `pk2` / `pk3` (prompt keys with per-coordinate k-means levels, 2 / 3
+bit), `pm3` / `pm4` (one min-max window over the prompt, 3 / 4 bit), all with
+`--key-group 32 --pre-rope-keys` on the generated keys, prompt values on the
+ordinary codebook at the value bits. Same sentences and seed as above. pm4
+also ran K3V3.
+
+| config | g32pre | pk2 | pk3 | pm3 | pm4 | g32pp |
+|---|---|---|---|---|---|---|
+| K2V2 collapse % | 100 | 100 | 100 | 36 | 2 | 0 |
+| K2V2 CER / WER | 1.04 / 1.26 | 0.99 / 1.06 | 0.97 / 1.02 | 0.33 / 0.44 | 0.034 / 0.057 | 0.003 / 0.010 |
+| K2V2 spk_sim | 0.75 | 0.68 | 0.68 | 0.92 | 0.954 | 0.992 |
+| K2V2 talker attn_js | 0.061 | 0.065 | 0.033 | 0.017 | 0.008 | 0.019 |
+| K2V2 relmse_k | 0.016 | 0.011 | 0.005 | 0.006 | 0.004 | 0.015 |
+| K2V2 key bits pooled (at S=1000) | 3.00 | 3.03 (3.01) | 3.43 (3.13) | 3.11 (3.03) | 3.30 (3.09) | 5.44 (3.73) |
+| K3V3 collapse % | 6 | | | | 0 | 0 |
+| K3V3 CER / WER | 0.13 / 0.18 | | | | 0.007 / 0.013 | 0.004 / 0.013 |
+| K3V3 spk_sim | 0.957 | | | | 0.959 | 0.992 |
+| K3V3 talker attn_js | 0.011 | | | | 0.004 | 0.003 |
+| K3V3 key bits pooled (at S=1000) | 4.00 | | | | 4.11 (4.03) | 6.25 (4.67) |
+
+fp16 reference: CER 0.005, WER 0.014. Value bits are the config's (2 or 3)
+in every cell except g32pp (4.63 / 5.44 pooled, fp16 prompt values).
+
+What it says
+
+- K3V3 + pm4 is a fully quantized cache at fp16 intelligibility: 0/50
+  collapses, CER 0.007, 4.11 key bits and 3 value bits per element pooled,
+  against 6.25 / 5.44 for g32pp. K2V2 + pm4 is the aggressive point: 1/50 at
+  3.30 key bits.
+- The prompt keys are the carrier. pm3 to pm4 changes only the prompt key
+  bits (3 to 4) and collapse goes 36% to 2%; prompt values stay at 2 bits in
+  both. The prompt-values confound of the design is closed for collapse.
+- Range, not shape. pk3 has the lowest key reconstruction error of any cell
+  (relmse 0.005) and collapses every sentence; pm3 at the same 3 bits with a
+  worse error collapses a third. k-means puts the levels at the quantile
+  centres and shrinks the coordinate extremes that the attention logits
+  depend on; min-max keeps each coordinate's minimum and maximum exact. More
+  k-means variants are not worth running.
+- The one pm4 K2V2 collapse is sentence 4 (fp16 5.4 s): a runaway to the
+  31.3 s generation cap, the same sentence that runs to the cap under 16 of
+  the other 20 quantized settings, including pm3, g32 at K3V3 and pp at
+  K3V3. pm4 at K3V3 passes it (CER 0.06). Section 9 of the analysis: every
+  collapse in pk2, pk3, pm3 and pm4 is a runaway, none an early stop.
+- Divergence now agrees with the audio: pm4 has the lowest talker attn_js of
+  any quantized cell (0.008 at K2V2, below g32pp's 0.019) and the layer-5
+  peak falls to 0.028.
+- Open: speaker similarity. pm4 sits at 0.954 / 0.959 and g32pp at 0.992; at
+  K3V3 the only remaining difference is prompt values at 3 bits versus fp16.
+  `CELLS="pm4" CFGS="fp16,K3V4@0"` (zero code) is the test if the thesis
+  wants to price that 0.04.
