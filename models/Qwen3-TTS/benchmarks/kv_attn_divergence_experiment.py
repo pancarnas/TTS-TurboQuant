@@ -624,6 +624,24 @@ def pending_items(items: list, done: set) -> list:
     return [t for t in items if (str(t[0]), int(t[1])) not in done]
 
 
+def load_idx_file(path):
+    """One integer idx per line ('#' comments and blanks ok) -> set; None if no path."""
+    if not path:
+        return None
+    allowed = set()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                allowed.add(int(line))
+    return allowed
+
+
+def select_idxs(items: list, allowed) -> list:
+    """Keep (group, idx, item) tuples whose idx is in ``allowed`` (None = keep all)."""
+    return items if allowed is None else [t for t in items if t[1] in allowed]
+
+
 def audio_done(
     out_dir,
     group,
@@ -688,11 +706,18 @@ def run_experiment(model, speaker, recorder, args) -> dict:
         os.path.dirname(os.path.abspath(__file__)), "outputs"
     )
     os.makedirs(out_dir, exist_ok=True)
-    items = [
-        (g, i, it)
-        for g in groups
-        for i, it in enumerate(iter_eval_items([g], args.max_per_group, args.data_dir))
-    ]
+    allowed = load_idx_file(getattr(args, "idx_file", None))
+    max_per_group = None if allowed is not None else args.max_per_group
+    items = select_idxs(
+        [
+            (g, i, it)
+            for g in groups
+            for i, it in enumerate(iter_eval_items([g], max_per_group, args.data_dir))
+        ],
+        allowed,
+    )
+    if allowed is not None:
+        print(f"restricting to {len(items)} idxs from {args.idx_file}")
 
     no_div = getattr(args, "no_divergence", False)
     resume = getattr(args, "resume", False)
@@ -906,6 +931,12 @@ def main() -> None:
     parser.add_argument("--voice-mode", default="clone")
     parser.add_argument("--default-ref", default=None)
     parser.add_argument("--out", default="results/kv_attn.csv")
+    parser.add_argument(
+        "--idx-file",
+        default=None,
+        help="Restrict to the sentence idxs listed in this file (one per line, # "
+        "comments). The whole group is enumerated; --max-per-group is ignored.",
+    )
     parser.add_argument(
         "--no-divergence",
         action="store_true",

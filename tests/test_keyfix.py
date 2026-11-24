@@ -36,13 +36,18 @@ def _load(path, name):
 def _qwen_cache_mod():
     pytest.importorskip("transformers")
     return _load(
-        os.path.join(_ROOT, "models/Qwen3-TTS/qwen_tts/core/models/turboquant_kv_cache.py"),
+        os.path.join(
+            _ROOT, "models/Qwen3-TTS/qwen_tts/core/models/turboquant_kv_cache.py"
+        ),
         "tq_kv_cache_keyfix",
     )
 
 
 def _vallex_cache_mod():
-    return _load(os.path.join(_ROOT, "models/VALL-E-X/turboquant_cache.py"), "tq_vallex_cache_keyfix")
+    return _load(
+        os.path.join(_ROOT, "models/VALL-E-X/turboquant_cache.py"),
+        "tq_vallex_cache_keyfix",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +65,15 @@ def _narrow_band_keys(B=1, H=2, S=64, D=64, seed=0):
 
 
 def _cos(a, b):
-    return torch.nn.functional.cosine_similarity(
-        a.reshape(-1, a.shape[-1]).float(), b.reshape(-1, b.shape[-1]).float(), dim=-1
-    ).mean().item()
+    return (
+        torch.nn.functional.cosine_similarity(
+            a.reshape(-1, a.shape[-1]).float(),
+            b.reshape(-1, b.shape[-1]).float(),
+            dim=-1,
+        )
+        .mean()
+        .item()
+    )
 
 
 def test_group_compressor_round_trip_shapes_and_keys():
@@ -129,8 +140,16 @@ def test_compressed_bytes_per_token_counts_group_metadata_honestly():
 
 
 def test_turboquantv3_threads_key_group_to_keys_only():
-    tq = TurboQuantV3(head_dim=64, key_bits=2, value_bits=2, layer_idx=0, n_layers=12,
-                      protected_layers=0, key_group=32, residual_window=0)
+    tq = TurboQuantV3(
+        head_dim=64,
+        key_bits=2,
+        value_bits=2,
+        layer_idx=0,
+        n_layers=12,
+        protected_layers=0,
+        key_group=32,
+        residual_window=0,
+    )
     assert tq.key_compressor.group == 32 and tq.val_compressor.group == 0
     k = _narrow_band_keys(S=64)
     v = torch.randn(1, 2, 64, 64)
@@ -147,13 +166,21 @@ def test_turboquantv3_threads_key_group_to_keys_only():
 
 
 def _cfg(**kw):
-    base = dict(key_bits=2, value_bits=2, residual_window=0, protected_layers=0,
-                protected_bits=8, track_only=False)
+    base = dict(
+        key_bits=2,
+        value_bits=2,
+        residual_window=0,
+        protected_layers=0,
+        protected_bits=8,
+        track_only=False,
+    )
     base.update(kw)
     return TurboQuantConfig(**base)
 
 
-def _feed_qwen(cache, steps, step_len, D=64, H=2, seed=0, with_rope=False, rope_scaling=None):
+def _feed_qwen(
+    cache, steps, step_len, D=64, H=2, seed=0, with_rope=False, rope_scaling=None
+):
     g = torch.Generator().manual_seed(seed)
     ks, full = [], None
     for i in range(steps):
@@ -172,9 +199,15 @@ def test_qwen_cache_rounds_spans_to_whole_groups():
     mod = _qwen_cache_mod()
     cache = mod.TurboQuantKVCache(_cfg(key_group=32), n_layers=1)
     k_in, k_out = _feed_qwen(cache, steps=5, step_len=8)  # 40 tokens
-    assert not torch.allclose(k_out[:, :, :32], k_in[:, :, :32], atol=1e-3)  # first group lossy
-    assert torch.equal(k_out[:, :, 32:], k_in[:, :, 32:])  # partial second group still exact
-    _feed_qwen(cache, steps=3, step_len=8, seed=1)  # +24 -> 64 tokens: second group fills
+    assert not torch.allclose(
+        k_out[:, :, :32], k_in[:, :, :32], atol=1e-3
+    )  # first group lossy
+    assert torch.equal(
+        k_out[:, :, 32:], k_in[:, :, 32:]
+    )  # partial second group still exact
+    _feed_qwen(
+        cache, steps=3, step_len=8, seed=1
+    )  # +24 -> 64 tokens: second group fills
     assert cache._compressed_upto[0] == 64
     assert cache.memory_report()["compressed_bytes"] > 0
 
@@ -227,7 +260,10 @@ def _rope_kwargs_for_positions(start, n, D, rope_scaling):
     emb = torch.cat([freqs, freqs], dim=-1)[None]  # (1, n, D)
     cos, sin = emb.cos(), emb.sin()
     if rope_scaling and rope_scaling.get("mrope_section"):
-        cos, sin = cos[None].expand(3, 1, n, D).clone(), sin[None].expand(3, 1, n, D).clone()
+        cos, sin = (
+            cos[None].expand(3, 1, n, D).clone(),
+            sin[None].expand(3, 1, n, D).clone(),
+        )
     return {"cos": cos, "sin": sin, "cache_position": torch.arange(start, start + n)}
 
 
@@ -242,7 +278,9 @@ def test_rope_keys_inverse_is_exact(lead, section, interleaved):
     cos, sin = _tables(S, D, lead=lead + (1,))  # (B, S, D) or (3, B, S, D)
     k_rot = mod.rope_keys(k, cos, sin, mrope_section=section, interleaved=interleaved)
     assert not torch.allclose(k_rot, k, atol=1e-3)  # RoPE actually did something
-    back = mod.rope_keys(k_rot, cos, sin, mrope_section=section, interleaved=interleaved, inverse=True)
+    back = mod.rope_keys(
+        k_rot, cos, sin, mrope_section=section, interleaved=interleaved, inverse=True
+    )
     assert torch.allclose(back, k, atol=1e-5)
 
 
@@ -263,7 +301,9 @@ _MROPE = {"mrope_section": [8, 12, 12], "interleaved": False}  # sums to D/2 for
 
 def test_qwen_cache_pre_rope_needs_tables():
     mod = _qwen_cache_mod()
-    cache = mod.TurboQuantKVCache(_cfg(pre_rope_keys=True), n_layers=1, rope_scaling=_MROPE)
+    cache = mod.TurboQuantKVCache(
+        _cfg(pre_rope_keys=True), n_layers=1, rope_scaling=_MROPE
+    )
     with pytest.raises(RuntimeError):
         cache.update(torch.randn(1, 2, 4, 64), torch.randn(1, 2, 4, 64), layer_idx=0)
 
@@ -272,9 +312,14 @@ def test_qwen_cache_pre_rope_8bit_is_near_identity():
     """With 8-bit keys the quantizer is ~lossless, so any error left in the
     read-back would come from the RoPE undo/redo — it must be ~exact."""
     mod = _qwen_cache_mod()
-    cache = mod.TurboQuantKVCache(_cfg(key_bits=8, value_bits=8, pre_rope_keys=True),
-                                  n_layers=1, rope_scaling=_MROPE)
-    k_in, k_out = _feed_qwen(cache, steps=6, step_len=8, with_rope=True, rope_scaling=_MROPE)
+    cache = mod.TurboQuantKVCache(
+        _cfg(key_bits=8, value_bits=8, pre_rope_keys=True),
+        n_layers=1,
+        rope_scaling=_MROPE,
+    )
+    k_in, k_out = _feed_qwen(
+        cache, steps=6, step_len=8, with_rope=True, rope_scaling=_MROPE
+    )
     assert cache._compressed_upto[0] == 48
     assert _cos(k_in, k_out) > 0.9999
     assert cache._rope_len == 48
@@ -285,8 +330,12 @@ def test_qwen_cache_pre_rope_changes_2bit_reconstruction():
     must differ (otherwise the flag is a no-op) while both stay lossy."""
     mod = _qwen_cache_mod()
     post = mod.TurboQuantKVCache(_cfg(), n_layers=1, rope_scaling=_MROPE)
-    pre = mod.TurboQuantKVCache(_cfg(pre_rope_keys=True), n_layers=1, rope_scaling=_MROPE)
-    k_in, k_post = _feed_qwen(post, steps=4, step_len=8, with_rope=True, rope_scaling=_MROPE)
+    pre = mod.TurboQuantKVCache(
+        _cfg(pre_rope_keys=True), n_layers=1, rope_scaling=_MROPE
+    )
+    k_in, k_post = _feed_qwen(
+        post, steps=4, step_len=8, with_rope=True, rope_scaling=_MROPE
+    )
     _, k_pre = _feed_qwen(pre, steps=4, step_len=8, with_rope=True, rope_scaling=_MROPE)
     assert not torch.allclose(k_post, k_in, atol=1e-3)
     assert not torch.allclose(k_pre, k_in, atol=1e-3)
@@ -297,7 +346,9 @@ def test_qwen_cache_pre_rope_with_plain_tables_and_group():
     """Plain 1-D tables (no rope_scaling) + group scaling together."""
     mod = _qwen_cache_mod()
     cache = mod.TurboQuantKVCache(_cfg(key_group=16, pre_rope_keys=True), n_layers=1)
-    k_in, k_out = _feed_qwen(cache, steps=5, step_len=8, with_rope=True, rope_scaling=None)
+    k_in, k_out = _feed_qwen(
+        cache, steps=5, step_len=8, with_rope=True, rope_scaling=None
+    )
     assert cache._compressed_upto[0] == 32  # 40 tokens -> two whole groups of 16
     assert torch.equal(k_out[:, :, 32:], k_in[:, :, 32:])
 
@@ -306,13 +357,18 @@ def test_qwen_cache_pre_rope_with_plain_tables_and_group():
 # E2: divergence recorder in pre-RoPE mode (exec-extracted like the other tests)
 # ---------------------------------------------------------------------------
 
-_EXP_PATH = os.path.join(_ROOT, "models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py")
+_EXP_PATH = os.path.join(
+    _ROOT, "models/Qwen3-TTS/benchmarks/kv_attn_divergence_experiment.py"
+)
 
 
 def _recorder_ns():
     import traceback
 
-    from tests.test_kv_attn_divergence import _kv_recon_errors, _repeat_kv  # reuse helpers
+    from tests.test_kv_attn_divergence import (
+        _kv_recon_errors,
+        _repeat_kv,
+    )  # reuse helpers
 
     src = open(_EXP_PATH, encoding="utf-8").read()
     start, end = src.index("def js_divergence("), src.index("\ndef force_eager(")
@@ -333,16 +389,24 @@ def _recorder_ns():
 def _talker_module(groups, S_new, start, D, layer_idx=0):
     kw = _rope_kwargs_for_positions(start, S_new, D, _MROPE)
     return types.SimpleNamespace(
-        layer_idx=layer_idx, num_key_value_groups=groups,
-        rope_scaling=_MROPE, _tq_rope=(kw["cos"], kw["sin"]),
+        layer_idx=layer_idx,
+        num_key_value_groups=groups,
+        rope_scaling=_MROPE,
+        _tq_rope=(kw["cos"], kw["sin"]),
     )
 
 
 def test_recorder_pre_rope_accumulates_tables_and_is_exact_at_8bit():
     ns = _recorder_ns()
     D, groups = 64, 2
-    rec = ns["DivergenceRecorder"](specs=[(8, 8, 0), (2, 2, 0)], n_layers=4, prot_layers=0,
-                                   prot_bits=8, stride=1, pre_rope=True)
+    rec = ns["DivergenceRecorder"](
+        specs=[(8, 8, 0), (2, 2, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        pre_rope=True,
+    )
     rec.group, rec.idx = "g", 0
     torch.manual_seed(0)
     q = torch.randn(1, 2 * groups, 1, D)
@@ -373,8 +437,14 @@ def test_recorder_pre_rope_every_layer_sees_the_same_step():
     decode step (46k skipped measurements)."""
     ns = _recorder_ns()
     D, groups, L = 64, 2, 3
-    rec = ns["DivergenceRecorder"](specs=[(8, 8, 0)], n_layers=4, prot_layers=0,
-                                   prot_bits=8, stride=1, pre_rope=True)
+    rec = ns["DivergenceRecorder"](
+        specs=[(8, 8, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        pre_rope=True,
+    )
     rec.group, rec.idx = "g", 0
     torch.manual_seed(1)
     q = torch.randn(1, 2 * groups, 1, D)
@@ -385,7 +455,9 @@ def test_recorder_pre_rope_every_layer_sees_the_same_step():
         key = torch.cat([key, torch.randn(1, 2, 1, D)], dim=2)
         pos = key.shape[2]
         for layer in range(L):
-            rec.record(_talker_module(groups, 1, pos - 1, D, layer), q, key, key, None, D**-0.5)
+            rec.record(
+                _talker_module(groups, 1, pos - 1, D, layer), q, key, key, None, D**-0.5
+            )
     assert rec.errors == 0 and len(rec.rows) == L * 4
     assert rec._rope_buf["SimpleNamespace"][0].shape[-2] == 11
     rows = [dict(zip(_cols(), r)) for r in rec.rows]
@@ -405,15 +477,23 @@ def test_recorder_pre_rope_accumulates_across_strided_steps():
     """--step-stride skips the measurement, not the table bookkeeping."""
     ns = _recorder_ns()
     D, groups = 64, 2
-    rec = ns["DivergenceRecorder"](specs=[(8, 8, 0)], n_layers=4, prot_layers=0,
-                                   prot_bits=8, stride=4, pre_rope=True)
+    rec = ns["DivergenceRecorder"](
+        specs=[(8, 8, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=4,
+        pre_rope=True,
+    )
     rec.group, rec.idx = "g", 0
     q = torch.randn(1, 2 * groups, 1, D)
     key = torch.randn(1, 2, 4, D)
     rec.record(_talker_module(groups, 4, 0, D), q, key, key, None, D**-0.5)
     for _ in range(4):  # positions 5,6,7 are skipped by the stride, 8 is measured
         key = torch.cat([key, torch.randn(1, 2, 1, D)], dim=2)
-        rec.record(_talker_module(groups, 1, key.shape[2] - 1, D), q, key, key, None, D**-0.5)
+        rec.record(
+            _talker_module(groups, 1, key.shape[2] - 1, D), q, key, key, None, D**-0.5
+        )
     assert rec.errors == 0
     assert [r[3] for r in rec.rows] == [4, 8]
     assert rec._rope_buf["SimpleNamespace"][0].shape[-2] == 8
@@ -428,8 +508,14 @@ def _cols():
 def test_recorder_pre_rope_detects_table_gap():
     ns = _recorder_ns()
     D, groups = 64, 2
-    rec = ns["DivergenceRecorder"](specs=[(4, 4, 0)], n_layers=4, prot_layers=0,
-                                   prot_bits=8, stride=1, pre_rope=True)
+    rec = ns["DivergenceRecorder"](
+        specs=[(4, 4, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        pre_rope=True,
+    )
     rec.group, rec.idx = "g", 0
     q = torch.randn(1, 4, 1, D)
     key = torch.randn(1, 2, 16, D)
@@ -443,8 +529,14 @@ def test_recorder_pre_rope_detects_table_gap():
 def test_recorder_key_group_threads_into_compressors():
     ns = _recorder_ns()
     D, groups = 64, 2
-    rec = ns["DivergenceRecorder"](specs=[(2, 2, 0)], n_layers=4, prot_layers=0,
-                                   prot_bits=8, stride=1, key_group=32)
+    rec = ns["DivergenceRecorder"](
+        specs=[(2, 2, 0)],
+        n_layers=4,
+        prot_layers=0,
+        prot_bits=8,
+        stride=1,
+        key_group=32,
+    )
     rec.group, rec.idx = "g", 0
     q = torch.randn(1, 4, 1, D)
     key = _narrow_band_keys(S=64)
@@ -482,11 +574,17 @@ def test_wav_path_keyfix_segments_and_fp16_shared(tmp_path):
     wav_path = _single("_wav_path", {"os": os})
     p = wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 32, True)
     assert p.endswith("qwen_g_3_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32_pre.wav")
-    assert wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 32, False).endswith("_pl=0_g=32.wav")
-    assert wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 0, True).endswith("_pl=0_pre.wav")
+    assert wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 32, False).endswith(
+        "_pl=0_g=32.wav"
+    )
+    assert wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0, 0, True).endswith(
+        "_pl=0_pre.wav"
+    )
     assert wav_path(str(tmp_path), "g", 3, 0, 0.9, 2, 2, 0, 0).endswith("_pl=0.wav")
     # fp16 never carries the segments
-    assert wav_path(str(tmp_path), "g", 3, 0, 0.9, None, None, None, 0, 32, True).endswith("_fp16.wav")
+    assert wav_path(
+        str(tmp_path), "g", 3, 0, 0.9, None, None, None, 0, 32, True
+    ).endswith("_fp16.wav")
 
 
 def test_load_done_filters_keyfix_columns(tmp_path):
@@ -508,20 +606,61 @@ def test_load_done_filters_keyfix_columns(tmp_path):
 def test_score_wav_dir_parses_keyfix_segments():
     from tools.score_wav_dir import parse_wav_name
 
-    e = parse_wav_name("qwen_librispeech_pc_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32_pre.wav")
-    assert e["config"] == "K2V2@0+g32+pre" and (e["key_bits"], e["rw"], e["pl"]) == (2, 0, 0)
-    assert parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32.wav")["config"] == "K2V2@0+g32"
-    assert parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_pre.wav")["config"] == "K2V2@0+pre"
-    assert parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0.wav")["config"] == "K2V2@0"
+    e = parse_wav_name(
+        "qwen_librispeech_pc_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32_pre.wav"
+    )
+    assert e["config"] == "K2V2@0+g32+pre" and (e["key_bits"], e["rw"], e["pl"]) == (
+        2,
+        0,
+        0,
+    )
+    assert (
+        parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32.wav")["config"]
+        == "K2V2@0+g32"
+    )
+    assert (
+        parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_pre.wav")["config"]
+        == "K2V2@0+pre"
+    )
+    assert (
+        parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0.wav")["config"]
+        == "K2V2@0"
+    )
     v = parse_wav_name("vallex_librispeech_pc_3_sampling_s0_K2V2@0+g32.wav")
     assert v["config"] == "K2V2@0+g32" and v["key_bits"] == 2
-    assert parse_wav_name("vallex_x_3_sampling_s0_K2V2@0+g32-nar.wav")["config"] == "K2V2@0+g32-nar"
+    assert (
+        parse_wav_name("vallex_x_3_sampling_s0_K2V2@0+g32-nar.wav")["config"]
+        == "K2V2@0+g32-nar"
+    )
 
 
 def test_check_audio_parses_keyfix_segments():
     from tools.check_audio import parse_wav_name
 
-    d = parse_wav_name("qwen_librispeech_pc_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32_pre.wav")
+    d = parse_wav_name(
+        "qwen_librispeech_pc_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0_g=32_pre.wav"
+    )
     assert d["config"] == "K2V2@0 pl0+g32+pre" and d["kb"] == 2
-    assert parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0.wav")["config"] == "K2V2@0 pl0"
-    assert parse_wav_name("vallex_x_3_sampling_s0_K2V2@0+g32.wav")["config"] == "K2V2@0+g32"
+    assert (
+        parse_wav_name("qwen_x_7_sampling_s0_t0.9_K2_V2_rw=0_pl=0.wav")["config"]
+        == "K2V2@0 pl0"
+    )
+    assert (
+        parse_wav_name("vallex_x_3_sampling_s0_K2V2@0+g32.wav")["config"]
+        == "K2V2@0+g32"
+    )
+
+
+def test_load_idx_file_skips_blanks_and_comments(tmp_path):
+    load_idx_file = _single("load_idx_file", {"os": os})
+    p = tmp_path / "idx.txt"
+    p.write_text("# head\n3\n\n7\n 11 \n")
+    assert load_idx_file(str(p)) == {3, 7, 11}
+    assert load_idx_file(None) is None
+
+
+def test_select_idxs_filters_on_index():
+    select_idxs = _single("select_idxs", {})
+    items = [("g", 0, "a"), ("g", 1, "b"), ("g", 2, "c")]
+    assert select_idxs(items, {1}) == [("g", 1, "b")]
+    assert select_idxs(items, None) == items
