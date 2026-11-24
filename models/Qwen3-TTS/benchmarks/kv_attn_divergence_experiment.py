@@ -624,7 +624,7 @@ def pending_items(items: list, done: set) -> list:
     return [t for t in items if (str(t[0]), int(t[1])) not in done]
 
 
-def load_idx_file(path):
+def load_idx_file(path: str | None) -> set[int] | None:
     """One integer idx per line ('#' comments and blanks ok) -> set; None if no path."""
     if not path:
         return None
@@ -637,7 +637,7 @@ def load_idx_file(path):
     return allowed
 
 
-def select_idxs(items: list, allowed) -> list:
+def select_idxs(items: list, allowed: set[int] | None) -> list:
     """Keep (group, idx, item) tuples whose idx is in ``allowed`` (None = keep all)."""
     return items if allowed is None else [t for t in items if t[1] in allowed]
 
